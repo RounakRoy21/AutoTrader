@@ -25,25 +25,39 @@ _fallback_channels: Dict[str, list] = {}
 
 
 async def get_redis() -> aioredis.Redis:
-    """Return the singleton async Redis client, creating it if necessary."""
+    """Return the singleton async Redis client, creating it if necessary.
+
+    If the existing singleton fails a ping, it is discarded so the next
+    call triggers a fresh connection attempt (handles Redis restart / network
+    blips without requiring a full process restart).
+    """
     global _redis, _fallback_mode
-    if _redis is None:
-        settings = get_settings()
+    if _redis is not None:
         try:
-            _redis = aioredis.from_url(
-                settings.redis_url,
-                decode_responses=True,
-                socket_connect_timeout=5,
-                retry_on_timeout=True,
-            )
             await _redis.ping()
-            _fallback_mode = False
-            logger.info("Redis connection established")
-        except Exception as exc:
-            logger.error("Redis connection failed: %s — running in fallback mode", exc)
-            _fallback_mode = True
+            return _redis
+        except Exception:
+            logger.warning("Redis ping failed on existing connection — reconnecting")
             _redis = None
-            raise
+
+    settings = get_settings()
+    try:
+        _redis = aioredis.from_url(
+            settings.redis_url,
+            decode_responses=True,
+            socket_connect_timeout=5,
+            retry_on_timeout=True,
+        )
+        await _redis.ping()
+        _fallback_mode = False
+        logger.info("Redis connection established")
+        # Replay any messages buffered while Redis was down
+        await flush_fallback_buffer()
+    except Exception as exc:
+        logger.error("Redis connection failed: %s — running in fallback mode", exc)
+        _fallback_mode = True
+        _redis = None
+        raise
     return _redis
 
 

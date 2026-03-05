@@ -21,6 +21,7 @@ from sqlalchemy import select, update
 from core.config import get_settings
 from core.database import get_db_context
 from core.redis_client import get_value, publish, set_value
+from core.redis_keys import HALT_KEY
 from integrations.kite_client import get_kite_client
 from integrations import ltp_store
 from integrations.telegram_client import (
@@ -36,7 +37,6 @@ from models.trade import Trade
 logger = logging.getLogger(__name__)
 
 IST = pytz.timezone("Asia/Kolkata")
-HALT_KEY = "trading_halt"
 POLL_INTERVAL = 5  # seconds
 
 # Intraday close times

@@ -19,6 +19,8 @@ from sqlalchemy import select
 from core.config import get_settings
 from core.database import get_db_context
 from core.redis_client import publish, set_value
+from core.redis_keys import LATEST_MARKET_BRIEF_KEY
+from core.nse_calendar import is_nse_holiday
 from integrations.alpha_vantage_client import (
     fetch_dxy,
     fetch_sgx_nifty,
@@ -289,7 +291,7 @@ async def persist_and_publish(brief: MarketBriefLLMOutput) -> None:
     logger.info("Market brief published to Redis channel 'market_brief'")
 
     # Store the latest brief in a Redis key for easy access
-    await set_value("latest_market_brief", json.dumps(brief_dict))
+    await set_value(LATEST_MARKET_BRIEF_KEY, json.dumps(brief_dict))
 
 
 async def run_research_agent() -> None:
@@ -297,6 +299,10 @@ async def run_research_agent() -> None:
     Main entry point for the Research Agent.
     Called by APScheduler at 6:00 AM IST, or triggered manually via the API.
     """
+    if is_nse_holiday():
+        logger.info("Research Agent: today is an NSE holiday — skipping run")
+        return
+
     logger.info("═══ Research Agent starting ═══")
     await set_value("agent:research:status", "ACTIVE")
     await set_value("agent:research:last_run_started", datetime.now(IST).isoformat())

@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agents.research_agent import run_research_agent
 from core.database import get_db
 from core.redis_client import get_redis
+from core.redis_keys import LATEST_MARKET_BRIEF_KEY
 from models.market_brief import MarketBrief
 from schemas.market_brief import MarketBriefResponse
 
@@ -81,27 +82,26 @@ async def get_today_brief(db: AsyncSession = Depends(get_db)):
 
     # Fallback: check Redis for a cached brief generated today
     r = await get_redis()
-    cached = await r.get("latest_market_brief")
+    cached = await r.get(LATEST_MARKET_BRIEF_KEY)
     if cached:
         data = json.loads(cached)
         brief_date = data.get("date", "")
         if brief_date == today.isoformat():
-            # Return raw JSON wrapped in the response schema fields
-            return {
-                "id": -1,
-                "date": today,
-                "generated_at": data.get("generated_at", "00:00:00"),
-                "market_bias": data.get("market_bias", "NEUTRAL"),
-                "bias_confidence": data.get("bias_confidence", 0.0),
-                "sgx_nifty_signal": data.get("sgx_nifty", {}).get("signal"),
-                "fii_signal": data.get("fii_dii", {}).get("signal"),
-                "dxy_signal": data.get("dxy", {}).get("signal"),
-                "us_markets_signal": data.get("us_markets", {}).get("signal"),
-                "watchlist": data.get("watchlist_today", []),
-                "avoid_list": data.get("avoid_today", []),
-                "recommended_stance": data.get("recommended_stance"),
-                "raw_json": data,
-            }
+            return MarketBriefResponse(
+                id=-1,
+                date=today,
+                generated_at=data.get("generated_at", "00:00:00"),
+                market_bias=data.get("market_bias", "NEUTRAL"),
+                bias_confidence=data.get("bias_confidence", 0.0),
+                sgx_nifty_signal=data.get("sgx_nifty", {}).get("signal"),
+                fii_signal=data.get("fii_dii", {}).get("signal"),
+                dxy_signal=data.get("dxy", {}).get("signal"),
+                us_markets_signal=data.get("us_markets", {}).get("signal"),
+                watchlist=data.get("watchlist_today", []),
+                avoid_list=data.get("avoid_today", []),
+                recommended_stance=data.get("recommended_stance"),
+                raw_json=data,
+            )
 
     raise HTTPException(
         status_code=404,

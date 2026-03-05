@@ -107,13 +107,16 @@ class TickDataStore:
         self.symbol = symbol
         self.avg_volume_20d = avg_volume_20d
         self.ticks: deque = deque(maxlen=self.MAX_TICKS)
-        self._df: Optional[pd.DataFrame] = None
+        self._df_backing: Optional[pd.DataFrame] = None  # SH1: backing store for lazy _df
+        self._df_dirty: bool = False                      # SH1: True after each add_tick
         self._prev_cum_volume: float = 0.0  # track previous cumulative volume
+        self._open_price: float = 0.0        # SH2: today's session open (from first tick)
+        self._prev_close: float = 0.0        # SH2: previous day's close (from first tick)
         self._candles_1m = CandleBuilder(interval_minutes=1, max_candles=200)
         self._candles_5m = CandleBuilder(interval_minutes=5, max_candles=100)
 
     def add_tick(self, tick: Dict[str, Any]) -> None:
-        """Append a tick (capped at MAX_TICKS) and rebuild the dataframe."""
+        """Append a tick (capped at MAX_TICKS) and mark the dataframe stale."""
         cum_vol = tick.get("volume_traded", 0)
         # Kite's volume_traded is cumulative for the day.
         # First tick: record as baseline only (delta=0).  On a mid-day restart
@@ -128,21 +131,46 @@ class TickDataStore:
         ts = tick.get("exchange_timestamp") or datetime.now(IST)
         price = tick.get("last_price", 0.0)
 
+        # SH2: Capture today's open and previous day's close from the very first
+        # tick of the session. Kite's ohlc.open = today's day open; ohlc.close =
+        # previous day's close (a static field that never changes intraday).
+        ohlc = tick.get("ohlc", {})
+        if self._open_price == 0.0:
+            open_price = float(ohlc.get("open", 0.0))
+            prev_close = float(ohlc.get("close", 0.0))
+            if open_price > 0:
+                self._open_price = open_price
+            if prev_close > 0:
+                self._prev_close = prev_close
+
         self.ticks.append({
             "timestamp": ts,
             "last_price": price,
             "volume_delta": vol_delta,
             "cum_volume": cum_vol,
-            "high": tick.get("ohlc", {}).get("high", 0.0),
-            "low": tick.get("ohlc", {}).get("low", 0.0),
-            "open": tick.get("ohlc", {}).get("open", 0.0),
-            "close": tick.get("ohlc", {}).get("close", 0.0),
+            "high": ohlc.get("high", 0.0),
+            "low": ohlc.get("low", 0.0),
+            "open": ohlc.get("open", 0.0),
+            "close": ohlc.get("close", 0.0),
         })
-        self._df = pd.DataFrame(self.ticks)
+        # SH1: Mark df stale instead of rebuilding on every tick.
+        # pd.DataFrame(deque) is O(N); rebuilding eagerly 20–40×/sec on the
+        # WebSocket thread causes backpressure.  The _df property rebuilds
+        # lazily on the first read per tick (first indicator call, or direct
+        # _df access in tests).
+        self._df_dirty = True
 
         # Feed candle builders for higher-level indicators
         self._candles_1m.add_tick(ts, price, vol_delta)
         self._candles_5m.add_tick(ts, price, vol_delta)
+
+    @property
+    def _df(self) -> Optional[pd.DataFrame]:
+        """Tick DataFrame, rebuilt lazily when the backing store is stale."""
+        if self._df_dirty or self._df_backing is None:
+            self._df_backing = pd.DataFrame(self.ticks) if self.ticks else pd.DataFrame()
+            self._df_dirty = False
+        return self._df_backing
 
     def compute_vwap(self) -> float:
         """Calculate intraday VWAP using per-tick volume deltas.
@@ -297,15 +325,22 @@ class Scanner:
         self._mock_generator: Optional[MockTickGenerator] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None  # for thread-safe queue access
 
-    def _calculate_suggested_qty(self, ltp: float, atr: float = 0.0) -> int:
+    def _calculate_suggested_qty(self, ltp: float, atr: float = 0.0, n_candles: int = 0) -> int:
         """
         Calculate position size.
-        With ATR: qty = max_loss / (atr × sl_multiplier)  — volatility-aware.
-        Without:  qty = max_loss / (ltp × stop_loss_pct)  — fixed percentage.
+
+        With ATR (≥45 completed 1m candles): qty = max_loss / (atr × sl_multiplier)
+        — volatility-aware sizing.  The 45-candle minimum (≈45 min of session)
+        avoids the noisy opening-range ATR, which can run 2–3× the historical
+        daily ATR in the first 30 minutes, causing dangerous over- or under-sizing.
+
+        Without sufficient candles (or ATR=0): qty = max_loss / (ltp × stop_loss_pct)
+        — fixed-percentage fallback.
         """
         settings = self._settings
         max_loss = settings.total_capital * settings.max_loss_per_trade_pct
-        if atr > 0:
+        # SH3: require ≥45 completed 1m candles before trusting the intraday ATR
+        if atr > 0 and n_candles >= 45:
             sl_distance = atr * settings.atr_sl_multiplier
         else:
             sl_distance = ltp * settings.stop_loss_pct
@@ -318,17 +353,36 @@ class Scanner:
 
         Conditions (all must pass):
          1. Price > VWAP
-         2. RSI(14) tick-level between 45-65
-         3. Volume > 1.5× 20-day average
-         4. EMA(9) > EMA(21) on 1m candles (trend filter)
-         5. MACD histogram > 0 on 1m candles (momentum confirmation)
-         6. 5-min RSI between 35-70 (higher timeframe filter, when available)
+         2. RSI(14) tick-level between 45–65
+            Note: DecisionEngine accepts RSI 40–72.  The Scanner uses a tighter
+            band (45–65) as a conservative first-pass filter.  Signals in the
+            40–44 and 66–72 RSI zones are intentionally not generated here —
+            they would pass the DecisionEngine but the scanner pre-filters them
+            out.  This two-layer design is deliberate. (SM1)
+         3. Volume > 1.5× 20-day average (skipped in paper mode where avg=0)
+         4. EMA(9) > EMA(21) on 1m candles (trend filter) — requires ≥35 candles
+         5. MACD histogram > 0 on 1m candles (momentum confirmation) — ≥35 candles
+            Both candle checks share the same ≥35 minimum so MACD is never
+            silently skipped while EMA is already evaluated. (SM2)
+         6. 5-min RSI between 45–72 (higher timeframe filter, when available)
+            Tightened from (35–70): a 5m RSI of 35–44 indicates a clearly bearish
+            higher-timeframe context that the original band would have passed. (SH4)
+         7. Gap-at-open < gap_filter_pct: reject when stock gapped up too far vs
+            yesterday's close, since VWAP above-price check alone cannot catch
+            this risk (VWAP resets each session). (SH2)
         """
         now_ist = datetime.now(IST)
 
         # Hard market-hours cutoff: no new signals after 3:15 PM IST
         cutoff_h, cutoff_m = self.SIGNAL_CUTOFF
         if (now_ist.hour, now_ist.minute) >= (cutoff_h, cutoff_m):
+            return None
+
+        # SM5: On Fridays, stop generating signals after 14:00 IST so the
+        # DecisionEngine never even calls the LLM on soon-to-expire positions.
+        # (The DecisionEngine also rejects Friday-14:00 signals, but filtering
+        # here prevents wasteful queue entries and LLM call avoidance work.)
+        if now_ist.weekday() == 4 and now_ist.hour >= 14:
             return None
 
         # Require minimum data points for statistically meaningful indicators
@@ -357,12 +411,21 @@ class Scanner:
         # Condition 1: Price > VWAP
         if ltp <= vwap:
             return None
-        # Condition 2: RSI between 45 and 65
+        # Condition 2: RSI between 45 and 65 (scanner pre-filter; see docstring)
         if not (45 <= rsi <= 65):
             return None
         # Condition 3: Volume > 1.5x 20-day average (skip when historical data unavailable)
         if store.avg_volume_20d > 0 and vol_ratio < 1.5:
             return None
+
+        # Condition 7: Gap-at-open filter (SH2)
+        # Reject signals when the stock gapped up beyond the configured threshold
+        # vs the previous session's close.  Stocks already extended at open are
+        # prone to intraday mean-reversion even when momentum indicators look green.
+        if store._prev_close > 0 and store._open_price > 0:
+            gap_pct = (store._open_price - store._prev_close) / store._prev_close * 100
+            if gap_pct > self._settings.gap_filter_pct:
+                return None
 
         # ── Candle-based indicators (1m) ───────────
         ema_9 = store.compute_ema(9)
@@ -370,19 +433,19 @@ class Scanner:
         macd_hist = store.compute_macd_histogram()
         atr = store.compute_atr()
 
-        # Condition 4: EMA trend — short EMA above medium EMA (bullish)
-        if n_candles >= 21 and ema_9 > 0 and ema_21 > 0:
-            if ema_9 <= ema_21:
+        # Conditions 4 + 5: EMA trend and MACD momentum — both require ≥35 candles
+        # so that MACD (which needs 26-period EMA) is always evaluated alongside
+        # the EMA crossover check, rather than being silently skipped.  (SM2)
+        if n_candles >= 35:
+            if ema_9 > 0 and ema_21 > 0 and ema_9 <= ema_21:
                 return None
-
-        # Condition 5: MACD momentum — histogram positive
-        if n_candles >= 35 and macd_hist <= 0:
-            return None
+            if macd_hist <= 0:
+                return None
 
         # ── Higher timeframe filter (5m) ───────────
         rsi_5m = store.compute_rsi_htf()
-        # Condition 6: 5-min RSI in neutral-bullish range
-        if rsi_5m is not None and (rsi_5m < 35 or rsi_5m > 70):
+        # Condition 6: 5-min RSI in neutral-bullish range (45–72, tightened from 35–70)
+        if rsi_5m is not None and (rsi_5m < 45 or rsi_5m > 72):
             return None
 
         # Record cooldown timestamp before returning
@@ -396,7 +459,7 @@ class Scanner:
             vwap=round(vwap, 2),
             rsi=round(rsi, 2),
             volume_ratio=round(vol_ratio, 2),
-            suggested_qty=self._calculate_suggested_qty(ltp, atr),
+            suggested_qty=self._calculate_suggested_qty(ltp, atr, n_candles),
             ema_9=round(ema_9, 2) if ema_9 else None,
             ema_21=round(ema_21, 2) if ema_21 else None,
             macd_histogram=round(macd_hist, 4) if macd_hist else None,
@@ -420,6 +483,16 @@ class Scanner:
                 continue
 
             if symbol not in self._stores:
+                # In live mode, all known symbols are pre-loaded by _load_avg_volumes()
+                # before the ticker starts.  An unknown token here is an instrument
+                # outside the focus list — create a store without volume data but
+                # log a warning so it is visible in production.  (SM4)
+                if not self._settings.paper_trading:
+                    logger.warning(
+                        "[Scanner] Tick for unexpected symbol %s (token=%s) — "
+                        "creating store with no historical volume data",
+                        symbol, token,
+                    )
                 self._stores[symbol] = TickDataStore(symbol)
             store = self._stores[symbol]
             store.add_tick(tick)
@@ -444,6 +517,47 @@ class Scanner:
                         self._signal_queue.put_nowait(signal)
                 except asyncio.QueueFull:
                     logger.warning("Signal queue full — dropping signal for %s", symbol)
+
+    async def _load_avg_volumes(self) -> None:
+        """Fetch 20-day average daily volume for every focus stock before session start.
+
+        Pre-populates TickDataStore instances so the volume filter (Condition 3) is
+        correctly enforced from the very first signal check.  Without this, all stores
+        default to avg_volume_20d=0 and the volume check is silently bypassed for the
+        entire session.  (SC1)
+
+        Best-effort: symbols whose historical fetch fails are initialised with 0.0
+        (volume check bypassed only for that symbol, a warning is logged).
+        """
+        kite_client = get_kite_client()
+        instrument_map = get_instrument_map()
+        loaded = 0
+        for symbol, token in instrument_map.items():
+            try:
+                candles = await kite_client.get_historical_data(
+                    token, interval="day", days_back=30
+                )
+                volumes = [c["volume"] for c in candles if c.get("volume", 0) > 0]
+                # Take the last 20 trading days; fall back to all available if <20
+                recent = volumes[-20:] if len(volumes) >= 20 else volumes
+                avg_vol = sum(recent) / len(recent) if recent else 0.0
+                self._stores[symbol] = TickDataStore(symbol, avg_volume_20d=avg_vol)
+                if avg_vol > 0:
+                    loaded += 1
+                    logger.debug("[Scanner] %s avg_volume_20d=%.0f", symbol, avg_vol)
+                else:
+                    logger.warning("[Scanner] %s: no volume data in historical candles", symbol)
+            except Exception as exc:
+                logger.warning(
+                    "[Scanner] Could not fetch avg volume for %s: %s "
+                    "— volume filter disabled for this symbol",
+                    symbol, exc,
+                )
+                self._stores[symbol] = TickDataStore(symbol)
+        logger.info(
+            "[Scanner] Loaded 20-day avg volumes for %d/%d symbols",
+            loaded, len(instrument_map),
+        )
 
     def _on_connect(self, ws, response) -> None:
         """Subscribe to instruments on WebSocket connect."""
@@ -470,7 +584,11 @@ class Scanner:
             self._mock_generator = MockTickGenerator(on_ticks_callback=self._on_ticks)
             await self._mock_generator.run()
         else:
-            logger.info("[Scanner] Live mode — starting KiteTicker WebSocket")
+            logger.info("[Scanner] Live mode — loading historical volumes before KiteTicker")
+            # SC1: Pre-populate TickDataStore instances with 20-day avg volumes so the
+            # volume filter is active from the first tick, not silently bypassed.
+            await self._load_avg_volumes()
+
             kite_client = get_kite_client()
             ticker = await kite_client.create_ticker()
 

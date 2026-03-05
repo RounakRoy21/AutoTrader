@@ -13,11 +13,12 @@ from kiteconnect import KiteConnect
 
 from core.config import get_settings
 from core.redis_client import get_value, set_value
+from core.redis_keys import KITE_TOKEN_KEY
+from integrations.kite_client import get_kite_client
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
 
-KITE_TOKEN_KEY = "kite_access_token"
 KITE_TOKEN_TTL = 24 * 60 * 60  # 24 hours
 
 
@@ -63,6 +64,8 @@ async def kite_callback(request_token: str = Query(...)):
         access_token = data["access_token"]
 
         await set_value(KITE_TOKEN_KEY, access_token, ttl=KITE_TOKEN_TTL)
+        # Invalidate the in-memory cache so kite_client re-reads the new token
+        get_kite_client().invalidate_token()
         logger.info("Kite access_token stored in Redis (TTL=%ds)", KITE_TOKEN_TTL)
 
         return {

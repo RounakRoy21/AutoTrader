@@ -451,11 +451,24 @@ class TestAtrQty:
         scanner = Scanner(queue)
         scanner._settings = settings
 
-        qty = scanner._calculate_suggested_qty(1000.0, atr=5.0)
+        # n_candles ≥ 45 is required before the intraday ATR is stable enough
+        # to use for position sizing (SH3: opening-range ATR exclusion).
+        qty = scanner._calculate_suggested_qty(1000.0, atr=5.0, n_candles=45)
         # max_loss = 1M * 0.015 = 15000
         # sl_distance = 5.0 * 1.5 = 7.5
         # qty = 15000 / 7.5 = 2000
         assert qty == 2000
+
+    def test_atr_qty_requires_min_candles(self, settings):
+        """ATR-based sizing must fall back to fixed-pct when < 45 candles (SH3)."""
+        queue = asyncio.Queue()
+        scanner = Scanner(queue)
+        scanner._settings = settings
+
+        # n_candles=30 (early session) → ATR not trusted → fixed-pct fallback
+        qty_early = scanner._calculate_suggested_qty(1000.0, atr=5.0, n_candles=30)
+        # fixed: max_loss=15000, sl=1000*0.008=8, qty=1875
+        assert qty_early == 1875
 
     def test_fallback_without_atr(self, settings):
         queue = asyncio.Queue()

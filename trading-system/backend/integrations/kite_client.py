@@ -18,11 +18,9 @@ from kiteconnect import KiteConnect, KiteTicker
 
 from core.config import get_settings
 from core.redis_client import get_value, set_value
+from core.redis_keys import HALT_KEY, KITE_TOKEN_KEY
 
 logger = logging.getLogger(__name__)
-
-KITE_TOKEN_KEY = "kite_access_token"
-HALT_KEY = "trading_halt"
 MAX_RETRIES = 3
 CIRCUIT_BREAKER_SECONDS = 60
 
@@ -56,12 +54,28 @@ class KiteClient:
         self._kite: Optional[KiteConnect] = None
         self._ticker: Optional[KiteTicker] = None
         self._last_failure: float = 0.0
+        self._cached_token: Optional[str] = None  # in-memory token cache
+
+    def invalidate_token(self) -> None:
+        """Evict the in-memory token so the next call re-reads from Redis.
+
+        Must be called by the auth callback after each successful token refresh.
+        """
+        self._cached_token = None
+        logger.info("KiteClient: access token cache invalidated")
 
     async def _get_access_token(self) -> str:
-        """Retrieve the current access token from Redis."""
+        """Return the access token, using the in-memory cache when available.
+
+        The token is fetched from Redis only on the first call after startup
+        or after ``invalidate_token()`` is called (at most once per day).
+        """
+        if self._cached_token:
+            return self._cached_token
         token = await get_value(KITE_TOKEN_KEY)
         if not token:
             raise RuntimeError("No Kite access_token found in Redis. Please authenticate first.")
+        self._cached_token = token
         return token
 
     async def get_kite(self) -> KiteConnect:
@@ -248,6 +262,48 @@ class KiteClient:
             return kite.ltp(instruments)
 
         return await asyncio.to_thread(_fetch)
+
+    async def get_historical_data(
+        self,
+        instrument_token: int,
+        interval: str = "day",
+        days_back: int = 30,
+    ) -> List[Dict[str, Any]]:
+        """Fetch historical OHLCV candles for an instrument.
+
+        Args:
+            instrument_token: Kite instrument token (integer).
+            interval: Kite interval string ("day", "minute", "5minute", etc.).
+            days_back: How many calendar days back to fetch (extra days ensure
+                       20 trading days even across weekends / NSE holidays).
+
+        Returns:
+            List of dicts with keys: date, open, high, low, close, volume.
+        """
+        from datetime import date, timedelta
+
+        kite = await self.get_kite()
+        to_date = date.today()
+        from_date = to_date - timedelta(days=days_back)
+
+        @_retry_sync
+        def _fetch():
+            return kite.historical_data(
+                instrument_token,
+                from_date=from_date,
+                to_date=to_date,
+                interval=interval,
+                continuous=False,
+                oi=False,
+            )
+
+        try:
+            result = await asyncio.to_thread(_fetch)
+            self._last_failure = 0.0
+            return result
+        except Exception as exc:
+            await self._handle_failure(exc)
+            raise
 
     # ── KiteTicker (WebSocket) ───────────────────
 

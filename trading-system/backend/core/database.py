@@ -8,7 +8,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
-from sqlalchemy import MetaData
+from sqlalchemy import MetaData, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -97,9 +97,7 @@ async def check_db_health() -> bool:
     try:
         engine = get_engine()
         async with engine.connect() as conn:
-            await conn.execute(
-                __import__("sqlalchemy").text("SELECT 1")
-            )
+            await conn.execute(text("SELECT 1"))
         return True
     except Exception as exc:
         logger.error("Database health check failed: %s", exc)

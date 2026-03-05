@@ -23,13 +23,13 @@ from sqlalchemy import func, select
 
 from core.database import get_db_context
 from core.redis_client import publish, set_value
+from core.redis_keys import HALT_KEY
+from core.nse_calendar import is_nse_holiday
 from models.trade import Trade
 
 logger = logging.getLogger(__name__)
 
 TRADE_COUNT_KEY = "daily_trade_count"
-HALT_KEY = "trading_halt"
-
 
 class TradingAgentManager:
     """
@@ -57,7 +57,12 @@ class TradingAgentManager:
         """
         Start a new trading session.
         Idempotent — returns 'already_running' if a session is active.
+        NSE holiday guard: returns 'nse_holiday' without starting if today is a non-trading day.
         """
+        if is_nse_holiday():
+            logger.info("[Manager] Today is an NSE holiday — trading session will not start")
+            return "nse_holiday"
+
         if self.is_running:
             logger.info("[Manager] Trading session already active — ignoring start request")
             return "already_running"

@@ -16,6 +16,19 @@ logger = logging.getLogger(__name__)
 TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}/sendMessage"
 TIMEOUT = 10
 
+# Module-level singleton — reuses the TCP connection pool across all alerts.
+# Under a stop-loss cascade this avoids spinning up N parallel TCP connections
+# to the Telegram API.
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    """Return the module-level HTTP client, creating it if necessary."""
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=TIMEOUT)
+    return _http_client
+
 
 async def send_telegram(message: str) -> bool:
     """
@@ -34,11 +47,11 @@ async def send_telegram(message: str) -> bool:
         "parse_mode": "HTML",
     }
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
-            logger.info("Telegram alert sent: %s", message[:80])
-            return True
+        client = _get_http_client()
+        resp = await client.post(url, json=payload)
+        resp.raise_for_status()
+        logger.info("Telegram alert sent: %s", message[:80])
+        return True
     except Exception as exc:
         logger.error("Telegram send failed: %s", exc)
         return False

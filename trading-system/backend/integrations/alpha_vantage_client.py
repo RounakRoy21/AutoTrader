@@ -17,6 +17,18 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://www.alphavantage.co/query"
 TIMEOUT = 10
 
+# Module-level singleton — the Research Agent runs once at 6 AM but makes
+# several sequential API calls (_query × 4 + Stooq × 1).  Reusing one client
+# avoids spinning up a new TCP connection for each call.
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=TIMEOUT)
+    return _http_client
+
 
 async def _query(function: str, symbol: str, **extra) -> Optional[Dict[str, Any]]:
     """Generic Alpha Vantage query helper."""
@@ -28,14 +40,14 @@ async def _query(function: str, symbol: str, **extra) -> Optional[Dict[str, Any]
         **extra,
     }
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            resp = await client.get(BASE_URL, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-            if "Error Message" in data or "Note" in data:
-                logger.warning("Alpha Vantage response issue: %s", data)
-                return None
-            return data
+        client = _get_http_client()
+        resp = await client.get(BASE_URL, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        if "Error Message" in data or "Note" in data:
+            logger.warning("Alpha Vantage response issue: %s", data)
+            return None
+        return data
     except Exception as exc:
         logger.error("Alpha Vantage request failed (%s %s): %s", function, symbol, exc)
         return None
@@ -96,36 +108,36 @@ async def fetch_sgx_nifty() -> Dict[str, Any]:
     """
     result: Dict[str, Any] = {"value": 0.0, "change_pct": 0.0, "signal": "FLAT"}
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                "https://stooq.com/q/l/",
-                params={"s": "^nsei", "f": "sd2t2ohlcvn", "h": "", "e": "csv"},
-                headers={"User-Agent": "Mozilla/5.0"},
-                follow_redirects=True,
-            )
-            resp.raise_for_status()
-            # CSV columns (with header flag): Symbol,Date,Time,Open,High,Low,Close,Volume,Name
-            lines = [
-                line for line in resp.text.strip().splitlines()
-                if line and not line.startswith("Symbol")
-            ]
-            if lines:
-                parts = lines[0].split(",")
-                if len(parts) >= 7:
-                    open_p = float(parts[3])
-                    close_p = float(parts[6])
-                    if open_p > 0:
-                        change_pct = round(((close_p - open_p) / open_p) * 100, 3)
-                        result["value"] = close_p
-                        result["change_pct"] = change_pct
-                        if change_pct > 0.2:
-                            result["signal"] = "GAP_UP"
-                        elif change_pct < -0.2:
-                            result["signal"] = "GAP_DOWN"
-                        logger.info(
-                            "Nifty50 via Stooq: close=%.2f change=%.3f%% signal=%s",
-                            close_p, change_pct, result["signal"],
-                        )
+        client = _get_http_client()
+        resp = await client.get(
+            "https://stooq.com/q/l/",
+            params={"s": "^nsei", "f": "sd2t2ohlcvn", "h": "", "e": "csv"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+        # CSV columns (with header flag): Symbol,Date,Time,Open,High,Low,Close,Volume,Name
+        lines = [
+            line for line in resp.text.strip().splitlines()
+            if line and not line.startswith("Symbol")
+        ]
+        if lines:
+            parts = lines[0].split(",")
+            if len(parts) >= 7:
+                open_p = float(parts[3])
+                close_p = float(parts[6])
+                if open_p > 0:
+                    change_pct = round(((close_p - open_p) / open_p) * 100, 3)
+                    result["value"] = close_p
+                    result["change_pct"] = change_pct
+                    if change_pct > 0.2:
+                        result["signal"] = "GAP_UP"
+                    elif change_pct < -0.2:
+                        result["signal"] = "GAP_DOWN"
+                    logger.info(
+                        "Nifty50 via Stooq: close=%.2f change=%.3f%% signal=%s",
+                        close_p, change_pct, result["signal"],
+                    )
     except Exception as exc:
         logger.warning("Stooq Nifty50 fetch failed: %s — using FLAT", exc)
     return result

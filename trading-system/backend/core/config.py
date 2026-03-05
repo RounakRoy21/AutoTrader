@@ -83,6 +83,10 @@ class Settings(BaseSettings):
     max_open_positions: int = 3
     max_trades_per_day: int = 6
     daily_drawdown_limit_pct: float = 0.03
+    # SH2: Gap-at-open filter — reject signals when stock gapped up more than
+    # this percentage vs previous close.  NSE intraday longs on >1.5% gap-up
+    # stocks have a high false-signal rate due to early mean-reversion pressure.
+    gap_filter_pct: float = 1.5
 
     # ── Derived helpers ───────────────────────────
     @property

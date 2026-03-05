@@ -13,15 +13,26 @@ from fastapi import APIRouter, Request
 from core.config import get_settings
 from core.database import check_db_health
 from core.redis_client import check_redis_health, get_redis, get_value, set_value
+from core.redis_keys import (
+    HALT_KEY,
+    KITE_TOKEN_KEY,
+    RESEARCH_STATUS_KEY,
+    TRADING_STATUS_KEY,
+    RESEARCH_STEP_KEY,
+    RESEARCH_LAST_BIAS_KEY,
+    RESEARCH_LAST_CONFIDENCE_KEY,
+    RESEARCH_LAST_RUN_COMPLETED_KEY,
+    DAILY_TRADE_COUNT_KEY,
+    TRADING_LAST_SIGNAL_STOCK_KEY,
+    TRADING_LAST_SIGNAL_TIME_KEY,
+    RISK_STATUS_KEY,
+    RISK_DAILY_LOSS_KEY,
+    RISK_DRAWDOWN_PCT_KEY,
+)
 from agents.trading_agent_manager import get_trading_agent_manager
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["System"])
-
-# ── Redis keys for agent state ────────────────────
-HALT_KEY = "trading_halt"
-RESEARCH_STATUS_KEY = "agent:research:status"
-TRADING_STATUS_KEY = "agent:trading:status"
 
 
 def _envelope(success: bool, data=None, error=None):
@@ -40,16 +51,16 @@ async def get_agent_status():
         RESEARCH_STATUS_KEY,            # 0
         TRADING_STATUS_KEY,             # 1
         HALT_KEY,                       # 2
-        "agent:research:step",          # 3
-        "agent:research:last_bias",     # 4
-        "agent:research:last_confidence",  # 5
-        "agent:research:last_run_completed",  # 6
-        "daily_trade_count",            # 7
-        "agent:trading:last_signal_stock",  # 8
-        "agent:trading:last_signal_time",   # 9
-        "agent:risk:status",            # 10
-        "agent:risk:daily_loss",        # 11
-        "agent:risk:drawdown_pct",      # 12
+        RESEARCH_STEP_KEY,              # 3
+        RESEARCH_LAST_BIAS_KEY,         # 4
+        RESEARCH_LAST_CONFIDENCE_KEY,   # 5
+        RESEARCH_LAST_RUN_COMPLETED_KEY,  # 6
+        DAILY_TRADE_COUNT_KEY,          # 7
+        TRADING_LAST_SIGNAL_STOCK_KEY,  # 8
+        TRADING_LAST_SIGNAL_TIME_KEY,   # 9
+        RISK_STATUS_KEY,                # 10
+        RISK_DAILY_LOSS_KEY,            # 11
+        RISK_DRAWDOWN_PCT_KEY,          # 12
     ]
     try:
         r = await get_redis()
@@ -123,7 +134,7 @@ async def health_check():
     redis_ok = await check_redis_health()
 
     # Kite health: just check if we have a valid token in Redis
-    kite_token = await get_value("kite_access_token")
+    kite_token = await get_value(KITE_TOKEN_KEY)
     kite_ok = kite_token is not None and len(kite_token) > 0
 
     all_ok = db_ok and redis_ok

@@ -19,6 +19,7 @@ from sqlalchemy import select
 from core.config import get_settings
 from core.database import get_db_context
 from core.redis_client import get_value, increment, publish, set_value, subscribe
+from core.redis_keys import HALT_KEY, TRADING_STATUS_KEY, DAILY_TRADE_COUNT_KEY
 from integrations import ltp_store as ltp_store_module
 from integrations.kite_client import get_kite_client
 from integrations.telegram_client import send_telegram, send_trade_entry_alert
@@ -34,8 +35,7 @@ from .scanner import Scanner
 logger = logging.getLogger(__name__)
 
 IST = pytz.timezone("Asia/Kolkata")
-TRADE_COUNT_KEY = "daily_trade_count"
-HALT_KEY = "trading_halt"
+TRADE_COUNT_KEY = DAILY_TRADE_COUNT_KEY  # alias kept for internal clarity
 
 
 class TradingAgent:

@@ -21,10 +21,12 @@ router = APIRouter(prefix="/api/trades", tags=["Trades"])
 @router.get("", response_model=List[TradeResponse])
 async def get_trades(
     trade_date: Optional[date] = Query(None, alias="date"),
+    limit: int = Query(default=100, ge=1, le=500, description="Max rows to return"),
+    offset: int = Query(default=0, ge=0, description="Rows to skip"),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return all trades, optionally filtered by date."""
-    stmt = select(Trade).order_by(Trade.created_at.desc())
+    """Return trades, optionally filtered by date. Paginated via limit/offset."""
+    stmt = select(Trade).order_by(Trade.created_at.desc()).limit(limit).offset(offset)
     if trade_date:
         stmt = stmt.where(Trade.trade_date == trade_date)
     result = await db.execute(stmt)

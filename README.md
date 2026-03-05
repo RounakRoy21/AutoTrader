@@ -26,25 +26,25 @@ An automated NSE intraday equity trading system. Streams live tick data from Zer
                      │                    │  State recovery on restart  │  │
                      │                    └────────────┬────────────────┘  │
                      │                                 │                   │
-                     │  ┌──────────────────────────────▼───────────────┐  │
-                     │  │                 Risk Manager                  │  │
-                     │  │  Poll every 5s — no LLM involved             │  │
-                     │  │  Stop-loss / target monitoring                │  │
-                     │  │  Trailing SL, daily drawdown halt            │  │
-                     │  │  Hard square-off at 15:00 IST                │  │
-                     │  └──────────────────────────────────────────────┘  │
+                     │  ┌──────────────────────────────▼───────────────┐   │
+                     │  │                 Risk Manager                 │   │
+                     │  │  Poll every 5s — no LLM involved             │   │
+                     │  │  Stop-loss / target monitoring               │   │
+                     │  │  Trailing SL, daily drawdown halt            │   │
+                     │  │  Hard square-off at 15:00 IST                │   │
+                     │  └──────────────────────────────────────────────┘   │
                      │                                                     │
-06:00–09:10 IST      │  ┌──────────────────────────────────────────────┐  │
-                     │  │            Research Agent                     │  │
-  Alpha Vantage  ───►│  │  SGX Nifty, DXY, US market close, FII/DII   │  │
-  NewsAPI        ───►│  │  → Claude synthesises → Market Brief         │  │
-  NSE data       ───►│  │  → published to Redis + PostgreSQL           │  │
-                     │  └──────────────────────────────────────────────┘  │
+06:00–09:10 IST      │  ┌──────────────────────────────────────────────┐   │
+                     │  │            Research Agent                    │   │
+  Alpha Vantage  ───►│  │  SGX Nifty, DXY, US market close, FII/DII    │   │
+  NewsAPI        ───►│  │  → Claude synthesises → Market Brief         │   │
+  NSE data       ───►│  │  → published to Redis + PostgreSQL           │   │
+                     │  └──────────────────────────────────────────────┘   │
                      │                           │                         │
-                     │              ┌────────────▼──────────┐             │
-                     │              │  PostgreSQL            │             │
-                     │              │  Redis (pub/sub, LTP)  │             │
-                     │              └────────────────────────┘             │
+                     │              ┌────────────▼──────────┐              │
+                     │              │  PostgreSQL           │              │
+                     │              │  Redis (pub/sub, LTP) │              │
+                     │              └───────────────────────┘              │
                      └─────────────────────────────────────────────────────┘
                                           │ REST + WebSocket
                                           ▼
