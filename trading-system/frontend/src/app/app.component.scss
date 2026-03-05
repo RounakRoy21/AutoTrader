@@ -1,0 +1,27 @@
+.toolbar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 1000;
+}
+
+.sidenav-container {
+  position: absolute;
+  top: 64px;
+  bottom: 0;
+  left: 0;
+  right: 0;
+}
+
+.sidenav {
+  width: 220px;
+}
+
+.content {
+  padding: 24px;
+}
+
+.active {
+  background-color: rgba(0, 0, 0, 0.04);
+}

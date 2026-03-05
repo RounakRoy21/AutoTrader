@@ -1,0 +1,26 @@
+# Dependencies — reinstalled inside the build
+node_modules/
+
+# Build output — rebuilt inside the image
+dist/
+.angular/
+
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# Tests
+coverage/
+e2e/
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,131 @@
+<div class="dashboard-grid">
+  <!-- Agent Status -->
+  <mat-card class="status-card">
+    <mat-card-header>
+      <mat-card-title>System Status</mat-card-title>
+    </mat-card-header>
+    <mat-card-content>
+      <div class="status-row">
+        <span class="status-dot" [class.active]="agentStatus.research_agent.status === 'ACTIVE'"></span>
+        <span>Research Agent: <strong>{{ agentStatus.research_agent.status }}</strong></span>
+      </div>
+      <div class="status-row">
+        <span class="status-dot" [class.active]="agentStatus.trading_agent.status === 'ACTIVE'"></span>
+        <span>Trading Agent: <strong>{{ agentStatus.trading_agent.status }}</strong></span>
+      </div>
+      <div class="status-row">
+        <span class="status-dot" [class.active]="agentStatus.risk_manager?.status === 'ACTIVE'"></span>
+        <span>Risk Manager: <strong>{{ agentStatus.risk_manager?.status ?? 'INACTIVE' }}</strong></span>
+      </div>
+
+      <div class="status-row halt-row" *ngIf="agentStatus.trading_agent.trading_halted">
+        <mat-icon color="warn">warning</mat-icon>
+        <span class="loss">&nbsp;TRADING HALTED</span>
+      </div>
+
+      <!-- Drawdown bar -->
+      <div class="drawdown-section" *ngIf="agentStatus.risk_manager">
+        <div class="drawdown-label">
+          Daily Drawdown: {{ drawdownPct | number:'1.1-1' }}%
+          <span class="drawdown-loss"
+                *ngIf="agentStatus.risk_manager.daily_loss > 0">
+            (₹{{ agentStatus.risk_manager.daily_loss | number:'1.0-0' }} lost)
+          </span>
+        </div>
+        <mat-progress-bar
+          [mode]="'determinate'"
+          [value]="drawdownPct"
+          [color]="drawdownColor">
+        </mat-progress-bar>
+      </div>
+
+      <div class="halt-controls">
+        <button mat-stroked-button color="warn"
+                (click)="halt()"
+                [disabled]="agentStatus.trading_agent.trading_halted">
+          Halt Trades
+        </button>
+        <button mat-stroked-button color="primary"
+                (click)="resume()"
+                [disabled]="!agentStatus.trading_agent.trading_halted">
+          Resume Trades
+        </button>
+      </div>
+      <div class="agent-controls">
+        <button mat-flat-button color="primary"
+                (click)="startAgent()"
+                [disabled]="agentStatus.trading_agent.status === 'ACTIVE' || agentActionInProgress">
+          <mat-icon>play_arrow</mat-icon> Start Agent
+        </button>
+        <button mat-flat-button color="warn"
+                (click)="stopAgent()"
+                [disabled]="agentStatus.trading_agent.status !== 'ACTIVE' || agentActionInProgress">
+          <mat-icon>stop</mat-icon> Stop Agent
+        </button>
+      </div>
+    </mat-card-content>
+  </mat-card>
+
+  <!-- Live P&L Ticker -->
+  <mat-card class="pnl-card">
+    <mat-card-header>
+      <mat-card-title>Today's P&L</mat-card-title>
+    </mat-card-header>
+    <mat-card-content>
+      <div class="pnl-value" [class.profit]="todayPnl >= 0" [class.loss]="todayPnl < 0">
+        ₹{{ todayPnl | number:'1.2-2' }}
+      </div>
+      <div class="pnl-detail">
+        Open Positions: {{ openPositions.length }}
+      </div>
+    </mat-card-content>
+  </mat-card>
+
+  <!-- Market Brief Summary -->
+  <mat-card class="brief-card" *ngIf="brief">
+    <mat-card-header>
+      <mat-card-title>Market Brief</mat-card-title>
+      <mat-card-subtitle>Generated: {{ brief.generated_at | date:'shortTime' }}</mat-card-subtitle>
+    </mat-card-header>
+    <mat-card-content>
+      <div class="bias-badge" [ngClass]="brief.market_bias.toLowerCase()">
+        {{ brief.market_bias }} ({{ brief.bias_confidence }}%)
+      </div>
+      <div class="brief-signals">
+        <div *ngIf="brief.fii_signal"><strong>FII/DII:</strong> {{ brief.fii_signal }}</div>
+        <div *ngIf="brief.sgx_nifty_signal"><strong>SGX Nifty:</strong> {{ brief.sgx_nifty_signal }}</div>
+        <div *ngIf="brief.dxy_signal"><strong>DXY:</strong> {{ brief.dxy_signal }}</div>
+        <div *ngIf="brief.us_markets_signal"><strong>US Markets:</strong> {{ brief.us_markets_signal }}</div>
+      </div>
+      <div class="watchlist" *ngIf="brief.watchlist?.length">
+        <strong>Watchlist:</strong>
+        <mat-chip-set>
+          <mat-chip *ngFor="let s of brief.watchlist" highlighted>{{ s }}</mat-chip>
+        </mat-chip-set>
+      </div>
+      <div class="avoid-list" *ngIf="brief.avoid_list?.length">
+        <strong>Avoid:</strong>
+        <mat-chip-set>
+          <mat-chip *ngFor="let s of brief.avoid_list" color="warn">{{ s }}</mat-chip>
+        </mat-chip-set>
+      </div>
+    </mat-card-content>
+  </mat-card>
+
+  <!-- Quick Stats -->
+  <mat-card class="stats-card">
+    <mat-card-header>
+      <mat-card-title>Quick Stats</mat-card-title>
+    </mat-card-header>
+    <mat-card-content>
+      <div class="stat-item">
+        <span class="stat-label">Total Trades Today</span>
+        <span class="stat-value">{{ todayTrades }}</span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-label">Win Rate (30d)</span>
+        <span class="stat-value">{{ winRate | number:'1.1-1' }}%</span>
+      </div>
+    </mat-card-content>
+  </mat-card>
+</div>

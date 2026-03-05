@@ -1,0 +1,37 @@
+<mat-toolbar color="primary" class="toolbar">
+  <button mat-icon-button (click)="sidenav.toggle()">
+    <mat-icon>menu</mat-icon>
+  </button>
+  <span>AutoTrader Dashboard</span>
+</mat-toolbar>
+
+<mat-sidenav-container class="sidenav-container">
+  <mat-sidenav #sidenav mode="side" opened class="sidenav">
+    <mat-nav-list>
+      <a mat-list-item routerLink="/dashboard" routerLinkActive="active">
+        <mat-icon matListItemIcon>dashboard</mat-icon>
+        <span matListItemTitle>Dashboard</span>
+      </a>
+      <a mat-list-item routerLink="/positions" routerLinkActive="active">
+        <mat-icon matListItemIcon>trending_up</mat-icon>
+        <span matListItemTitle>Open Positions</span>
+      </a>
+      <a mat-list-item routerLink="/trades" routerLinkActive="active">
+        <mat-icon matListItemIcon>receipt_long</mat-icon>
+        <span matListItemTitle>Trade Log</span>
+      </a>
+      <a mat-list-item routerLink="/pnl" routerLinkActive="active">
+        <mat-icon matListItemIcon>show_chart</mat-icon>
+        <span matListItemTitle>P&L Chart</span>
+      </a>
+      <a mat-list-item routerLink="/alerts" routerLinkActive="active">
+        <mat-icon matListItemIcon>notifications</mat-icon>
+        <span matListItemTitle>System Alerts</span>
+      </a>
+    </mat-nav-list>
+  </mat-sidenav>
+
+  <mat-sidenav-content class="content">
+    <router-outlet></router-outlet>
+  </mat-sidenav-content>
+</mat-sidenav-container>

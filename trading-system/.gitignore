@@ -1,0 +1,35 @@
+# Environment
+.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Node / Angular
+node_modules/
+frontend/dist/
+frontend/.angular/
+
+# Docker
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Alembic
+backend/migrations/versions/*.pyc

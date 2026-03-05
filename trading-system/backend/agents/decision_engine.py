@@ -1,0 +1,624 @@
+"""
+Decision Engine — LLM-backed trade approval module.
+
+Receives scanner signals, applies hard pre-checks (day rules, position caps,
+watchlist/avoid list), then consults Claude for final trade decisions.
+All LLM responses are validated against a Pydantic model before use.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from datetime import date, datetime
+from typing import Optional
+
+import pytz
+from sqlalchemy import func, select
+
+from core.config import get_settings
+from core.database import get_db_context
+from core.redis_client import get_value, increment, publish, set_value
+from integrations.anthropic_client import get_anthropic_client
+from models.trade import Trade
+from schemas.decision import Decision, DecisionOutput, SignalAudit
+from schemas.market_brief import MarketBriefLLMOutput, RecommendedStance
+from schemas.trade import ScannerSignal
+
+logger = logging.getLogger(__name__)
+
+IST = pytz.timezone("Asia/Kolkata")
+
+TRADE_COUNT_KEY = "daily_trade_count"
+HALT_KEY = "trading_halt"
+
+# ── Signal-quality thresholds ─────────────────────────────────────────────────
+# These values are stated verbatim in DECISION_SYSTEM_PROMPT so the LLM reasons
+# with the same numbers, and are independently enforced in _validate_decision()
+# regardless of what the LLM returns.
+
+# RSI (14-period, 1-min ticks) — long-only system
+RSI_LONG_MIN: float = 40.0        # below: momentum too weak / counter-trend
+RSI_LONG_MAX: float = 72.0        # above: overbought — late-entry risk
+RSI_HARD_REJECT_LOW: float = 28.0  # falling-knife territory — hard reject
+RSI_HARD_REJECT_HIGH: float = 80.0 # extreme overbought — hard reject
+
+# Volume ratio vs. session average
+VOLUME_RATIO_HARD_REJECT: float = 1.2  # no signal validity below this
+VOLUME_RATIO_MIN: float = 1.5          # minimum for a tradeable signal
+
+# VWAP deviation for a long entry: (price - vwap) / vwap * 100
+VWAP_DEV_MAX_PCT: float = 1.5          # overextended long above this
+VWAP_DEV_REDUCE_PCT: float = 0.8       # elevated mean-reversion risk → reduce
+VWAP_DEV_HARD_REJECT_PCT: float = 2.0  # hard reject beyond this (above VWAP)
+VWAP_DEV_BELOW_HARD_PCT: float = -1.0  # hard reject: price ≥ 1% BELOW VWAP on a long
+
+# Risk : Reward (post SL/target clamping)
+RR_MIN: float = 2.0  # industry standard minimum for NSE MIS intraday
+
+# LLM confidence score thresholds (0–100)
+CONFIDENCE_HARD_REJECT: int = 45   # < 45 → REJECT regardless
+CONFIDENCE_REDUCE_THRESHOLD: int = 65  # 45–64 → REDUCE; ≥ 65 → EXECUTE eligible
+
+DECISION_SYSTEM_PROMPT = (
+    "You are an NSE intraday equity trader (MIS). You receive a scanner signal and market "
+    "brief and must decide: EXECUTE, REDUCE (half qty), or REJECT. "
+    "Return ONLY a valid JSON object matching the DecisionOutput schema — no prose, no markdown fences.\n\n"
+
+    "MANDATORY ENTRY THRESHOLDS (verify each before deciding):\n"
+    "  1. RSI (1-min, 14-period): Valid long zone 40–72. "
+    "     Hard reject if RSI > 80 or RSI < 28.\n"
+    "  2. Volume ratio: Minimum 1.5× daily avg. "
+    "     Hard reject if < 1.2×.\n"
+    "  3. VWAP deviation (LONG): price must be 0 %–1.5 % above VWAP. "
+    "     Hard reject if > 2.0 % above OR ≥ 1.0 % below. Reduce if > 0.8 % above or any below VWAP.\n"
+    "  4. EMA alignment: EMA-9 > EMA-21 confirms uptrend. "
+    "     Reduce qty if misaligned (when EMAs are available).\n"
+    "  5. MACD histogram: Positive confirms direction. "
+    "     Reduce qty if negative (when available).\n"
+    "  6. Risk:Reward: Minimum 2.0 = |target−entry| / |entry−stop|. "
+    "     Hard reject if < 2.0.\n"
+    "  7. Market bias: BEARISH market + LONG signal = REJECT.\n\n"
+
+    "CONFIDENCE → DECISION MAPPING (apply strictly):\n"
+    "  confidence_score < 45   → decision = REJECT\n"
+    "  45 ≤ confidence_score < 65 → decision = REDUCE (half qty)\n"
+    "  confidence_score ≥ 65   → decision = EXECUTE (only if all hard checks pass)\n\n"
+
+    "SIGNAL AUDIT RULES:\n"
+    "  • Copy rsi_cited and volume_ratio_cited EXACTLY from the signal — they will be verified.\n"
+    "  • List ALL failing conditions in conditions_not_met, even for REDUCE decisions.\n"
+    "  • Never fabricate or round signal values."
+)
+
+
+def _rebuild_conditions(
+    audit: SignalAudit,
+    vwap_dev_pct: float,
+    actual_rr: float,
+    vwap_unavailable: bool = False,
+) -> list[str]:
+    """Derive the authoritative conditions_not_met list from the final audit state.
+
+    Called at the end of _validate_decision() so the stored audit trail reflects
+    what the validator *actually* found rather than what the LLM reported.  Any
+    field the LLM got wrong but was overwritten in Step 2 is now reflected here.
+    """
+    issues: list[str] = []
+    if not audit.rsi_in_range:
+        issues.append("rsi_out_of_range")
+    if not audit.volume_confirms:
+        issues.append("volume_below_threshold")
+    if not audit.price_vwap_valid:
+        if vwap_unavailable:
+            issues.append("vwap_data_unavailable")
+        elif vwap_dev_pct < 0:
+            issues.append("price_below_vwap")
+        else:
+            issues.append("price_overextended_from_vwap")
+    if audit.ema_aligned is False:
+        issues.append("ema_not_aligned")
+    if audit.macd_confirms is False:
+        issues.append("macd_against_direction")
+    if actual_rr < RR_MIN:
+        issues.append("rr_insufficient")
+    if audit.confidence_score < CONFIDENCE_REDUCE_THRESHOLD:
+        issues.append("low_confidence")
+    return issues
+
+
+class DecisionEngine:
+    """
+    Consumes signals from the Scanner's asyncio Queue, runs hard pre-checks,
+    then delegates to Claude for the final approve/reduce/reject decision.
+    """
+
+    def __init__(self, signal_queue: asyncio.Queue) -> None:
+        self._signal_queue = signal_queue
+        self._settings = get_settings()
+        self._market_brief: Optional[MarketBriefLLMOutput] = None
+        self._running = False
+
+    def set_market_brief(self, brief: MarketBriefLLMOutput) -> None:
+        """Update the current Market Brief (called when Research Agent publishes)."""
+        self._market_brief = brief
+        logger.info("Decision Engine received market brief: bias=%s", brief.market_bias.value)
+
+    async def _count_open_positions(self) -> int:
+        """
+        Return the number of currently open positions by querying the database.
+        This is the authoritative source of truth — not an in-memory counter —
+        so it survives process restarts and Redis pub/sub misses.
+        """
+        try:
+            today = date.today()
+            async with get_db_context() as session:
+                result = await session.execute(
+                    select(func.count()).select_from(Trade).where(
+                        Trade.trade_date == today,
+                        Trade.status == "OPEN",
+                    )
+                )
+                return result.scalar() or 0
+        except Exception as exc:
+            logger.error("Failed to query open positions count: %s — defaulting to 0", exc)
+            return 0
+
+    # ── Helpers ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _is_placeholder_key(key: str) -> bool:
+        """Return True if the API key looks like a placeholder value."""
+        placeholders = {"", "placeholder", "your-key-here", "xxxx", "sk-ant-api03-placeholder"}
+        return not key or any(p in key.lower() for p in placeholders)
+
+    def _mock_decision(self, signal: ScannerSignal) -> DecisionOutput:
+        """
+        Generate a deterministic mock DecisionOutput for paper trading / testing.
+        Uses ATR-based SL/TGT when available, otherwise fixed percentages.
+        Computes a real SignalAudit from the signal so downstream validation
+        can apply the same hard rules even in paper mode.
+        """
+        from schemas.decision import ProductType as DecisionProductType
+        if signal.atr and signal.atr > 0:
+            sl  = round(signal.ltp - signal.atr * self._settings.atr_sl_multiplier, 2)
+            tgt = round(signal.ltp + signal.atr * self._settings.atr_target_multiplier, 2)
+        else:
+            sl  = round(signal.ltp * (1 - self._settings.stop_loss_pct), 2)
+            tgt = round(signal.ltp * (1 + self._settings.min_target_pct), 2)
+
+        # Compute SignalAudit from actual signal values
+        vwap_dev = ((signal.ltp - signal.vwap) / signal.vwap * 100) if signal.vwap else 0.0
+        sl_dist  = abs(signal.ltp - sl)
+        rr       = round(abs(tgt - signal.ltp) / sl_dist, 2) if sl_dist > 0 else 2.0
+        ema_ok   = (
+            signal.ema_9 > signal.ema_21
+            if (signal.ema_9 is not None and signal.ema_21 is not None)
+            else None
+        )
+        macd_ok = (
+            signal.macd_histogram > 0
+            if signal.macd_histogram is not None
+            else None
+        )
+        audit = SignalAudit(
+            rsi_cited=signal.rsi,
+            rsi_in_range=(RSI_LONG_MIN <= signal.rsi <= RSI_LONG_MAX),
+            volume_ratio_cited=signal.volume_ratio,
+            volume_confirms=(signal.volume_ratio >= VOLUME_RATIO_MIN),
+            vwap_deviation_pct=round(vwap_dev, 3),
+            price_vwap_valid=(0.0 <= vwap_dev <= VWAP_DEV_MAX_PCT),
+            ema_aligned=ema_ok,
+            macd_confirms=macd_ok,
+            risk_reward_ratio=rr,
+            confidence_score=70,  # neutral paper-trading confidence
+            conditions_not_met=[],
+        )
+        logger.info(
+            "[MOCK] Paper decision for %s: qty=%d SL=%.2f TGT=%.2f ATR=%s",
+            signal.stock, signal.suggested_qty, sl, tgt,
+            f"{signal.atr:.2f}" if signal.atr else "N/A",
+        )
+        return DecisionOutput(
+            decision=Decision.EXECUTE,
+            adjusted_qty=signal.suggested_qty,
+            stop_loss_price=sl,
+            target_price=tgt,
+            rationale=(
+                f"[MOCK] Paper trade — RSI={signal.rsi:.1f} "
+                f"VolRatio={signal.volume_ratio:.2f} LTP={signal.ltp:.2f}"
+            ),
+            product_type=DecisionProductType.MIS,
+            signal_audit=audit,
+        )
+
+    async def _pre_check(self, signal: ScannerSignal) -> tuple[bool, str, ScannerSignal]:
+        """
+        Run hard pre-checks before consulting the LLM.
+        Returns (passed, reason, potentially_modified_signal).
+        """
+        now_ist = datetime.now(IST)
+        day_name = now_ist.strftime("%A")
+
+        # Check trading halt
+        halt = await get_value(HALT_KEY)
+        if halt == "TRUE":
+            return False, "Trading is halted", signal
+
+        # Check per-stock lock (stock stopped out today → locked for session)
+        if self._settings.stock_lock_after_sl:
+            lock = await get_value(f"stock_lock:{signal.stock}")
+            if lock == "TRUE":
+                return False, f"{signal.stock} locked after stop-loss today", signal
+
+        # Check consecutive loss pause
+        consec_str = await get_value("consecutive_losses")
+        consec_count = int(consec_str) if consec_str else 0
+        if consec_count >= self._settings.consecutive_loss_pause_threshold:
+            pause_until_str = await get_value("consecutive_loss_pause_until")
+            if pause_until_str:
+                try:
+                    pause_until = datetime.fromisoformat(pause_until_str)
+                    if now_ist < pause_until:
+                        remaining = int((pause_until - now_ist).total_seconds() / 60)
+                        return False, f"Paused: {consec_count} consecutive losses — {remaining} min left", signal
+                    else:
+                        await set_value("consecutive_losses", "0")
+                except (ValueError, TypeError):
+                    pass
+
+        # Check market brief stance and stock filters
+        size_reduced = False
+        if self._market_brief:
+            # Recommended stance enforcement
+            stance = self._market_brief.recommended_stance
+            if stance == RecommendedStance.AVOID_TRADING:
+                return False, "Market brief recommends avoiding trading today", signal
+
+            watchlist = self._market_brief.watchlist_today
+            avoid = self._market_brief.avoid_today
+            if signal.stock in avoid:
+                return False, f"{signal.stock} is in today's avoid list", signal
+            if watchlist and signal.stock not in watchlist:
+                return False, f"{signal.stock} not in today's watchlist", signal
+
+            # Half-size positions based on market brief stance
+            if stance == RecommendedStance.HALF_SIZE_POSITIONS:
+                signal = signal.model_copy(
+                    update={"suggested_qty": max(1, signal.suggested_qty // 2)}
+                )
+                size_reduced = True
+                logger.info("Half-size stance: reduced quantity to %d", signal.suggested_qty)
+
+        # Check max open positions (authoritative DB query — not an in-memory counter)
+        open_count = await self._count_open_positions()
+        if open_count >= self._settings.max_open_positions:
+            return False, f"Max open positions ({self._settings.max_open_positions}) reached", signal
+
+        # Prevent duplicate position in the same stock
+        try:
+            async with get_db_context() as session:
+                dup_result = await session.execute(
+                    select(func.count()).select_from(Trade).where(
+                        Trade.stock == signal.stock,
+                        Trade.trade_date == date.today(),
+                        Trade.status.in_(["OPEN", "CLOSING"]),
+                    )
+                )
+                if (dup_result.scalar() or 0) > 0:
+                    return False, f"Position already open for {signal.stock}", signal
+        except Exception as exc:
+            logger.error("Failed to check duplicate position for %s: %s", signal.stock, exc)
+
+        # Check daily trade count
+        trade_count_str = await get_value(TRADE_COUNT_KEY)
+        trade_count = int(trade_count_str) if trade_count_str else 0
+        if trade_count >= self._settings.max_trades_per_day:
+            return False, f"Max daily trades ({self._settings.max_trades_per_day}) reached", signal
+
+        # Monday: half-size positions (skip if already halved by stance above)
+        if day_name == "Monday" and not size_reduced:
+            signal = signal.model_copy(
+                update={"suggested_qty": max(1, signal.suggested_qty // 2)}
+            )
+            logger.info("Monday rule: halved quantity to %d", signal.suggested_qty)
+
+        # Friday after 2:00 PM: reject all new entries
+        if day_name == "Friday" and now_ist.hour >= 14:
+            return False, "Friday after 2:00 PM — no new entries", signal
+
+        return True, "Pre-checks passed", signal
+
+    async def _call_llm(self, signal: ScannerSignal) -> Optional[DecisionOutput]:
+        """Send signal + market brief to Claude for a trade decision.
+        Returns a mock decision immediately when in paper mode or key is a placeholder.
+        """
+        # ── Paper trading / missing key → skip LLM ──
+        if self._settings.paper_trading or self._is_placeholder_key(self._settings.anthropic_api_key):
+            return self._mock_decision(signal)
+
+        # ── Live mode: call Claude ──
+        brief_summary = "No market brief available."
+        if self._market_brief:
+            brief_summary = json.dumps(self._market_brief.model_dump(), default=str)
+
+        sl_rule = (
+            f"ATR-based: entry − ATR({signal.atr:.2f}) × {self._settings.atr_sl_multiplier}"
+            if signal.atr and signal.atr > 0
+            else "0.8% below entry price"
+        )
+        tgt_rule = (
+            f"ATR-based: entry + ATR({signal.atr:.2f}) × {self._settings.atr_target_multiplier}"
+            if signal.atr and signal.atr > 0
+            else "1.6% above entry price (min 1:2 risk-reward)"
+        )
+        user_content = (
+            f"TRADE SIGNAL:\n{json.dumps(signal.model_dump(), default=str)}\n\n"
+            f"MARKET BRIEF:\n{brief_summary}\n\n"
+            f"Stop-loss rule: {sl_rule}.\n"
+            f"Minimum target: {tgt_rule}.\n"
+            f"Today is {datetime.now(IST).strftime('%A')}.\n\n"
+            "THRESHOLDS QUICK REFERENCE (apply to signal_audit fields):\n"
+            f"  RSI valid zone (LONG): {RSI_LONG_MIN}–{RSI_LONG_MAX}  "
+            f"| hard reject < {RSI_HARD_REJECT_LOW} or > {RSI_HARD_REJECT_HIGH}\n"
+            f"  Volume ratio minimum: {VOLUME_RATIO_MIN}×  "
+            f"| hard reject < {VOLUME_RATIO_HARD_REJECT}×\n"
+            f"  VWAP deviation (LONG): 0 %–{VWAP_DEV_MAX_PCT} %  "
+            f"| hard reject > {VWAP_DEV_HARD_REJECT_PCT} % above or < {VWAP_DEV_BELOW_HARD_PCT} % (below VWAP)  "
+            f"| reduce > {VWAP_DEV_REDUCE_PCT} % above or any below VWAP\n"
+            f"  R:R minimum: {RR_MIN}  "
+            f"| Confidence → EXECUTE ≥ {CONFIDENCE_REDUCE_THRESHOLD}, "
+            f"REDUCE ≥ {CONFIDENCE_HARD_REJECT}, else REJECT\n\n"
+            "Return your decision as a JSON object."
+        )
+
+        client = get_anthropic_client()
+        return await client.generate_structured(
+            system_prompt=DECISION_SYSTEM_PROMPT,
+            user_content=user_content,
+            response_model=DecisionOutput,
+        )
+
+    def _validate_decision(
+        self, signal: ScannerSignal, decision: DecisionOutput
+    ) -> DecisionOutput:
+        """Post-validate and harden the LLM decision against quantified signal-quality
+        thresholds and hard risk rules.
+
+        Execution order (matters for correctness):
+          1. Clamp SL / target / qty to hard minimums  (existing safety net)
+          2. Recompute every signal_audit field from the raw signal + final prices
+             so the LLM cannot misreport signal values.
+          3. Apply hard REJECT rules  (RSI, volume, VWAP, R:R, confidence floor).
+          4. Apply soft REDUCE rules  (RSI borderline, EMA misaligned, MACD negative,
+             VWAP extended, confidence below preferred threshold).
+        """
+        settings = self._settings
+        audit = decision.signal_audit
+
+        # ── Step 1: SL / target / qty clamping (identical to original logic) ──
+        if signal.atr and signal.atr > 0:
+            min_sl = round(signal.ltp - signal.atr * settings.atr_sl_multiplier, 2)
+        else:
+            min_sl = round(signal.ltp * (1 - settings.stop_loss_pct), 2)
+        if decision.stop_loss_price > min_sl:
+            logger.warning(
+                "LLM SL ₹%.2f too tight for %s (entry ₹%.2f) — clamping to ₹%.2f",
+                decision.stop_loss_price, signal.stock, signal.ltp, min_sl,
+            )
+            decision = decision.model_copy(update={"stop_loss_price": min_sl})
+
+        if signal.atr and signal.atr > 0:
+            min_target = round(signal.ltp + signal.atr * settings.atr_target_multiplier, 2)
+        else:
+            min_target = round(signal.ltp * (1 + settings.min_target_pct), 2)
+        if decision.target_price < min_target:
+            logger.warning(
+                "LLM target ₹%.2f too close for %s (entry ₹%.2f) — clamping to ₹%.2f",
+                decision.target_price, signal.stock, signal.ltp, min_target,
+            )
+            decision = decision.model_copy(update={"target_price": min_target})
+
+        if decision.decision != Decision.REJECT and decision.adjusted_qty < 1:
+            logger.warning("LLM returned qty=0 for %s — clamping to 1", signal.stock)
+            decision = decision.model_copy(update={"adjusted_qty": 1})
+
+        if decision.adjusted_qty > signal.suggested_qty:
+            logger.warning(
+                "LLM qty %d exceeds scanner suggestion %d for %s — clamping",
+                decision.adjusted_qty, signal.suggested_qty, signal.stock,
+            )
+            decision = decision.model_copy(update={"adjusted_qty": signal.suggested_qty})
+
+        # ── Step 2: Recompute signal_audit from ground-truth signal values ────
+        # The LLM's factual assertions are overwritten so they cannot be gamed.
+        # confidence_score is the only field trusted verbatim from the LLM.
+        vwap_unavailable = not signal.vwap or signal.vwap <= 0
+        vwap_dev_pct = (
+            (signal.ltp - signal.vwap) / signal.vwap * 100
+            if not vwap_unavailable
+            else 0.0
+        )
+        sl_dist  = abs(signal.ltp - decision.stop_loss_price)
+        tgt_dist = abs(decision.target_price - signal.ltp)
+        actual_rr = round(tgt_dist / sl_dist, 2) if sl_dist > 0 else 0.0
+
+        ema_aligned: Optional[bool] = None
+        if signal.ema_9 is not None and signal.ema_21 is not None:
+            ema_aligned = signal.ema_9 > signal.ema_21
+
+        macd_confirms: Optional[bool] = None
+        if signal.macd_histogram is not None:
+            macd_confirms = signal.macd_histogram > 0
+
+        audit = audit.model_copy(update={
+            "rsi_cited":           signal.rsi,
+            "rsi_in_range":        RSI_LONG_MIN <= signal.rsi <= RSI_LONG_MAX,
+            "volume_ratio_cited":  signal.volume_ratio,
+            "volume_confirms":     signal.volume_ratio >= VOLUME_RATIO_MIN,
+            "vwap_deviation_pct":  round(vwap_dev_pct, 3),
+            "price_vwap_valid":    (not vwap_unavailable) and (0.0 <= vwap_dev_pct <= VWAP_DEV_MAX_PCT),
+            "ema_aligned":         ema_aligned,
+            "macd_confirms":       macd_confirms,
+            "risk_reward_ratio":   actual_rr,
+        })
+        decision = decision.model_copy(update={"signal_audit": audit})
+
+        # Short-circuit: LLM already rejected — keep the REJECT, skip further checks.
+        if decision.decision == Decision.REJECT:
+            return decision
+
+        # ── Step 3: Hard REJECT rules ─────────────────────────────────────────
+        reject_reason: Optional[str] = None
+
+        if signal.rsi > RSI_HARD_REJECT_HIGH or signal.rsi < RSI_HARD_REJECT_LOW:
+            reject_reason = (
+                f"RSI {signal.rsi:.1f} outside hard bounds "
+                f"[{RSI_HARD_REJECT_LOW}\u2013{RSI_HARD_REJECT_HIGH}]"
+            )
+        elif signal.volume_ratio < VOLUME_RATIO_HARD_REJECT:
+            reject_reason = (
+                f"Volume ratio {signal.volume_ratio:.2f}\u00d7 below hard minimum "
+                f"{VOLUME_RATIO_HARD_REJECT}\u00d7"
+            )
+        elif vwap_dev_pct > VWAP_DEV_HARD_REJECT_PCT:
+            reject_reason = (
+                f"Price {vwap_dev_pct:.2f}% above VWAP — overextended "
+                f"(limit {VWAP_DEV_HARD_REJECT_PCT}%)"
+            )
+        elif vwap_dev_pct < VWAP_DEV_BELOW_HARD_PCT:
+            reject_reason = (
+                f"Price {vwap_dev_pct:.2f}% below VWAP — bearish intraday structure "
+                f"(hard limit {VWAP_DEV_BELOW_HARD_PCT}%)"
+            )
+        elif actual_rr < RR_MIN:
+            reject_reason = f"R:R {actual_rr:.2f} below minimum {RR_MIN}"
+        elif audit.confidence_score < CONFIDENCE_HARD_REJECT:
+            reject_reason = (
+                f"Confidence score {audit.confidence_score} below floor "
+                f"{CONFIDENCE_HARD_REJECT}"
+            )
+
+        if reject_reason:
+            logger.warning("Hard-rule REJECT for %s: %s", signal.stock, reject_reason)
+            fresh_conditions = _rebuild_conditions(audit, vwap_dev_pct, actual_rr, vwap_unavailable)
+            return decision.model_copy(update={
+                "decision":    Decision.REJECT,
+                "rationale":   f"Hard rule: {reject_reason}",
+                "signal_audit": audit.model_copy(
+                    update={"conditions_not_met": fresh_conditions}
+                ),
+            })
+
+        # ── Step 4: Soft REDUCE rules (EXECUTE → REDUCE) ─────────────────────
+        downgrade_reasons = []
+
+        if signal.rsi > RSI_LONG_MAX:
+            # Passes hard reject (≤ 80) but is above preferred zone
+            downgrade_reasons.append(
+                f"RSI {signal.rsi:.1f} above preferred max {RSI_LONG_MAX}"
+            )
+        if ema_aligned is False:
+            downgrade_reasons.append("EMA-9 below EMA-21 — short-term trend not confirmed")
+        if macd_confirms is False:
+            downgrade_reasons.append("MACD histogram negative — momentum against direction")
+        if vwap_unavailable:
+            # VWAP data missing (scanner not warmed up) — cannot confirm intraday
+            # alignment; reduce size as a precaution rather than hard-reject.
+            downgrade_reasons.append(
+                "VWAP data unavailable — reducing size as precaution"
+            )
+        elif vwap_dev_pct > VWAP_DEV_REDUCE_PCT:
+            downgrade_reasons.append(
+                f"Price {vwap_dev_pct:.2f}% above VWAP "
+                f"(> {VWAP_DEV_REDUCE_PCT}% reduce zone)"
+            )
+        elif vwap_dev_pct < 0.0:
+            # Price below VWAP: intraday sellers in control — reduce size
+            downgrade_reasons.append(
+                f"Price {vwap_dev_pct:.2f}% below VWAP — bearish intraday structure"
+            )
+        if audit.confidence_score < CONFIDENCE_REDUCE_THRESHOLD:
+            downgrade_reasons.append(
+                f"Confidence {audit.confidence_score} < {CONFIDENCE_REDUCE_THRESHOLD}"
+            )
+
+        if downgrade_reasons and decision.decision == Decision.EXECUTE:
+            new_qty = max(1, decision.adjusted_qty // 2)
+            logger.info(
+                "Downgrading %s EXECUTE\u2192REDUCE (qty %d\u2192%d): %s",
+                signal.stock, decision.adjusted_qty, new_qty,
+                "; ".join(downgrade_reasons),
+            )
+            decision = decision.model_copy(update={
+                "decision":     Decision.REDUCE,
+                "adjusted_qty": new_qty,
+            })
+
+        # ── Final: rebuild conditions_not_met from ground-truth audit state ──
+        # Replaces the LLM's original list (which may be empty or fabricated) with
+        # a list derived from what _validate_decision actually computed in Steps 2-4.
+        fresh_conditions = _rebuild_conditions(
+            decision.signal_audit, vwap_dev_pct, actual_rr, vwap_unavailable
+        )
+        final_audit = decision.signal_audit.model_copy(
+            update={"conditions_not_met": fresh_conditions}
+        )
+        decision = decision.model_copy(update={"signal_audit": final_audit})
+        return decision
+
+    async def process_signal(self, signal: ScannerSignal) -> Optional[DecisionOutput]:
+        """Process a single scanner signal through pre-checks and LLM decision."""
+        passed, reason, signal = await self._pre_check(signal)
+        if not passed:
+            logger.info("Signal rejected by pre-check: %s — %s", signal.stock, reason)
+            await publish("system_alerts", {
+                "type": "warning",
+                "message": f"Signal skipped ({signal.stock}): {reason}",
+                "timestamp": datetime.now(IST).isoformat(),
+            })
+            return None
+
+        decision = await self._call_llm(signal)
+        if decision is None:
+            logger.warning("LLM failed to return a valid decision for %s", signal.stock)
+            await publish("system_alerts", {
+                "type": "error",
+                "message": f"Decision Engine LLM failed for {signal.stock} — signal discarded",
+                "timestamp": datetime.now(IST).isoformat(),
+            })
+            return None
+
+        # Post-validate LLM output: clamp SL/target/qty to hard risk rules
+        decision = self._validate_decision(signal, decision)
+
+        if decision.decision == Decision.REJECT:
+            logger.info("LLM rejected trade: %s — %s", signal.stock, decision.rationale)
+            await publish("system_alerts", {
+                "type": "info",
+                "message": f"LLM rejected {signal.stock}: {decision.rationale}",
+                "timestamp": datetime.now(IST).isoformat(),
+            })
+            return None
+
+        logger.info(
+            "LLM decision for %s: %s qty=%d SL=%.2f TGT=%.2f — %s",
+            signal.stock, decision.decision.value, decision.adjusted_qty,
+            decision.stop_loss_price, decision.target_price, decision.rationale,
+        )
+        await publish("system_alerts", {
+            "type": "info",
+            "message": (
+                f"Decision Engine: {decision.decision.value} {signal.stock} "
+                f"@ ₹{signal.ltp:.2f} | qty={decision.adjusted_qty} | "
+                f"SL=₹{decision.stop_loss_price:.2f} TGT=₹{decision.target_price:.2f}"
+            ),
+            "timestamp": datetime.now(IST).isoformat(),
+        })
+        return decision
+
+    def stop(self) -> None:
+        """Stop the decision engine."""
+        self._running = False
+        logger.info("Decision Engine stopped")

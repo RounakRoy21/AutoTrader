@@ -1,0 +1,77 @@
+version: "3.9"
+
+services:
+  # ── PostgreSQL ────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: autotrader-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-autotrader}
+      POSTGRES_USER: ${POSTGRES_USER:-autotrader}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_postgres_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-autotrader}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ─────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: autotrader-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Backend (FastAPI) ─────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: autotrader-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: >
+      uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ── Frontend (Angular) ───────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: autotrader-frontend
+    restart: unless-stopped
+    ports:
+      - "4200:4200"
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    command: npx ng serve --host 0.0.0.0 --port 4200 --poll 2000
+
+volumes:
+  postgres_data:
+  redis_data:

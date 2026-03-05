@@ -1,0 +1,69 @@
+# Production overrides — use together with the base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# Changes vs dev:
+#   - Frontend: multi-stage build → nginx (port 80), no source-code volume mount
+#   - Backend:  no --reload, no source-code volume mount, 2 uvicorn workers
+#   - Postgres/Redis: ports NOT exposed to the host (only reachable inside Docker network)
+#   - All services: restart unless-stopped + log rotation (10 MB × 5 files)
+#   - Frontend waits for backend healthcheck before nginx starts
+
+version: "3.9"
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    ports: []   # Remove host exposure; only backend container needs it
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ── Redis ────────────────────────────────────────────────────────────
+  redis:
+    ports: []   # Same — no external exposure
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ── Backend (FastAPI) ────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    volumes: []   # No live source mount; image contains the code
+    restart: unless-stopped
+    command: >
+      uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ── Frontend (nginx serving compiled Angular) ────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: production       # Use the nginx stage, not ng serve
+    ports:
+      - "80:80"                # Single public port — nginx reverse-proxies /api and /ws
+    volumes: []                # No source mount; image contains the build
+    restart: unless-stopped
+    command: ["nginx", "-g", "daemon off;"]
+    depends_on:
+      backend:
+        condition: service_healthy   # Wait for backend /api/health before nginx starts
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"

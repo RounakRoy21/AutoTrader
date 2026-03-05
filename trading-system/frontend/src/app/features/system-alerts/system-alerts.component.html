@@ -1,0 +1,25 @@
+<mat-card class="alerts-card">
+  <mat-card-header>
+    <mat-card-title>System Alerts</mat-card-title>
+    <span class="alert-count" *ngIf="alerts.length">{{ alerts.length }}</span>
+  </mat-card-header>
+  <mat-card-content>
+    <div class="alerts-scroll" #scrollContainer>
+      <mat-list *ngIf="alerts.length; else empty">
+        <mat-list-item *ngFor="let a of alerts" class="alert-item">
+          <mat-icon matListItemIcon [ngClass]="iconClass(a.type)">
+            {{ iconName(a.type) }}
+          </mat-icon>
+          <div matListItemTitle>{{ a.message }}</div>
+          <div matListItemLine class="alert-meta">
+            <span class="alert-type">{{ a.type }}</span>
+            <span class="alert-time">{{ a.timestamp | date:'short' }}</span>
+          </div>
+        </mat-list-item>
+      </mat-list>
+      <ng-template #empty>
+        <p class="empty-msg">No alerts yet.</p>
+      </ng-template>
+    </div>
+  </mat-card-content>
+</mat-card>
