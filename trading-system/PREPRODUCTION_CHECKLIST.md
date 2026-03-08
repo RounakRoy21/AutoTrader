@@ -7,9 +7,10 @@ This file summarizes the accounts, configuration steps, and actions required bef
 - Zerodha (Kite Connect): Trading account + Kite Connect subscription (create an app to get `KITE_API_KEY` & `KITE_API_SECRET`).
 - Oracle Cloud Free Tier: create an account and provision an Ampere A1 instance (Ubuntu).
 - Anthropic: API account; obtain `ANTHROPIC_API_KEY`.
-- NewsAPI: get `NEWSAPI_API_KEY` (optional but recommended).
-- Alpha Vantage: get `ALPHAVANTAGE_API_KEY` (optional but recommended).
+- Alpha Vantage: get `ALPHAVANTAGE_API_KEY` (free tier, 25 req/day — used for US close and DXY).
 - Telegram: create a bot via @BotFather and get `TELEGRAM_BOT_TOKEN`; find your `TELEGRAM_CHAT_ID`.
+
+> **No longer needed:** NewsAPI. News is now gathered from 5 Indian financial RSS feeds (Economic Times, Business Standard, Moneycontrol, LiveMint, NDTV Profit) + Google News RSS — all free and keyless. India VIX is fetched from Stooq (also free, no key).
 
 **Post-account configuration**
 
@@ -17,7 +18,7 @@ This file summarizes the accounts, configuration steps, and actions required bef
   - Subscribe to Kite Connect and create an app.
   - Set OAuth redirect URL to `http://<your-server-ip>/api/auth/kite/callback`.
   - Keep `KITE_API_KEY` and `KITE_API_SECRET` ready for `.env`.
-- Anthropic / NewsAPI / AlphaVantage:
+- Anthropic / AlphaVantage:
   - Place API keys in the backend `.env` file.
 - Telegram:
   - Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to `.env`.

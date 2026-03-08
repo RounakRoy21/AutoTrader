@@ -37,7 +37,8 @@ An automated NSE intraday equity trading system. Streams live tick data from Zer
 06:00–09:10 IST      │  ┌──────────────────────────────────────────────┐   │
                      │  │            Research Agent                    │   │
   Alpha Vantage  ───►│  │  SGX Nifty, DXY, US market close, FII/DII    │   │
-  NewsAPI        ───►│  │  → Claude synthesises → Market Brief         │   │
+  RSS / Google   ───►│  │  India VIX, financial news headlines          │   │
+  News RSS feeds ───►│  │  → Claude synthesises → Market Brief         │   │
   NSE data       ───►│  │  → published to Redis + PostgreSQL           │   │
                      │  └──────────────────────────────────────────────┘   │
                      │                           │                         │
@@ -86,11 +87,13 @@ An automated NSE intraday equity trading system. Streams live tick data from Zer
 - Stock lock after stop-loss hit for remainder of the day
 
 **Research Agent** (pre-market, 06:00–09:10 IST)
-- Fetches SGX Nifty futures, DXY trend, US market close (Alpha Vantage)
+- Fetches SGX Nifty proxy (Nifty 50 close via Yahoo Finance `^NSEI`), DXY trend, US market close (Alpha Vantage)
+- India VIX (NSE implied-volatility index via Yahoo Finance `^INDIAVIX`) — drives `recommended_stance` and `position_size_override`
 - FII/DII net buy/sell data (NSE)
-- Latest market-moving headlines (NewsAPI)
+- Financial news headlines via `HybridNewsAggregator`: 5 Indian RSS feeds (Economic Times, Business Standard, Moneycontrol, LiveMint, NDTV Profit) + targeted Google News RSS per watchlist stock
 - Claude synthesises all inputs into a structured `MarketBrief` with a `BULLISH / NEUTRAL / BEARISH` bias
 - Bias is injected into every trade decision — a bearish brief suppresses long signals
+- VIX regime gates position sizing: ELEVATED (20–25) → half-size; STRESS (>25) → avoid trading
 
 **Trading Agent**
 - Orchestrates Scanner → Decision Engine → Risk Manager lifecycle
@@ -124,8 +127,8 @@ An automated NSE intraday equity trading system. Streams live tick data from Zer
 | Scheduling | APScheduler 3.10 |
 | Broker | Zerodha Kite Connect v5 |
 | LLM | Anthropic Claude (claude-sonnet-4) |
-| Market data | Alpha Vantage, NSE HTTP |
-| News | NewsAPI |
+| Market data | Alpha Vantage (US close, DXY), Yahoo Finance (Nifty 50 close, India VIX), NSE HTTP |
+| News | HybridNewsAggregator — 5 Indian financial RSS feeds + Google News RSS (no API key) |
 | Alerts | Telegram Bot API |
 | Frontend | Angular 17, TypeScript |
 | Containers | Docker, Docker Compose |
@@ -156,7 +159,9 @@ trading-system/
 │   ├── integrations/
 │   │   ├── kite_client.py          # Kite Connect wrapper (retry + circuit breaker)
 │   │   ├── anthropic_client.py
-│   │   ├── alpha_vantage_client.py
+│   │   ├── alpha_vantage_client.py # US market close, DXY; Yahoo Finance Nifty 50 close + India VIX
+│   │   ├── news_aggregator.py      # HybridNewsAggregator: RSS + Google News RSS
+│   │   ├── nse_client.py           # FII/DII data
 │   │   ├── telegram_client.py
 │   │   ├── ltp_store.py            # In-memory LTP cache (Redis-backed)
 │   │   └── mock_tick_generator.py  # ±2% random walk for offline dev
@@ -215,7 +220,7 @@ falls back to the mock tick generator (`MockTickGenerator`) automatically.
 ```bash
 cd trading-system/backend
 python -m pytest tests/ -p no:warnings -q
-# 150 passed, 2 failed (pre-existing test_api.py async fixture issues)
+# 151 passed, 2 failed (pre-existing test_api.py async fixture issues — unrelated to trading logic)
 ```
 
 ---
@@ -232,6 +237,7 @@ All configuration lives in `trading-system/.env`. Key variables:
 | `MAX_TRADES_PER_DAY` | Hard daily trade count ceiling | `6` |
 | `DAILY_DRAWDOWN_LIMIT_PCT` | % loss that triggers a trading halt | `0.03` |
 | `KITE_API_KEY` | Zerodha Kite Connect API key | — |
+| `ALPHA_VANTAGE_API_KEY` | Alpha Vantage API key (US market close, DXY) | — |
 | `ANTHROPIC_API_KEY` | Claude API key | — |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token | — |
 | `TELEGRAM_CHAT_ID` | Your personal Telegram chat ID | — |

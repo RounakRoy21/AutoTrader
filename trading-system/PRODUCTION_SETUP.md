@@ -47,18 +47,19 @@ Kite historical data or NSE EOD dumps. That is a separate project.
 ┌─────────────────────────────────────────────────────────────┐
 │  Oracle Cloud VM (Ubuntu, Docker)                           │
 │                                                             │
-│  ┌──────────┐  ┌──────────┐  ┌─────────────────────────┐  │
+│  ┌──────────┐  ┌──────────┐  ┌───────────────────────────┐  │
 │  │ Postgres │  │  Redis   │  │  FastAPI backend          │  │
 │  │  :5432   │  │  :6379   │  │  :8000                    │  │
 │  └──────────┘  └──────────┘  │  ├─ Kite Connect SDK      │  │
-│                               │  ├─ Anthropic SDK         │  │
-│  ┌───────────────────────────┐│  ├─ Alpha Vantage HTTP    │  │
-│  │  nginx + Angular  :80    ││  ├─ NewsAPI HTTP           │  │
-│  └───────────────────────────┘│  └─ Telegram Bot          │  │
-│                               └─────────────────────────── │
+│                              │  ├─ Anthropic SDK         │  │
+│  ┌──────────────────────────┐│  ├─ Alpha Vantage HTTP    │  │
+│  │  nginx + Angular  :80    ││  ├─ Yahoo Finance HTTP    │  │
+│  └──────────────────────────┘│  ├─ Indian RSS feeds      │  │
+│                              │  └─ Telegram Bot          │  │
+│                              └───────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
            │               │              │
-  Zerodha Kite        Anthropic       Alpha Vantage
+  Zerodha Kite        Anthropic       Alpha Vantage / Yahoo Finance
   (broker + ticks)   (Claude LLM)    (market data)
 ```
 
@@ -96,16 +97,14 @@ Do all of these before touching any config files.
 ### 1.3 Alpha Vantage (optional but recommended — used by Research Agent)
 
 1. Sign up free at **alphavantage.co/support/#api-key**.
-2. Free tier: 25 requests/day — sufficient for end-of-day market context.
+2. Free tier: 25 requests/day — sufficient for end-of-day market context (S&P 500, NASDAQ, DXY).
 3. Note down the API key.
 
-### 1.4 NewsAPI (optional — news sentiment in Research Agent)
+> **Note:** India VIX and Nifty 50 directional proxy are fetched from **Yahoo Finance** (`^INDIAVIX`, `^NSEI`) — free, no registration, no key required.
+> Indian financial news is gathered from **5 RSS feeds** (Economic Times, Business Standard, Moneycontrol, LiveMint, NDTV Profit) plus Google News RSS — also free, no key.
+> A `NEWSAPI_API_KEY` is no longer used.
 
-1. Sign up free at **newsapi.org/register**.
-2. Free tier: 100 requests/day — plenty for a once-daily run.
-3. Note down the API key.
-
-### 1.5 Telegram (strongly recommended — all trade alerts go here)
+### 1.4 Telegram (strongly recommended — all trade alerts go here)
 
 1. Open Telegram and search for **@BotFather**.
 2. Send `/newbot` → give it a name (e.g. `AutoTrader Bot`).
@@ -117,7 +116,7 @@ Do all of these before touching any config files.
      `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates` in a browser.
      Your chat ID is in the JSON under `message.chat.id`.
 
-### 1.6 Oracle Cloud Free Tier (the server)
+### 1.5 Oracle Cloud Free Tier (the server)
 
 1. Sign up at **cloud.oracle.com** — requires a credit card for identity, but
    the Ampere A1 tier is **always free** (4 OCPUs, 24 GB RAM, 200 GB storage).
@@ -219,9 +218,9 @@ ANTHROPIC_MODEL=claude-sonnet-4-20250514
 
 # ── Alpha Vantage ───────────────────────────────────────
 ALPHA_VANTAGE_API_KEY=<your key>
-
-# ── NewsAPI ─────────────────────────────────────────────
-NEWSAPI_API_KEY=<your key>
+# India VIX and Nifty 50 directional proxy are fetched from Yahoo Finance (^INDIAVIX, ^NSEI)
+# (free, no key needed)
+# News is fetched from Indian RSS feeds + Google News RSS (free, no key needed)
 
 # ── Telegram ────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN=<123456789:ABCDef...>
@@ -442,7 +441,8 @@ docker compose down -v
 | Zerodha Kite Connect subscription | **₹2,000/month** |
 | Anthropic Claude Sonnet (~30 trades/day, 22 days) | **~$20–40/month** |
 | Alpha Vantage (free tier) | **Free** |
-| NewsAPI (free tier) | **Free** |
+| Yahoo Finance (^NSEI, ^INDIAVIX) | **Free** |
+| Indian RSS feeds + Google News RSS | **Free** |
 | Telegram Bot API | **Free** |
 | **Total** | **~₹4,500–6,000/month** |
 

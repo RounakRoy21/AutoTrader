@@ -54,9 +54,6 @@ class Settings(BaseSettings):
     # ── Alpha Vantage ─────────────────────────────
     alpha_vantage_api_key: str = ""
 
-    # ── NewsAPI ───────────────────────────────────
-    newsapi_api_key: str = ""
-
     # ── Telegram ──────────────────────────────────
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""

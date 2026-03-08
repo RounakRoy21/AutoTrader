@@ -170,15 +170,25 @@ class RiskManager:
             # ── ROI Decay (time-based target reduction) ──
             # Evaluated BEFORE target check so the reduced target takes effect
             # in the same poll cycle rather than requiring a 5-second delay.
+            #
+            # Thresholds are calibrated for NSE intraday stocks with ATR-based
+            # stops (typically 0.7–2 % below entry).  Original values of 0.8 / 0.3 /
+            # 0.1 % created an inverted R:R after 35 min — the trade would close at
+            # near-breakeven while still carrying a ₹7–15 downside risk from the SL.
+            # The revised curve keeps a meaningful R:R at every tier:
+            #
+            #   > 20 min → 1.5 %  (still ~1 : 1 R:R for a 1.5 % ATR stop)
+            #   > 35 min → 1.0 %  (captures most of the expected intraday move)
+            #   > 50 min → 0.5 %  (late-move urgency; MIS force-close is at 15:00)
             if settings.roi_decay_enabled and trade.entry_time:
                 entry_dt = IST.localize(datetime.combine(trade.trade_date, trade.entry_time))
                 elapsed_min = (now_ist - entry_dt).total_seconds() / 60
-                if elapsed_min > 35:
-                    decayed = round(trade.entry_price * 1.001, 2)   # 0.1%
-                elif elapsed_min > 25:
-                    decayed = round(trade.entry_price * 1.003, 2)   # 0.3%
-                elif elapsed_min > 15:
-                    decayed = round(trade.entry_price * 1.008, 2)   # 0.8%
+                if elapsed_min > 50:
+                    decayed = round(trade.entry_price * 1.005, 2)   # 0.5%
+                elif elapsed_min > 35:
+                    decayed = round(trade.entry_price * 1.010, 2)   # 1.0%
+                elif elapsed_min > 20:
+                    decayed = round(trade.entry_price * 1.015, 2)   # 1.5%
                 else:
                     decayed = None
                 # Guard: never let the decayed target fall below or equal to

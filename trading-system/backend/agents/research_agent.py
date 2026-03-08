@@ -23,23 +23,26 @@ from core.redis_keys import LATEST_MARKET_BRIEF_KEY
 from core.nse_calendar import is_nse_holiday
 from integrations.alpha_vantage_client import (
     fetch_dxy,
+    fetch_india_vix,
     fetch_sgx_nifty,
     fetch_us_market_close,
 )
 from integrations.anthropic_client import get_anthropic_client
-from integrations.news_client import fetch_market_news
+from integrations.news_aggregator import HybridNewsAggregator
 from integrations.nse_client import fetch_fii_dii_data
 from models.market_brief import MarketBrief
 from schemas.market_brief import (
     DxySchema,
     DxySignal,
     DxyTrend,
-    EarningsDriftCandidate,
+    EarningsDriftCandidate,  # NOTE: intentionally empty until Tickertape API is integrated
     FiiDiiSchema,
     FiiDiiSignal,
     MarketBias,
     MarketBriefLLMOutput,
     NewsFlagSchema,
+    NewsSentiment,
+    NewsUrgency,
     RecommendedStance,
     SgxNiftySchema,
     SgxSignal,
@@ -60,7 +63,39 @@ RESEARCH_SYSTEM_PROMPT = (
     "BULLISH, BEARISH, or NEUTRAL market bias along with a confidence score between "
     "0.0 and 1.0. Identify which NIFTY 50 stocks to watch today and which to avoid. "
     "Flag any news that materially changes the risk profile. Return ONLY a valid JSON "
-    "object — no explanation, no preamble, no markdown."
+    "object — no explanation, no preamble, no markdown. "
+    "The JSON must contain exactly these top-level keys: "
+    "date, generated_at, market_bias, bias_confidence, sgx_nifty, fii_dii, dxy, "
+    "us_markets, news_flags, watchlist_today, avoid_today, earnings_drift_candidates, "
+    "recommended_stance, position_size_override. "
+    "news_flags is a list of objects with keys: type, sentiment (POSITIVE/NEGATIVE/NEUTRAL), "
+    "urgency (HIGH/MEDIUM/LOW), stock (nullable), beat_pct (nullable). "
+    "earnings_drift_candidates is a list of objects with keys: stock, beat_pct.\n\n"
+    "NEWS HEADLINE INTERPRETATION RULES:\n"
+    "  • Each headline has an 'age_minutes' field. Weight headlines under 180 minutes "
+    "(3 hours) as HIGH relevance — these are fresh overnight catalysts not yet priced in. "
+    "Headlines over 720 minutes (12 hours) are background context only — do not base "
+    "watchlist decisions solely on them.\n"
+    "  • Headlines with a 'stock_tag' field are the result of a targeted company search — "
+    "treat them as confirmed to be about that stock. Headlines from RSS feeds without a "
+    "stock_tag require your own attribution from the title.\n"
+    "  • Prioritise source quality: economic_times and business_standard are primary "
+    "sources; google_news aggregates and may include opinion pieces.\n"
+    "  • A headline about a SEBI action, court order, promoter pledge, or block deal "
+    "is higher urgency than a routine analyst target change.\n\n"
+    "INDIA VIX INTERPRETATION RULES:\n"
+    "  • india_vix.value is the NSE volatility index (30-day implied vol of Nifty options).\n"
+    "  • regime=LOW (<14): complacency — momentum strategies work well, full-size positions "
+    "appropriate.\n"
+    "  • regime=NORMAL (14–20): standard environment — use normal position sizing and default "
+    "stance.\n"
+    "  • regime=ELEVATED (20–25): anxiety — compress bias_confidence by ~20%, recommend "
+    "HALF_SIZE_POSITIONS even on BULLISH bias.\n"
+    "  • regime=STRESS (>25): crisis — recommend AVOID_TRADING unless news catalyst is extremely "
+    "clear; set position_size_override to 'REDUCE_50PCT' or higher.\n"
+    "  • regime=UNKNOWN: VIX data unavailable — treat as NORMAL but note the gap.\n"
+    "  • VIX regime overrides directional signals when they conflict: a BULLISH bias with "
+    "regime=STRESS still warrants AVOID_TRADING or HALF_SIZE_POSITIONS."
 )
 
 
@@ -71,27 +106,210 @@ async def collect_pre_market_data() -> dict:
     """
     logger.info("Starting pre-market data collection…")
 
-    fii_dii, us_markets, dxy, sgx_nifty, news = await asyncio.gather(
+    # Use yesterday's watchlist for targeted Google News per-stock queries.
+    # The Research Agent stores its output watchlist in Redis each day, so by
+    # 6 AM the previous session's list is already available \u2014 stocks flagged
+    # yesterday remain relevant today (earnings clusters, sector moves, macro
+    # events persist across sessions).  Falls back to the built-in 10-stock
+    # default on first ever run (cold start).
+    prior_watchlist: list[str] | None = None
+    try:
+        raw_brief = await get_value(LATEST_MARKET_BRIEF_KEY)
+        if raw_brief:
+            prior_watchlist = json.loads(raw_brief).get("watchlist_today")
+    except Exception as _wl_exc:
+        logger.debug("Could not load prior watchlist from Redis: %s", _wl_exc)
+
+    if prior_watchlist:
+        logger.info("fetch_all: using prior watchlist (%d symbols)", len(prior_watchlist))
+    else:
+        logger.info("fetch_all: no prior watchlist found \u2014 using default 10-stock set")
+
+    _aggregator = HybridNewsAggregator()
+
+    fii_dii, us_markets, dxy, sgx_nifty, india_vix, news_items = await asyncio.gather(
         fetch_fii_dii_data(),
         fetch_us_market_close(),
         fetch_dxy(),
         fetch_sgx_nifty(),
-        fetch_market_news(),
+        fetch_india_vix(),
+        _aggregator.fetch_all(watchlist=prior_watchlist),  # real-time RSS + Google News
         return_exceptions=True,
     )
 
     # Handle any failures gracefully
+    # mode='json' gives ISO-8601 datetimes; exclude 'link' because URLs
+    # consume ~100 tokens each and Claude cannot act on them.
+    raw_news = (
+        [item.model_dump(mode="json", exclude={"link"}) for item in news_items]
+        if not isinstance(news_items, Exception) else []
+    )
+
+    # Detect total news blackout (network outage / IP block at 6 AM).
+    # fetch_all() never raises — it returns [] on full failure — so we must
+    # check explicitly.  Brief still runs but operator is alerted.
+    if not raw_news:
+        logger.warning(
+            "All news sources returned 0 items — possible network outage or IP block. "
+            "Brief will be generated from macro data only."
+        )
+        asyncio.create_task(publish("system_alerts", {
+            "type": "warning",
+            "message": "News aggregator returned 0 items from all sources. "
+                       "Brief generated without news context.",
+            "timestamp": datetime.now(IST).isoformat(),
+        }))
+
     raw_data = {
         "fii_dii": fii_dii if not isinstance(fii_dii, Exception) else {"error": str(fii_dii)},
         "us_markets": us_markets if not isinstance(us_markets, Exception) else {"error": str(us_markets)},
         "dxy": dxy if not isinstance(dxy, Exception) else {"error": str(dxy)},
         "sgx_nifty": sgx_nifty if not isinstance(sgx_nifty, Exception) else {"error": str(sgx_nifty)},
-        "news_headlines": news if not isinstance(news, Exception) else [],
+        "india_vix": india_vix if not isinstance(india_vix, Exception) else {"value": 0.0, "regime": "UNKNOWN"},
+        "news_headlines": raw_news,
         "earnings_calendar": [],  # TODO: integrate Tickertape API
     }
 
     logger.info("Pre-market data collection complete")
     return raw_data
+
+
+def _parse_news_flags(headlines: list) -> list[NewsFlagSchema]:
+    """Convert HybridNewsAggregator headlines into NewsFlagSchema entries via keyword heuristics.
+
+    Used by _generate_mock_brief so paper-trading sessions still reflect real
+    news risk — something that was silently discarded when news_flags was
+    hardcoded to [].  The heuristic is intentionally conservative: it only
+    uses the article title and caps output at 10 items.
+    """
+    NEGATIVE_KEYWORDS = {
+        "crash", "fall", "drop", "plunge", "decline", "loss", "losses", "fraud",
+        "probe", "ban", "delist", "downgrade", "sell-off", "warning", "risk",
+        "concern", "weak", "slowdown", "penalty", "default", "cut", "miss",
+        "below expectations", "disappoints",
+    }
+    POSITIVE_KEYWORDS = {
+        "rise", "gain", "rally", "surge", "profit", "upgrade", "dividend",
+        "buyback", "strong", "beat", "record", "growth", "order win",
+        "outperform", "beat estimates",
+    }
+    HIGH_URGENCY_KEYWORDS = {
+        "fraud", "ban", "penalty", "default", "probe", "merger", "acquisition",
+        "crash", "plunge", "emergency", "crisis", "rbi rate", "sebi", "halt",
+        "circuit breaker",
+    }
+    # All NIFTY 50 constituents: symbol → lowercased search strings.
+    # Ordered so that more specific phrases (e.g. "hdfc bank") are checked
+    # before shorter tokens to avoid false partial matches.
+    STOCK_KEYWORDS: dict[str, list[str]] = {
+        # ── Financials ────────────────────────────────────────────────────────
+        "HDFCBANK":   ["hdfc bank", "hdfcbank"],
+        "ICICIBANK":  ["icici bank", "icicibank"],
+        "KOTAKBANK":  ["kotak bank", "kotak mahindra bank"],
+        "SBIN":       ["state bank of india", "state bank", "sbi "],
+        "AXISBANK":   ["axis bank", "axisbank"],
+        "BAJFINANCE": ["bajaj finance"],
+        "BAJAJFINSV": ["bajaj finserv"],
+        "INDUSINDBK": ["indusind bank"],
+        "HDFCLIFE":   ["hdfc life"],
+        "SBILIFE":    ["sbi life"],
+        # ── Information Technology ────────────────────────────────────────────
+        "INFY":       ["infosys"],
+        "TCS":        ["tata consultancy", " tcs "],
+        "WIPRO":      ["wipro"],
+        "HCLTECH":    ["hcl tech", "hcl technologies"],
+        "TECHM":      ["tech mahindra"],
+        "LTIM":       ["ltimindtree", "lti mindtree"],
+        # ── Consumer / FMCG ──────────────────────────────────────────────────
+        "RELIANCE":   ["reliance industries", "reliance jio", "reliance retail", "reliance"],
+        "HINDUNILVR": ["hindustan unilever", " hul "],
+        "NESTLEIND":  ["nestle india"],
+        "ITC":        ["itc limited", "itc ltd", " itc "],
+        "BRITANNIA":  ["britannia"],
+        "TATACONSUM": ["tata consumer"],
+        "DABUR":      ["dabur"],
+        # ── Automobiles ──────────────────────────────────────────────────────
+        "MARUTI":     ["maruti suzuki", "maruti"],
+        "TATAMOTORS": ["tata motors"],
+        "M&M":        ["mahindra & mahindra", "mahindra and mahindra"],
+        "BAJAJ-AUTO": ["bajaj auto"],
+        "HEROMOTOCO": ["hero motocorp", "hero moto"],
+        "EICHERMOT":  ["eicher motors", "royal enfield"],
+        # ── Metals & Mining ───────────────────────────────────────────────────
+        "TATASTEEL":  ["tata steel"],
+        "JSWSTEEL":   ["jsw steel"],
+        "HINDALCO":   ["hindalco"],
+        "COALINDIA":  ["coal india"],
+        "VEDL":       ["vedanta"],
+        # ── Energy & Utilities ────────────────────────────────────────────────
+        "ONGC":       ["oil and natural gas corporation", "ongc"],
+        "BPCL":       ["bharat petroleum", "bpcl"],
+        "NTPC":       ["ntpc"],
+        "POWERGRID":  ["power grid corporation", "powergrid"],
+        # ── Pharmaceuticals ───────────────────────────────────────────────────
+        "SUNPHARMA":  ["sun pharma", "sun pharmaceutical"],
+        "DRREDDY":    ["dr. reddy", "dr reddy"],
+        "CIPLA":      ["cipla"],
+        "DIVISLAB":   ["divi's lab", "divi laboratories"],
+        # ── Cement & Construction ─────────────────────────────────────────────
+        "ULTRACEMCO": ["ultratech cement"],
+        "GRASIM":     ["grasim"],
+        "LT":         ["larsen & toubro", "larsen and toubro", "l&t"],
+        # ── Diversified / Others ─────────────────────────────────────────────
+        "TITAN":      ["titan company"],
+        "ASIANPAINT": ["asian paints"],
+        "PIDILITIND": ["pidilite"],
+        "APOLLOHOSP": ["apollo hospitals"],
+        "BHARTIARTL": ["bharti airtel", "airtel"],
+        "ADANIPORTS": ["adani ports"],
+        "ADANIENT":   ["adani enterprises", "adani group"],
+    }
+
+    flags: list[NewsFlagSchema] = []
+    for article in headlines:  # process all fetched articles
+        title = (article.get("title") or "").lower()
+        if not title:
+            continue
+
+        neg_score = sum(1 for kw in NEGATIVE_KEYWORDS if kw in title)
+        pos_score = sum(1 for kw in POSITIVE_KEYWORDS if kw in title)
+        if neg_score > pos_score:
+            sentiment = NewsSentiment.NEGATIVE
+        elif pos_score > neg_score:
+            sentiment = NewsSentiment.POSITIVE
+        else:
+            sentiment = NewsSentiment.NEUTRAL
+
+        has_high = any(kw in title for kw in HIGH_URGENCY_KEYWORDS)
+        urgency = NewsUrgency.HIGH if has_high else (
+            NewsUrgency.MEDIUM if neg_score + pos_score >= 2 else NewsUrgency.LOW
+        )
+
+        # Prefer the explicit stock_tag set by the HybridNewsAggregator for
+        # Google News per-stock queries.  Fall back to keyword matching for
+        # RSS feed articles that have no tag.
+        matched_stock: str | None = article.get("stock_tag")
+        if matched_stock is None:
+            for symbol, names in STOCK_KEYWORDS.items():
+                if any(name in title for name in names):
+                    matched_stock = symbol
+                    break
+
+        # Skip generic low-signal articles (no stock match + LOW urgency = noise)
+        if matched_stock is None and urgency == NewsUrgency.LOW:
+            continue
+
+        flags.append(NewsFlagSchema(
+            type="NEWS",
+            sentiment=sentiment,
+            urgency=urgency,
+            stock=matched_stock,
+        ))
+
+        if len(flags) >= 15:  # cap output so the brief stays concise
+            break
+
+    return flags
 
 
 def _generate_mock_brief(raw_data: dict | None = None) -> MarketBriefLLMOutput:
@@ -174,7 +392,27 @@ def _generate_mock_brief(raw_data: dict | None = None) -> MarketBriefLLMOutput:
     else:
         us_sig = UsMarketsSignal.NEUTRAL
 
-    logger.info("[MOCK] Generated mock brief: bias=%s confidence=%.2f", bias, confidence)
+    # Apply India VIX regime to stance and confidence — mirrors the LLM instructions.
+    # Paper mode uses the same real-time VIX data fetched during collect_pre_market_data().
+    vix_regime = "NORMAL"
+    if raw_data:
+        vix_regime = raw_data.get("india_vix", {}).get("regime", "NORMAL") or "NORMAL"
+    if vix_regime == "STRESS":
+        stance = RecommendedStance.AVOID_TRADING
+        confidence = round(confidence * 0.6, 2)
+    elif vix_regime == "ELEVATED":
+        if stance == RecommendedStance.FULL_SIZE_POSITIONS:
+            stance = RecommendedStance.HALF_SIZE_POSITIONS
+        confidence = round(confidence * 0.8, 2)
+
+    # Parse real news headlines into structured flags (paper mode still sees real news)
+    news_headlines = (raw_data.get("news_headlines") or []) if raw_data else []
+    news_flags = _parse_news_flags(news_headlines)
+
+    logger.info(
+        "[MOCK] Generated mock brief: bias=%s confidence=%.2f vix_regime=%s stance=%s",
+        bias, confidence, vix_regime, stance.value,
+    )
     return MarketBriefLLMOutput(
         date=now_ist.strftime("%Y-%m-%d"),
         generated_at=now_ist.strftime("%H:%M:%S"),
@@ -184,7 +422,7 @@ def _generate_mock_brief(raw_data: dict | None = None) -> MarketBriefLLMOutput:
         fii_dii=FiiDiiSchema(fii_net_crore=fii_net, dii_net_crore=dii_net, signal=fii_sig),
         dxy=DxySchema(value=dxy_value, trend=dxy_trend, signal=dxy_sig),
         us_markets=UsMarketsSchema(sp500_close_pct=sp500_pct, nasdaq_close_pct=nasdaq_pct, signal=us_sig),
-        news_flags=[],
+        news_flags=news_flags,
         watchlist_today=["RELIANCE", "HDFCBANK", "INFY", "TCS", "ICICIBANK", "AXISBANK", "WIPRO"],
         avoid_today=[],
         earnings_drift_candidates=[],
@@ -306,6 +544,12 @@ async def run_research_agent() -> None:
     logger.info("═══ Research Agent starting ═══")
     await set_value("agent:research:status", "ACTIVE")
     await set_value("agent:research:last_run_started", datetime.now(IST).isoformat())
+
+    # Fire-and-forget feed health check — runs concurrently with data collection
+    # so the 6 AM data fetch is never delayed by feed probing.  Failures are
+    # logged and published to system_alerts by check_feed_health() itself.
+    asyncio.create_task(HybridNewsAggregator().check_feed_health())
+
     await publish("system_alerts", {
         "type": "info",
         "message": "Research Agent started pre-market data collection",

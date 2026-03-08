@@ -259,7 +259,7 @@ class KiteClient:
 
         @_retry_sync
         def _fetch():
-            return kite.ltp(instruments)
+            return kite.ltp(*instruments)
 
         return await asyncio.to_thread(_fetch)
 

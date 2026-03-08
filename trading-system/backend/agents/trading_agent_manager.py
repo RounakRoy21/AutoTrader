@@ -23,13 +23,13 @@ from sqlalchemy import func, select
 
 from core.database import get_db_context
 from core.redis_client import publish, set_value
-from core.redis_keys import HALT_KEY
+from core.redis_keys import DAILY_TRADE_COUNT_KEY, HALT_KEY
 from core.nse_calendar import is_nse_holiday
 from models.trade import Trade
 
 logger = logging.getLogger(__name__)
 
-TRADE_COUNT_KEY = "daily_trade_count"
+TRADE_COUNT_KEY = DAILY_TRADE_COUNT_KEY
 
 class TradingAgentManager:
     """

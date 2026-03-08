@@ -12,6 +12,7 @@ import json
 import logging
 from datetime import datetime, time as dt_time
 from typing import Optional
+from uuid import uuid4
 
 import pytz
 from sqlalchemy import select
@@ -142,7 +143,7 @@ class TradingAgent:
 
         try:
             if settings.paper_trading:
-                order_id = f"PAPER-{now_ist.strftime('%H%M%S')}-{signal.stock}"
+                order_id = f"PAPER-{now_ist.strftime('%H%M%S')}-{signal.stock}-{uuid4().hex[:6]}"
                 logger.info("📝 Paper trade: %s", order_id)
             else:
                 order_id = await kite.place_order(
@@ -152,20 +153,30 @@ class TradingAgent:
                     product=decision.product_type.value,
                 )
 
-                # Verify actual fill price (MARKET orders fill near-instantly on NSE)
+                # Verify actual fill price.  NSE MARKET orders usually complete
+                # within 1–2 s, but during the opening 30 min (9:15–9:45) and on
+                # high-volatility days exchange acknowledgment can take up to 5 s.
+                # A single 0.5 s sleep missed fills frequently in the most active
+                # trading window, leaving fill_price = signal.ltp and losing
+                # accurate slippage and SL/target recalculation.
+                # Retry up to 3 times (≤ 1.5 s total) before falling back.
                 try:
-                    await asyncio.sleep(0.5)
-                    history = await kite.get_order_history(order_id)
-                    for entry in reversed(history):
-                        if entry.get("status") == "COMPLETE" and entry.get("average_price"):
-                            fill_price = entry["average_price"]
-                            if fill_price != signal.ltp:
-                                slippage_pct = ((fill_price - signal.ltp) / signal.ltp) * 100
-                                logger.info(
-                                    "Slippage for %s: signal ₹%.2f → fill ₹%.2f (%.3f%%)",
-                                    signal.stock, signal.ltp, fill_price, slippage_pct,
-                                )
-                            break
+                    for _attempt in range(3):
+                        await asyncio.sleep(0.5)
+                        history = await kite.get_order_history(order_id)
+                        for entry in reversed(history):
+                            if entry.get("status") == "COMPLETE" and entry.get("average_price"):
+                                fill_price = entry["average_price"]
+                                if fill_price != signal.ltp:
+                                    slippage_pct = ((fill_price - signal.ltp) / signal.ltp) * 100
+                                    logger.info(
+                                        "Slippage for %s: signal ₹%.2f → fill ₹%.2f (%.3f%%)",
+                                        signal.stock, signal.ltp, fill_price, slippage_pct,
+                                    )
+                                break
+                        else:
+                            continue  # COMPLETE entry not found yet — retry
+                        break  # fill confirmed — exit retry loop
                 except Exception as fill_exc:
                     logger.warning(
                         "Could not verify fill price for %s: %s — using signal LTP",

@@ -20,7 +20,7 @@ from sqlalchemy import func, select
 from core.config import get_settings
 from core.database import get_db_context
 from core.redis_client import get_value, increment, publish, set_value
-from core.redis_keys import HALT_KEY
+from core.redis_keys import DAILY_TRADE_COUNT_KEY, HALT_KEY
 from integrations.anthropic_client import get_anthropic_client
 from models.trade import Trade
 from schemas.decision import Decision, DecisionOutput, SignalAudit
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 IST = pytz.timezone("Asia/Kolkata")
 
-TRADE_COUNT_KEY = "daily_trade_count"
+TRADE_COUNT_KEY = DAILY_TRADE_COUNT_KEY
 
 # ── Signal-quality thresholds ─────────────────────────────────────────────────
 # These values are stated verbatim in DECISION_SYSTEM_PROMPT so the LLM reasons

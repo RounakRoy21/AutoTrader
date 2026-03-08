@@ -1,6 +1,11 @@
 """
-Alpha Vantage API wrapper.
-Fetches US market close prices (S&P 500, NASDAQ), Dollar Index (DXY), and Forex data.
+Market data integrations for the Research Agent.
+
+Sources:
+  - Alpha Vantage  : US market close (S&P 500, NASDAQ), Dollar Index (DXY)
+  - Yahoo Finance  : Nifty 50 previous-session close (^NSEI), India VIX (^INDIAVIX)
+
+All functions are async and share a single module-level httpx.AsyncClient.
 """
 
 from __future__ import annotations
@@ -18,8 +23,8 @@ BASE_URL = "https://www.alphavantage.co/query"
 TIMEOUT = 10
 
 # Module-level singleton — the Research Agent runs once at 6 AM but makes
-# several sequential API calls (_query × 4 + Stooq × 1).  Reusing one client
-# avoids spinning up a new TCP connection for each call.
+# several sequential API calls (_query × 4 + Yahoo Finance × 2).  Reusing one
+# client avoids spinning up a new TCP connection for each call.
 _http_client: Optional[httpx.AsyncClient] = None
 
 
@@ -102,42 +107,88 @@ async def fetch_dxy() -> Dict[str, Any]:
 
 async def fetch_sgx_nifty() -> Dict[str, Any]:
     """
-    Fetch Nifty 50 previous-session data from Stooq as a proxy for SGX NIFTY direction.
-    Stooq is free and requires no API key.
-    Falls back to FLAT if the request fails.
+    Fetch Nifty 50 previous-session close from Yahoo Finance (^NSEI) as a
+    directional proxy for the overnight gap.
+
+    At 6 AM IST this reflects yesterday's close vs previous close, which
+    provides the baseline.  GIFT Nifty live pre-market futures are not
+    available on any free API; this is the best freely available substitute.
+
+    Falls back to {value: 0, change_pct: 0, signal: FLAT} on any failure.
     """
     result: Dict[str, Any] = {"value": 0.0, "change_pct": 0.0, "signal": "FLAT"}
     try:
         client = _get_http_client()
         resp = await client.get(
-            "https://stooq.com/q/l/",
-            params={"s": "^nsei", "f": "sd2t2ohlcvn", "h": "", "e": "csv"},
-            headers={"User-Agent": "Mozilla/5.0"},
-            follow_redirects=True,
+            "https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI",
+            params={"interval": "1d", "range": "2d"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json",
+            },
         )
         resp.raise_for_status()
-        # CSV columns (with header flag): Symbol,Date,Time,Open,High,Low,Close,Volume,Name
-        lines = [
-            line for line in resp.text.strip().splitlines()
-            if line and not line.startswith("Symbol")
-        ]
-        if lines:
-            parts = lines[0].split(",")
-            if len(parts) >= 7:
-                open_p = float(parts[3])
-                close_p = float(parts[6])
-                if open_p > 0:
-                    change_pct = round(((close_p - open_p) / open_p) * 100, 3)
-                    result["value"] = close_p
-                    result["change_pct"] = change_pct
-                    if change_pct > 0.2:
-                        result["signal"] = "GAP_UP"
-                    elif change_pct < -0.2:
-                        result["signal"] = "GAP_DOWN"
-                    logger.info(
-                        "Nifty50 via Stooq: close=%.2f change=%.3f%% signal=%s",
-                        close_p, change_pct, result["signal"],
-                    )
+        data = resp.json()
+        meta = data["chart"]["result"][0]["meta"]
+        price = float(meta.get("regularMarketPrice") or 0.0)
+        prev_close = float(
+            meta.get("previousClose") or meta.get("chartPreviousClose") or 0.0
+        )
+        if price > 0 and prev_close > 0:
+            change_pct = round(((price - prev_close) / prev_close) * 100, 3)
+            result["value"] = price
+            result["change_pct"] = change_pct
+            if change_pct > 0.2:
+                result["signal"] = "GAP_UP"
+            elif change_pct < -0.2:
+                result["signal"] = "GAP_DOWN"
+            logger.info(
+                "Nifty50 via Yahoo Finance: close=%.2f change=%.3f%% signal=%s",
+                price, change_pct, result["signal"],
+            )
     except Exception as exc:
-        logger.warning("Stooq Nifty50 fetch failed: %s — using FLAT", exc)
+        logger.warning("Yahoo Finance Nifty50 fetch failed: %s — using FLAT", exc)
+    return result
+
+
+async def fetch_india_vix() -> Dict[str, Any]:
+    """
+    Fetch India VIX from Yahoo Finance (^INDIAVIX).
+    India VIX measures 30-day implied volatility of the Nifty 50 options market.
+
+    Regime interpretation used downstream:
+      < 14  — LOW: very low vol / complacency
+      14–20 — NORMAL: standard trading environment
+      20–25 — ELEVATED: elevated anxiety, reduce position size
+      > 25  — STRESS: crisis regime, avoid trading
+    """
+    result: Dict[str, Any] = {"value": 0.0, "regime": "UNKNOWN"}
+    try:
+        client = _get_http_client()
+        resp = await client.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/%5EINDIAVIX",
+            params={"interval": "1d", "range": "1d"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json",
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        vix = float(
+            data["chart"]["result"][0]["meta"].get("regularMarketPrice") or 0.0
+        )
+        if vix > 0:
+            result["value"] = round(vix, 2)
+            if vix < 14:
+                result["regime"] = "LOW"
+            elif vix <= 20:
+                result["regime"] = "NORMAL"
+            elif vix <= 25:
+                result["regime"] = "ELEVATED"
+            else:
+                result["regime"] = "STRESS"
+            logger.info("India VIX via Yahoo Finance: %.2f regime=%s", vix, result["regime"])
+    except Exception as exc:
+        logger.warning("Yahoo Finance India VIX fetch failed: %s — returning UNKNOWN", exc)
     return result
