@@ -18,12 +18,13 @@ from sqlalchemy import select
 
 from core.config import get_settings
 from core.database import get_db_context
-from core.redis_client import publish, set_value
+from core.redis_client import get_value, publish, set_value
 from core.redis_keys import LATEST_MARKET_BRIEF_KEY
 from core.nse_calendar import is_nse_holiday
 from integrations.alpha_vantage_client import (
     fetch_crude_oil,
     fetch_dxy,
+    fetch_earnings_calendar,
     fetch_gold,
     fetch_india_vix,
     fetch_sgx_nifty,
@@ -37,7 +38,7 @@ from schemas.market_brief import (
     DxySchema,
     DxySignal,
     DxyTrend,
-    EarningsDriftCandidate,  # NOTE: intentionally empty until Tickertape API is integrated
+    EarningsDriftCandidate,
     FiiDiiSchema,
     FiiDiiSignal,
     MarketBias,
@@ -151,7 +152,10 @@ async def collect_pre_market_data() -> dict:
 
     _aggregator = HybridNewsAggregator()
 
-    fii_dii, us_markets, dxy, sgx_nifty, india_vix, crude_oil, gold, news_items = await asyncio.gather(
+    (
+        fii_dii, us_markets, dxy, sgx_nifty, india_vix,
+        crude_oil, gold, earnings_cal, news_items,
+    ) = await asyncio.gather(
         fetch_fii_dii_data(),
         fetch_us_market_close(),
         fetch_dxy(),
@@ -159,6 +163,7 @@ async def collect_pre_market_data() -> dict:
         fetch_india_vix(),
         fetch_crude_oil(),
         fetch_gold(),
+        fetch_earnings_calendar(prior_watchlist),  # upcoming results in next 7 days
         _aggregator.fetch_all(watchlist=prior_watchlist),  # real-time RSS + Google News
         return_exceptions=True,
     )
@@ -195,7 +200,7 @@ async def collect_pre_market_data() -> dict:
         "crude_oil": crude_oil if not isinstance(crude_oil, Exception) else {"price": 0.0, "change_pct": 0.0, "available": False},
         "gold": gold if not isinstance(gold, Exception) else {"price": 0.0, "change_pct": 0.0, "available": False},
         "news_headlines": raw_news,
-        "earnings_calendar": [],  # TODO: integrate Tickertape API
+        "earnings_calendar": earnings_cal if not isinstance(earnings_cal, Exception) else [],
     }
 
     logger.info("Pre-market data collection complete")

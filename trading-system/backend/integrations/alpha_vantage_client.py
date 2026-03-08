@@ -11,8 +11,10 @@ All functions are async and share a single module-level httpx.AsyncClient.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import Any, Dict, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -278,3 +280,67 @@ async def fetch_gold() -> Dict[str, Any]:
     except Exception as exc:
         logger.warning("Yahoo Finance gold fetch failed: %s", exc)
     return result
+
+
+_EARNINGS_DEFAULT_SYMBOLS: List[str] = [
+    "RELIANCE", "HDFCBANK", "INFY", "ICICIBANK", "TCS",
+    "WIPRO", "AXISBANK", "KOTAKBANK", "SBIN", "BAJFINANCE",
+    "HINDUNILVR", "ITC", "LT", "ONGC", "NTPC",
+    "TATAMOTORS", "TATASTEEL", "SUNPHARMA", "MARUTI", "TITAN",
+]
+
+
+async def fetch_earnings_calendar(
+    symbols: List[str] | None = None,
+    lookahead_days: int = 7,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch upcoming NSE earnings dates via Yahoo Finance quoteSummary calendarEvents.
+
+    For each symbol appends '.NS' and hits:
+      https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}.NS?modules=calendarEvents
+
+    Returns a list of {"stock": "INFY", "earnings_date": "2026-03-12"} for any
+    stock with a result date in the next `lookahead_days` calendar days.
+    Falls back to _EARNINGS_DEFAULT_SYMBOLS when no symbols list is provided.
+    """
+    target_symbols = symbols if symbols else _EARNINGS_DEFAULT_SYMBOLS
+    today = datetime.now(timezone.utc).date()
+    cutoff = today + timedelta(days=lookahead_days)
+
+    async def _fetch_one(symbol: str) -> Dict[str, Any] | None:
+        try:
+            client = _get_http_client()
+            resp = await client.get(
+                f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}.NS",
+                params={"modules": "calendarEvents"},
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "application/json",
+                },
+                timeout=8,
+            )
+            resp.raise_for_status()
+            result = resp.json()["quoteSummary"]["result"]
+            if not result:
+                return None
+            dates = result[0]["calendarEvents"]["earnings"].get("earningsDate", [])
+            if not dates:
+                return None
+            ts = dates[0].get("raw")
+            if ts is None:
+                return None
+            earnings_date = datetime.fromtimestamp(ts, tz=timezone.utc).date()
+            if today <= earnings_date <= cutoff:
+                return {"stock": symbol, "earnings_date": str(earnings_date)}
+        except Exception as exc:
+            logger.debug("Earnings calendar fetch skipped for %s: %s", symbol, exc)
+        return None
+
+    results = await asyncio.gather(*[_fetch_one(s) for s in target_symbols])
+    candidates = [r for r in results if r is not None]
+    logger.info(
+        "Earnings calendar: %d upcoming results in next %d days",
+        len(candidates), lookahead_days,
+    )
+    return candidates
