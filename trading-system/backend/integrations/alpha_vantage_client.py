@@ -3,7 +3,8 @@ Market data integrations for the Research Agent.
 
 Sources:
   - Alpha Vantage  : US market close (S&P 500, NASDAQ), Dollar Index (DXY)
-  - Yahoo Finance  : Nifty 50 previous-session close (^NSEI), India VIX (^INDIAVIX)
+  - Yahoo Finance  : Nifty 50 previous-session close (^NSEI), India VIX (^INDIAVIX),
+                     WTI crude oil futures (CL=F), gold futures (GC=F)
 
 All functions are async and share a single module-level httpx.AsyncClient.
 """
@@ -191,4 +192,89 @@ async def fetch_india_vix() -> Dict[str, Any]:
             logger.info("India VIX via Yahoo Finance: %.2f regime=%s", vix, result["regime"])
     except Exception as exc:
         logger.warning("Yahoo Finance India VIX fetch failed: %s — returning UNKNOWN", exc)
+    return result
+
+
+async def fetch_crude_oil() -> Dict[str, Any]:
+    """
+    Fetch WTI crude oil front-month futures from Yahoo Finance (CL=F).
+    Returns spot price and % change vs previous close.
+
+    NSE relevance:
+      • Upstream energy stocks (ONGC, Oil India) benefit from higher crude.
+      • Downstream consumers (BPCL, HPCL, IOC) are hurt by crude spikes.
+      • Aviation (IndiGo) and paints/chemicals (Asian Paints, Pidilite) have
+        high crude cost pass-through — spikes compress margins.
+      • Rule of thumb: crude +2%  →  bearish for OMCs/aviation/paints,
+        bullish for upstream producers; crude −2%  →  opposite.
+    """
+    result: Dict[str, Any] = {"price": 0.0, "change_pct": 0.0, "available": False}
+    try:
+        client = _get_http_client()
+        resp = await client.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/CL%3DF",
+            params={"interval": "1d", "range": "2d"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json",
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        meta = data["chart"]["result"][0]["meta"]
+        price = float(meta.get("regularMarketPrice") or 0.0)
+        prev_close = float(
+            meta.get("previousClose") or meta.get("chartPreviousClose") or 0.0
+        )
+        if price > 0 and prev_close > 0:
+            change_pct = round(((price - prev_close) / prev_close) * 100, 3)
+            result["price"] = round(price, 2)
+            result["change_pct"] = change_pct
+            result["available"] = True
+            logger.info("WTI Crude via Yahoo Finance: $%.2f change=%.3f%%", price, change_pct)
+    except Exception as exc:
+        logger.warning("Yahoo Finance crude oil fetch failed: %s", exc)
+    return result
+
+
+async def fetch_gold() -> Dict[str, Any]:
+    """
+    Fetch gold front-month futures from Yahoo Finance (GC=F).
+    Returns spot price and % change vs previous close.
+
+    NSE relevance:
+      • Gold is a risk-off / fear indicator.  Sharp rallies (>1%) correlate
+        with equity sell-offs — compress bias_confidence and lean BEARISH/NEUTRAL.
+      • Jewellery stocks (Titan, Kalyan Jewellers) move with gold sentiment but
+        can diverge on stock-specific news.
+      • In geopolitical stress (US-Iran, Israel-Hamas, etc.), gold rising while
+        DXY is also rising signals genuine safe-haven demand — more bearish for
+        equities than gold rising alone.
+    """
+    result: Dict[str, Any] = {"price": 0.0, "change_pct": 0.0, "available": False}
+    try:
+        client = _get_http_client()
+        resp = await client.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/GC%3DF",
+            params={"interval": "1d", "range": "2d"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json",
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        meta = data["chart"]["result"][0]["meta"]
+        price = float(meta.get("regularMarketPrice") or 0.0)
+        prev_close = float(
+            meta.get("previousClose") or meta.get("chartPreviousClose") or 0.0
+        )
+        if price > 0 and prev_close > 0:
+            change_pct = round(((price - prev_close) / prev_close) * 100, 3)
+            result["price"] = round(price, 2)
+            result["change_pct"] = change_pct
+            result["available"] = True
+            logger.info("Gold Futures via Yahoo Finance: $%.2f change=%.3f%%", price, change_pct)
+    except Exception as exc:
+        logger.warning("Yahoo Finance gold fetch failed: %s", exc)
     return result

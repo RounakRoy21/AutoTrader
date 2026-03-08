@@ -12,7 +12,7 @@ An automated NSE intraday equity trading system. Streams live tick data from Zer
 09:15–15:30 IST      │                                                     │
                      │  ┌────────────┐    ┌─────────────────────────────┐  │
   Kite WebSocket ───►│  │  Scanner   │───►│     Decision Engine         │  │
-  (live ticks)       │  │            │    │  (Claude claude-sonnet-4)   │  │
+  (live ticks)       │  │            │    │  (Claude Haiku 4.5)         │  │
                      │  │  VWAP      │    │  SignalAudit thresholds:    │  │
                      │  │  RSI 14    │    │  • RSI 40–72                │  │
                      │  │  Volume ×  │    │  • Volume ≥ 1.5×            │  │
@@ -126,7 +126,7 @@ An automated NSE intraday equity trading system. Streams live tick data from Zer
 | Migrations | Alembic |
 | Scheduling | APScheduler 3.10 |
 | Broker | Zerodha Kite Connect v5 |
-| LLM | Anthropic Claude (claude-sonnet-4) |
+| LLM | Anthropic Claude — Sonnet 4.6 (Research Agent), Haiku 4.5 (Decision Engine) |
 | Market data | Alpha Vantage (US close, DXY), Yahoo Finance (Nifty 50 close, India VIX), NSE HTTP |
 | News | HybridNewsAggregator — 5 Indian financial RSS feeds + Google News RSS (no API key) |
 | Alerts | Telegram Bot API |

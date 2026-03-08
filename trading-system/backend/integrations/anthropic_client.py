@@ -1,7 +1,9 @@
 """
-Anthropic API wrapper for Claude claude-sonnet-4-20250514 calls.
+Anthropic API wrapper.
+  Research Agent  → claude-sonnet-4-6          (configured via ANTHROPIC_MODEL)
+  Decision Engine → claude-haiku-4-5-20251001  (configured via ANTHROPIC_DECISION_MODEL)
 Validates every LLM response against the provided Pydantic model.
-Max 2 attempts per signal — if both fail, the signal is discarded.
+Max 2 attempts per call — if both fail, the result is discarded.
 """
 
 from __future__ import annotations
@@ -36,15 +38,18 @@ class AnthropicClient:
         user_content: str,
         response_model: Type[T],
         max_tokens: int = 4096,
+        model: Optional[str] = None,
     ) -> Optional[T]:
         """
         Send a prompt to Claude and validate the response against *response_model*.
+        Pass *model* to override the default (e.g. use Haiku for the Decision Engine).
         Returns the parsed Pydantic object or None if validation fails after retries.
         """
+        active_model = model or self._model
         for attempt in range(1, MAX_LLM_RETRIES + 1):
             try:
                 message = await self._client.messages.create(
-                    model=self._model,
+                    model=active_model,
                     max_tokens=max_tokens,
                     system=system_prompt,
                     messages=[{"role": "user", "content": user_content}],
@@ -60,7 +65,7 @@ class AnthropicClient:
                 data = json.loads(raw_text)
                 parsed = response_model.model_validate(data)
                 logger.info(
-                    "LLM response validated (model=%s, attempt=%d)", self._model, attempt
+                    "LLM response validated (model=%s, attempt=%d)", active_model, attempt
                 )
                 return parsed
 

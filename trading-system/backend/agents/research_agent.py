@@ -22,7 +22,9 @@ from core.redis_client import publish, set_value
 from core.redis_keys import LATEST_MARKET_BRIEF_KEY
 from core.nse_calendar import is_nse_holiday
 from integrations.alpha_vantage_client import (
+    fetch_crude_oil,
     fetch_dxy,
+    fetch_gold,
     fetch_india_vix,
     fetch_sgx_nifty,
     fetch_us_market_close,
@@ -95,7 +97,29 @@ RESEARCH_SYSTEM_PROMPT = (
     "clear; set position_size_override to 'REDUCE_50PCT' or higher.\n"
     "  • regime=UNKNOWN: VIX data unavailable — treat as NORMAL but note the gap.\n"
     "  • VIX regime overrides directional signals when they conflict: a BULLISH bias with "
-    "regime=STRESS still warrants AVOID_TRADING or HALF_SIZE_POSITIONS."
+    "regime=STRESS still warrants AVOID_TRADING or HALF_SIZE_POSITIONS.\n\n"
+    "COMMODITY INTERPRETATION RULES:\n"
+    "  • crude_oil.change_pct is WTI futures overnight % change. crude_oil.available=False "
+    "means the fetch failed — ignore the field.\n"
+    "  • Crude oil impact on NSE stocks:\n"
+    "    - change_pct > +2%: BEARISH for downstream consumers — BPCL, HPCL, IOC (margin "
+    "compression), IndiGo/aviation (fuel costs), Asian Paints/Pidilite (raw material costs). "
+    "Add these to avoid_today unless a strong stock-specific catalyst overrides. BULLISH for "
+    "upstream producers: ONGC, Oil India — consider adding to watchlist_today.\n"
+    "    - change_pct < -2%: BULLISH signal for downstream consumers listed above; BEARISH "
+    "for upstream producers.\n"
+    "    - Absolute change between -2% and +2%: no material sector adjustment needed.\n"
+    "  • gold.change_pct is gold futures overnight % change. gold.available=False means "
+    "the fetch failed — ignore the field.\n"
+    "  • Gold as a risk-off indicator:\n"
+    "    - change_pct > +1% AND sgx_nifty is FLAT or GAP_DOWN: compress bias_confidence "
+    "by 10–15% — risk-off sentiment is active, equity upside is capped.\n"
+    "    - change_pct > +1% AND dxy is STRENGTHENING simultaneously: this is strong safe-haven "
+    "demand (geopolitical stress pattern) — lean BEARISH or NEUTRAL regardless of US markets "
+    "signal; recommend HALF_SIZE_POSITIONS.\n"
+    "    - change_pct < -0.5%: risk-on signal, mildly supportive for equities.\n"
+    "    - Jewellery stocks (TITAN): gold rally > +1% is modestly BULLISH for TITAN as "
+    "investor interest in gold/silver jewellery rises; add to watchlist if no other negatives."
 )
 
 
@@ -127,12 +151,14 @@ async def collect_pre_market_data() -> dict:
 
     _aggregator = HybridNewsAggregator()
 
-    fii_dii, us_markets, dxy, sgx_nifty, india_vix, news_items = await asyncio.gather(
+    fii_dii, us_markets, dxy, sgx_nifty, india_vix, crude_oil, gold, news_items = await asyncio.gather(
         fetch_fii_dii_data(),
         fetch_us_market_close(),
         fetch_dxy(),
         fetch_sgx_nifty(),
         fetch_india_vix(),
+        fetch_crude_oil(),
+        fetch_gold(),
         _aggregator.fetch_all(watchlist=prior_watchlist),  # real-time RSS + Google News
         return_exceptions=True,
     )
@@ -166,6 +192,8 @@ async def collect_pre_market_data() -> dict:
         "dxy": dxy if not isinstance(dxy, Exception) else {"error": str(dxy)},
         "sgx_nifty": sgx_nifty if not isinstance(sgx_nifty, Exception) else {"error": str(sgx_nifty)},
         "india_vix": india_vix if not isinstance(india_vix, Exception) else {"value": 0.0, "regime": "UNKNOWN"},
+        "crude_oil": crude_oil if not isinstance(crude_oil, Exception) else {"price": 0.0, "change_pct": 0.0, "available": False},
+        "gold": gold if not isinstance(gold, Exception) else {"price": 0.0, "change_pct": 0.0, "available": False},
         "news_headlines": raw_news,
         "earnings_calendar": [],  # TODO: integrate Tickertape API
     }
@@ -340,18 +368,33 @@ def _generate_mock_brief(raw_data: dict | None = None) -> MarketBriefLLMOutput:
         raw_sgx_sig = raw_data.get("sgx_nifty", {}).get("signal", "FLAT")
         sgx_signal = SgxSignal(raw_sgx_sig) if raw_sgx_sig in SgxSignal.__members__ else SgxSignal.FLAT
 
-    # Derive simple bias from available data
+    crude_change = 0.0
+    gold_change = 0.0
+    if raw_data:
+        crude = raw_data.get("crude_oil", {})
+        if crude.get("available"):
+            crude_change = crude.get("change_pct", 0.0)
+        gold = raw_data.get("gold", {})
+        if gold.get("available"):
+            gold_change = gold.get("change_pct", 0.0)
+
+    # Derive simple bias from available data.
+    # Gold > +1% is a risk-off bear signal; crude > +2% is mildly bearish overall
+    # (net negative for the broader market even if bullish for specific upstream names).
     bull_count = sum([
         sp500_pct > 0.2,
         nasdaq_pct > 0.2,
         fii_net > 200,
         sgx_change > 0.2,
+        gold_change < -0.5,    # risk-on: gold falling
     ])
     bear_count = sum([
         sp500_pct < -0.2,
         nasdaq_pct < -0.2,
         fii_net < -200,
         sgx_change < -0.2,
+        gold_change > 1.0,     # risk-off: gold rallying
+        crude_change > 2.0,    # cost-push pressure on broad market
     ])
     if bull_count >= 3:
         bias = MarketBias.BULLISH

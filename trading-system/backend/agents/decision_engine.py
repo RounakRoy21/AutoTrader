@@ -383,6 +383,7 @@ class DecisionEngine:
             system_prompt=DECISION_SYSTEM_PROMPT,
             user_content=user_content,
             response_model=DecisionOutput,
+            model=self._settings.anthropic_decision_model,
         )
 
     def _validate_decision(
