@@ -45,6 +45,49 @@ MIS_FORCE_CLOSE = dt_time(15, 20)  # 3:20 PM IST
 EOD_REPORT_TIME = dt_time(15, 30)  # 3:30 PM IST
 
 
+def _transaction_costs(entry_price: float, exit_price: float, qty: int, product_type: str) -> float:
+    """Estimate round-trip NSE transaction costs for a single trade.
+
+    Applies Zerodha's published fee schedule (rates as of 2025):
+    - Brokerage:           ₹20/order (capped at 0.03% per leg) — both entry and exit
+    - STT:                 0.025% of sell-side turnover (intraday MIS/NRML)
+                           0.1%   of both sides (CNC delivery)
+    - Exchange charges:    0.00345% of total turnover (NSE equities)
+    - GST:                 18% on (brokerage + exchange charges)
+    - SEBI turnover fee:   0.0001% of total turnover
+    - Stamp duty:          0.003% of buy-side turnover
+
+    Returns the total cost estimate in rupees.  The result is subtracted from
+    gross P&L so that ``realized_pnl`` reflects what actually hits the bank.
+    """
+    buy_value = entry_price * qty
+    sell_value = exit_price * qty
+    total_turnover = buy_value + sell_value
+
+    # Brokerage: ₹20 flat per executed order, capped at 0.03% of that leg's value
+    brokerage = min(20.0, buy_value * 0.0003) + min(20.0, sell_value * 0.0003)
+
+    # STT: intraday (MIS/NRML) → sell side only; delivery (CNC) → both sides
+    if product_type.upper() in ("MIS", "NRML"):
+        stt = sell_value * 0.00025
+    else:
+        stt = total_turnover * 0.001
+
+    # Exchange transaction charges (NSE equity segment)
+    exchange_charges = total_turnover * 0.0000345
+
+    # GST on brokerage + exchange charges
+    gst = (brokerage + exchange_charges) * 0.18
+
+    # SEBI turnover fee
+    sebi = total_turnover * 0.000001
+
+    # Stamp duty: 0.003% on buy-side only (rounded up at exchange, approximated here)
+    stamp = buy_value * 0.00003
+
+    return round(brokerage + stt + exchange_charges + gst + sebi + stamp, 2)
+
+
 class RiskManager:
     """
     Deterministic risk manager that monitors all open positions.
@@ -316,8 +359,10 @@ class RiskManager:
             # manual intervention will handle it.
             return
 
-        # Phase 3 — Calculate P&L and finalise as CLOSED
-        pnl = (exit_price - trade.entry_price) * trade.quantity
+        # Phase 3 — Calculate net P&L (gross less transaction costs) and finalise as CLOSED
+        gross_pnl = (exit_price - trade.entry_price) * trade.quantity
+        costs = _transaction_costs(trade.entry_price, exit_price, trade.quantity, trade.product_type)
+        pnl = round(gross_pnl - costs, 2)
 
         async with get_db_context() as session:
             await session.execute(
@@ -333,8 +378,8 @@ class RiskManager:
             )
 
         logger.info(
-            "%s: %s @ ₹%.2f → P&L: ₹%.2f",
-            reason, trade.stock, exit_price, pnl,
+            "%s: %s @ ₹%.2f → gross P&L: ₹%.2f | costs: ₹%.2f | net P&L: ₹%.2f",
+            reason, trade.stock, exit_price, gross_pnl, costs, pnl,
         )
 
         # Publish event to Redis
@@ -360,18 +405,47 @@ class RiskManager:
         # reset the streak, so a morning SL run isn't artificially extended
         # by forced EOD exits.
         if reason == "STOP_LOSS_HIT":
-            count_str = await get_value("consecutive_losses") or "0"
-            count = int(count_str) + 1
-            await set_value("consecutive_losses", str(count))
+            count = 0
+            try:
+                count_str = await get_value("consecutive_losses") or "0"
+                count = int(count_str) + 1
+                await set_value("consecutive_losses", str(count))
+            except Exception as redis_exc:
+                logger.warning(
+                    "Redis unavailable for consecutive loss tracking: %s — falling back to DB count",
+                    redis_exc,
+                )
+                # B-5: Count today's SL-hit trades from DB as a conservative approximation
+                # of the consecutive streak.  This may overcount if there were target hits
+                # interleaved today, but it is safer to pause too early than to miss a needed
+                # pause when Redis is degraded.
+                try:
+                    async with get_db_context() as session:
+                        result = await session.execute(
+                            select(Trade).where(
+                                Trade.trade_date == now_ist.date(),
+                                Trade.status == "CLOSED",
+                                Trade.exit_reason == "STOP_LOSS_HIT",
+                            )
+                        )
+                        count = len(list(result.scalars().all()))
+                except Exception as db_exc:
+                    logger.error("DB fallback for consecutive loss count failed: %s", db_exc)
             if count >= settings.consecutive_loss_pause_threshold:
                 pause_until = now_ist + timedelta(minutes=settings.consecutive_loss_pause_minutes)
-                await set_value("consecutive_loss_pause_until", pause_until.isoformat())
+                try:
+                    await set_value("consecutive_loss_pause_until", pause_until.isoformat())
+                except Exception:
+                    pass  # Non-fatal; new-trade decision path will recheck when Redis recovers
                 logger.warning(
                     "%d consecutive losses — trading paused until %s",
                     count, pause_until.strftime("%H:%M"),
                 )
         elif reason == "TARGET_HIT":
-            await set_value("consecutive_losses", "0")
+            try:
+                await set_value("consecutive_losses", "0")
+            except Exception:
+                pass  # Non-critical; streak resets naturally from next SL-hit DB count
 
     async def _update_stop_loss(self, trade: Trade, new_sl: float) -> None:
         """Update the stop-loss price for a trade in the database (trailing SL)."""

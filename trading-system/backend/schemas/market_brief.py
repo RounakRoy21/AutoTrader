@@ -104,7 +104,7 @@ class NewsFlagSchema(BaseModel):
 
 class EarningsDriftCandidate(BaseModel):
     stock: str
-    beat_pct: float
+    beat_pct: Optional[float] = None  # null for pre-earnings candidates; non-null only when an actual beat% is known from news
 
 
 # ── Main Market Brief Schema ──────────────────────

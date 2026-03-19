@@ -55,26 +55,119 @@ class TradingAgent:
 
     async def state_recovery(self) -> None:
         """
-        MANDATORY first step: log open positions recovered from Kite at session start.
-        Open position counting is now handled by live DB queries in the Decision Engine,
-        so no counter synchronisation is required here.
+        MANDATORY first step: reconcile open Kite positions with the DB.
+
+        Safety invariant: the Risk Manager queries ONLY the DB for open trades.
+        If the process crashed after a live order was placed but before the DB
+        row was committed, Kite holds a real position the Risk Manager will
+        never see — meaning no SL enforcement, no EOD close, no P&L tracking.
+
+        This method creates a synthetic OPEN Trade record for every orphaned
+        Kite position so the Risk Manager can manage it normally.  SL and target
+        are estimated from configured percentages; the rationale field is set to
+        "RECOVERED — no DB record found on startup" so the operator can
+        distinguish synthetic rows from normally entered trades.
         """
-        logger.info("Running state recovery — syncing open positions from Kite…")
+        logger.info("Running state recovery — reconciling Kite positions with DB…")
+
+        # Paper trading: no Kite positions exist, nothing to reconcile.
+        if self._settings.paper_trading:
+            logger.info("Paper trading mode — skipping Kite state recovery")
+            return
+
         try:
             kite = get_kite_client()
             positions = await kite.get_positions()
             net_positions = positions.get("net", [])
-            open_count = sum(1 for p in net_positions if p.get("quantity", 0) != 0)
-            for pos in net_positions:
-                if pos.get("quantity", 0) != 0:
-                    logger.info(
-                        "Recovered position: %s qty=%d avg_price=%.2f",
-                        pos.get("tradingsymbol"), pos.get("quantity"),
-                        pos.get("average_price", 0),
-                    )
-            logger.info("State recovery complete: %d open positions", open_count)
+            open_kite: dict = {
+                p["tradingsymbol"]: p
+                for p in net_positions
+                if p.get("quantity", 0) != 0
+            }
         except Exception as exc:
-            logger.error("State recovery failed: %s — proceeding with empty state", exc)
+            logger.error(
+                "State recovery: Kite positions fetch failed: %s — proceeding with DB state", exc
+            )
+            return
+
+        if not open_kite:
+            logger.info("State recovery: no open positions in Kite")
+            return
+
+        today = datetime.now(IST).date()
+        now_time = datetime.now(IST).time()
+        settings = self._settings
+
+        try:
+            async with get_db_context() as session:
+                result = await session.execute(
+                    select(Trade).where(
+                        Trade.status.in_(["OPEN", "CLOSING"]),
+                        Trade.trade_date == today,
+                    )
+                )
+                db_open = {t.stock: t for t in result.scalars().all()}
+
+            orphans = {sym: pos for sym, pos in open_kite.items() if sym not in db_open}
+
+            if not orphans:
+                logger.info(
+                    "State recovery complete: %d Kite position(s), all matched in DB",
+                    len(open_kite),
+                )
+                return
+
+            logger.warning(
+                "State recovery: %d orphaned Kite position(s) with no DB record — "
+                "creating synthetic OPEN entries: %s",
+                len(orphans), list(orphans.keys()),
+            )
+
+            async with get_db_context() as session:
+                for sym, pos in orphans.items():
+                    avg_price = float(pos.get("average_price") or 0)
+                    if avg_price <= 0:
+                        logger.warning(
+                            "State recovery: %s has avg_price=0 — skipping synthetic record", sym
+                        )
+                        continue
+                    qty = abs(int(pos.get("quantity", 0)))
+                    product = pos.get("product", "MIS")
+                    sl = round(avg_price * (1 - settings.stop_loss_pct), 2)
+                    tgt = round(avg_price * (1 + settings.min_target_pct), 2)
+                    synthetic = Trade(
+                        kite_order_id=f"RECOVERED-{sym}-{today.isoformat()}",
+                        stock=sym,
+                        exchange=pos.get("exchange", "NSE"),
+                        direction="BUY",
+                        product_type=product,
+                        quantity=qty,
+                        entry_price=avg_price,
+                        stop_loss_price=sl,
+                        target_price=tgt,
+                        status="OPEN",
+                        trade_date=today,
+                        entry_time=now_time,
+                        decision_rationale="RECOVERED — no DB record found on startup",
+                    )
+                    session.add(synthetic)
+                    logger.warning(
+                        "Synthetic Trade created: %s qty=%d avg=₹%.2f SL=₹%.2f TGT=₹%.2f",
+                        sym, qty, avg_price, sl, tgt,
+                    )
+
+            await publish("system_alerts", {
+                "type": "warning",
+                "message": (
+                    f"State recovery created {len(orphans)} synthetic trade record(s) for "
+                    f"orphaned Kite position(s): {list(orphans.keys())}. "
+                    f"SL/target estimated from config. Manual review recommended."
+                ),
+                "timestamp": datetime.now(IST).isoformat(),
+            })
+
+        except Exception as exc:
+            logger.error("State recovery DB reconciliation failed: %s", exc)
 
     async def _on_market_brief(self, data: str) -> None:
         """Handler for Redis messages on the 'market_brief' channel."""
@@ -146,6 +239,37 @@ class TradingAgent:
                 order_id = f"PAPER-{now_ist.strftime('%H%M%S')}-{signal.stock}-{uuid4().hex[:6]}"
                 logger.info("📝 Paper trade: %s", order_id)
             else:
+                # A3: Circuit limit pre-check — reject orders when the stock is at
+                # or within 0.5% of its upper circuit limit.  NSE will reject the
+                # order anyway, but without this check there is no user notification
+                # and the signal is silently abandoned with no DB record or Telegram alert.
+                try:
+                    kite_quote = await kite.get_quote([f"NSE:{signal.stock}"])
+                    stock_quote = kite_quote.get(f"NSE:{signal.stock}", {})
+                    upper_circuit = float(stock_quote.get("upper_circuit_limit") or 0)
+                    if upper_circuit > 0 and signal.ltp >= upper_circuit * 0.995:
+                        logger.warning(
+                            "Circuit limit: %s LTP ₹%.2f >= upper circuit ₹%.2f (99.5%%) — order skipped",
+                            signal.stock, signal.ltp, upper_circuit,
+                        )
+                        await publish("system_alerts", {
+                            "type": "warning",
+                            "message": (
+                                f"Order skipped: {signal.stock} at/near upper circuit ₹{upper_circuit:.2f} "
+                                f"— circuit limit buy rejected"
+                            ),
+                            "timestamp": now_ist.isoformat(),
+                        })
+                        return
+                except Exception as circuit_exc:
+                    # Non-fatal: if the quote call fails, log and proceed.
+                    # A real circuit breach will still be caught by Kite's rejection,
+                    # but at least we attempted the check.
+                    logger.warning(
+                        "Circuit limit check failed for %s: %s — proceeding with order",
+                        signal.stock, circuit_exc,
+                    )
+
                 order_id = await kite.place_order(
                     tradingsymbol=signal.stock,
                     transaction_type="BUY",
@@ -218,7 +342,30 @@ class TradingAgent:
                     if gtt_trigger_id:
                         logger.info("GTT placed for %s: trigger_id=%s", signal.stock, gtt_trigger_id)
                 except Exception as gtt_exc:
-                    logger.error("GTT placement failed for %s: %s", signal.stock, gtt_exc)
+                    logger.error(
+                        "GTT placement failed for %s: %s — halting new trades, manual stop required",
+                        signal.stock, gtt_exc,
+                    )
+                    # B-2: Position is LIVE with no server-side stop-loss.  If this
+                    # process crashes or is restarted, nothing at Zerodha will close
+                    # the position.  Halt new entries immediately so the operator can
+                    # review.  The Risk Manager will still manage THIS position via its
+                    # DB poll (SL/target enforcement continues intraday).
+                    await set_value(HALT_KEY, "TRUE")
+                    await publish("system_alerts", {
+                        "type": "critical",
+                        "message": (
+                            f"GTT stop-loss FAILED for {signal.stock}. "
+                            f"Position is LIVE with no server-side stop. "
+                            f"Trading HALTED — manual intervention required."
+                        ),
+                        "timestamp": now_ist.isoformat(),
+                    })
+                    await send_telegram(
+                        f"\U0001f6a8 GTT STOP-LOSS FAILED for {signal.stock}\n"
+                        f"Position is LIVE with NO server-side stop-loss.\n"
+                        f"Trading halted — manual intervention required."
+                    )
 
         except Exception as exc:
             logger.error("Order placement failed for %s: %s", signal.stock, exc)
@@ -304,7 +451,10 @@ class TradingAgent:
         self._running = True
 
         # Start Risk Manager on its own thread
-        loop = asyncio.get_event_loop()
+        # get_running_loop() is the correct call inside an async function — it
+        # always returns the currently-executing event loop and raises RuntimeError
+        # if called outside one (which would be a programming error here).
+        loop = asyncio.get_running_loop()
         self._risk_manager.start(loop)
 
         # Start Scanner (WebSocket) and Decision processing concurrently

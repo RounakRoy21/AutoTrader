@@ -37,9 +37,11 @@ An automated NSE intraday equity trading system. Streams live tick data from Zer
 06:00–09:10 IST      │  ┌──────────────────────────────────────────────┐   │
                      │  │            Research Agent                    │   │
   Alpha Vantage  ───►│  │  SGX Nifty, DXY, US market close, FII/DII    │   │
-  RSS / Google   ───►│  │  India VIX, financial news headlines          │   │
-  News RSS feeds ───►│  │  → Claude synthesises → Market Brief         │   │
-  NSE data       ───►│  │  → published to Redis + PostgreSQL           │   │
+  Yahoo Finance  ───►│  │  India VIX, crude oil (Brent), gold          │   │
+  RSS / Google   ───►│  │  Earnings calendar (next 7 days)             │   │
+  News RSS feeds ───►│  │  Financial news headlines                    │   │
+  NSE data       ───►│  │  → Claude synthesises → Market Brief         │   │
+                     │  │  → published to Redis + PostgreSQL           │   │
                      │  └──────────────────────────────────────────────┘   │
                      │                           │                         │
                      │              ┌────────────▼──────────┐              │
@@ -89,7 +91,9 @@ An automated NSE intraday equity trading system. Streams live tick data from Zer
 **Research Agent** (pre-market, 06:00–09:10 IST)
 - Fetches SGX Nifty proxy (Nifty 50 close via Yahoo Finance `^NSEI`), DXY trend, US market close (Alpha Vantage)
 - India VIX (NSE implied-volatility index via Yahoo Finance `^INDIAVIX`) — drives `recommended_stance` and `position_size_override`
+- Brent crude oil (Yahoo Finance `CL=F`) and gold spot (Yahoo Finance `GC=F`) — feed commodity interpretation rules in the LLM prompt
 - FII/DII net buy/sell data (NSE)
+- Earnings calendar: upcoming NSE results in the next 7 days (Yahoo Finance `quoteSummary`) — populates `earnings_drift_candidates`; stocks with results today/tomorrow are flagged as high-uncertainty and bias the watchlist
 - Financial news headlines via `HybridNewsAggregator`: 5 Indian RSS feeds (Economic Times, Business Standard, Moneycontrol, LiveMint, NDTV Profit) + targeted Google News RSS per watchlist stock
 - Claude synthesises all inputs into a structured `MarketBrief` with a `BULLISH / NEUTRAL / BEARISH` bias
 - Bias is injected into every trade decision — a bearish brief suppresses long signals
@@ -127,7 +131,7 @@ An automated NSE intraday equity trading system. Streams live tick data from Zer
 | Scheduling | APScheduler 3.10 |
 | Broker | Zerodha Kite Connect v5 |
 | LLM | Anthropic Claude — Sonnet 4.6 (Research Agent), Haiku 4.5 (Decision Engine) |
-| Market data | Alpha Vantage (US close, DXY), Yahoo Finance (Nifty 50 close, India VIX), NSE HTTP |
+| Market data | Alpha Vantage (US close, DXY), Yahoo Finance (Nifty 50 close, India VIX, crude oil, gold, earnings calendar), NSE HTTP |
 | News | HybridNewsAggregator — 5 Indian financial RSS feeds + Google News RSS (no API key) |
 | Alerts | Telegram Bot API |
 | Frontend | Angular 17, TypeScript |
@@ -159,7 +163,9 @@ trading-system/
 │   ├── integrations/
 │   │   ├── kite_client.py          # Kite Connect wrapper (retry + circuit breaker)
 │   │   ├── anthropic_client.py
-│   │   ├── alpha_vantage_client.py # US market close, DXY; Yahoo Finance Nifty 50 close + India VIX
+│   │   ├── alpha_vantage_client.py # US close, DXY (Alpha Vantage); Nifty 50, India VIX,
+│   │   │                           #   crude oil, gold, earnings calendar (Yahoo Finance)
+│   │   ├── instrument_service.py   # NSE instrument list download + symbol resolution
 │   │   ├── news_aggregator.py      # HybridNewsAggregator: RSS + Google News RSS
 │   │   ├── nse_client.py           # FII/DII data
 │   │   ├── telegram_client.py
@@ -181,7 +187,9 @@ trading-system/
 │       └── trade-log/
 ├── docker-compose.yml              # Dev stack
 ├── docker-compose.prod.yml         # Production overrides
-├── deploy.sh                       # Oracle Cloud bootstrap script
+├── deploy.sh                       # Oracle Cloud one-time bootstrap script
+├── start.sh                        # Daily launch script (Linux / Oracle Cloud)
+├── start.ps1                       # Daily launch script (Windows / Docker Desktop)
 ├── PRODUCTION_SETUP.md             # Step-by-step production setup guide
 └── PREPRODUCTION_CHECKLIST.md
 ```
@@ -200,11 +208,14 @@ cd AutoTrader/trading-system
 cp .env.example .env
 # Edit .env: add KITE_API_KEY, ANTHROPIC_API_KEY, etc.
 
-# Start the full stack
-docker compose up --build
+# Start the full stack (waits for health checks, runs migrations automatically)
+chmod +x start.sh && ./start.sh
 
-# In a separate terminal — apply migrations
-docker compose exec backend alembic upgrade head
+# On Windows (Docker Desktop):
+# .\start.ps1
+#
+# Rebuild images after code changes:
+# ./start.sh --build  (or .\start.ps1 -Build)
 ```
 
 Open **http://localhost:4200** for the dashboard.
@@ -220,7 +231,7 @@ falls back to the mock tick generator (`MockTickGenerator`) automatically.
 ```bash
 cd trading-system/backend
 python -m pytest tests/ -p no:warnings -q
-# 151 passed, 2 failed (pre-existing test_api.py async fixture issues — unrelated to trading logic)
+# 153 passed
 ```
 
 ---

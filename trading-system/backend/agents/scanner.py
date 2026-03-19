@@ -21,7 +21,7 @@ import pytz
 
 from core.config import get_settings
 from integrations.kite_client import get_kite_client
-from integrations.instrument_service import get_instrument_map, get_symbol
+from integrations.instrument_service import get_instrument_map, get_symbol, NIFTY50_TOKEN
 from integrations.ltp_store import set_ltp
 from integrations.mock_tick_generator import MockTickGenerator
 from schemas.trade import ScannerSignal
@@ -324,6 +324,10 @@ class Scanner:
         self._running = False
         self._mock_generator: Optional[MockTickGenerator] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None  # for thread-safe queue access
+        # A2: Intraday NIFTY 50 trend state — updated from index ticks on every tick batch.
+        # Suppresses long signals when NIFTY drifts below nifty_trend_filter_pct from open.
+        self._nifty_open_price: float = 0.0
+        self._nifty_ltp: float = 0.0
 
     def _calculate_suggested_qty(self, ltp: float, atr: float = 0.0, n_candles: int = 0) -> int:
         """
@@ -336,6 +340,12 @@ class Scanner:
 
         Without sufficient candles (or ATR=0): qty = max_loss / (ltp × stop_loss_pct)
         — fixed-percentage fallback.
+
+        Hard capital cap (A1 fix): the risk formula alone can produce notional values
+        of 3–9× total capital when ATR is tight relative to the max-loss budget (e.g.
+        RELIANCE at ₹2,800 with 1m ATR ₹8 → 625 shares → ₹17.5L on ₹5L capital).
+        The cap clamps qty so that qty × ltp ≤ total_capital / max_open_positions,
+        keeping every position within its designated capital envelope.
         """
         settings = self._settings
         max_loss = settings.total_capital * settings.max_loss_per_trade_pct
@@ -346,7 +356,18 @@ class Scanner:
             sl_distance = ltp * settings.stop_loss_pct
         if sl_distance <= 0:
             return 0
-        return max(1, int(max_loss / sl_distance))
+
+        qty_from_risk = max(1, int(max_loss / sl_distance))
+
+        # A1: Hard capital cap — each position must fit within its capital envelope.
+        # Without this, the risk formula produces notional values far exceeding
+        # available capital, resulting in Kite margin rejections and silent order loss.
+        if ltp > 0 and settings.max_open_positions > 0:
+            max_notional_per_position = settings.total_capital / settings.max_open_positions
+            qty_from_capital = max(1, int(max_notional_per_position / ltp))
+            return min(qty_from_risk, qty_from_capital)
+
+        return qty_from_risk
 
     def _check_signal(self, store: TickDataStore) -> Optional[ScannerSignal]:
         """Check if all entry conditions are met for a given stock.
@@ -408,9 +429,25 @@ class Scanner:
         rsi = store.compute_rsi()
         vol_ratio = store.compute_volume_ratio()
 
+        # A2: Intraday NIFTY 50 macro trend filter.
+        # Suppress all long signals when NIFTY has drifted below the configured
+        # threshold from its session open.  An individual stock can satisfy all
+        # technical conditions while NIFTY is in a broad intraday downtrend — the
+        # stock-level indicators cannot see this because VWAP and RSI both reset
+        # at the session open and carry no information about index direction.
+        # In paper mode or when NIFTY data hasn't arrived yet, skip the check
+        # (open=0 means no tick received) to avoid blocking all signals at startup.
+        if self._nifty_open_price > 0 and self._nifty_ltp > 0:
+            nifty_drift = (self._nifty_ltp - self._nifty_open_price) / self._nifty_open_price
+            if nifty_drift < self._settings.nifty_trend_filter_pct:
+                logger.debug(
+                    "NIFTY trend filter: index drift %.3f%% < threshold %.3f%% — no long signals",
+                    nifty_drift * 100, self._settings.nifty_trend_filter_pct * 100,
+                )
+                return None
+
         # Condition 1: Price > VWAP
         if ltp <= vwap:
-            return None
         # Condition 2: RSI between 45 and 65 (scanner pre-filter; see docstring)
         if not (45 <= rsi <= 65):
             return None
@@ -478,6 +515,24 @@ class Scanner:
         """Callback invoked by KiteTicker or MockTickGenerator on each tick batch."""
         for tick in ticks:
             token = tick.get("instrument_token")
+
+            # A2: Intercept NIFTY 50 index ticks to maintain the macro trend state.
+            # The index is subscribed in _on_connect() but has no TickDataStore —
+            # we only need its open and LTP, not a full OHLCV history.
+            if token == NIFTY50_TOKEN:
+                price = tick.get("last_price", 0.0)
+                if price > 0:
+                    self._nifty_ltp = price
+                    # Capture session open on the very first tick of the day.
+                    ohlc = tick.get("ohlc", {})
+                    open_price = float(ohlc.get("open", 0.0))
+                    if self._nifty_open_price == 0.0 and open_price > 0:
+                        self._nifty_open_price = open_price
+                        logger.info(
+                            "[Scanner] NIFTY 50 open price captured: ₹%.2f", open_price
+                        )
+                continue  # Do not process as a stock signal
+
             symbol = get_symbol(token) if token else None
             if symbol is None:
                 continue
@@ -562,10 +617,15 @@ class Scanner:
     def _on_connect(self, ws, response) -> None:
         """Subscribe to instruments on WebSocket connect."""
         tokens = list(get_instrument_map().values())
+        # A2: Always subscribe to the NIFTY 50 index for the intraday trend filter,
+        # even if it is not in the focus stock list.  LTP mode is sufficient — we
+        # only need last_price and ohlc.open, not full market depth.
+        if NIFTY50_TOKEN not in tokens:
+            tokens.append(NIFTY50_TOKEN)
         if tokens:
             ws.subscribe(tokens)
             ws.set_mode(ws.MODE_FULL, tokens)
-            logger.info("KiteTicker subscribed to %d instruments", len(tokens))
+            logger.info("KiteTicker subscribed to %d instruments (incl. NIFTY 50 index)", len(tokens))
 
     def _on_close(self, ws, code, reason) -> None:
         logger.warning("KiteTicker closed: code=%s reason=%s", code, reason)

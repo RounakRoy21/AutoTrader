@@ -263,6 +263,34 @@ class KiteClient:
 
         return await asyncio.to_thread(_fetch)
 
+    async def get_quote(self, instruments: List[str]) -> Dict[str, Any]:
+        """Fetch full market quote including circuit limits for a list of instruments.
+
+        The returned dict keyed by 'NSE:SYMBOL' includes:
+          - last_price, upper_circuit_limit, lower_circuit_limit
+          - depth (bid/ask), ohlc, volume, etc.
+
+        Used for the pre-order circuit limit check (A3).
+        """
+        if self._settings.paper_trading:
+            # In paper mode return a minimal stub — circuit check is skipped
+            return {instr: {"last_price": 0.0, "upper_circuit_limit": 0.0,
+                            "lower_circuit_limit": 0.0} for instr in instruments}
+
+        kite = await self.get_kite()
+
+        @_retry_sync
+        def _fetch():
+            return kite.quote(*instruments)
+
+        try:
+            result = await asyncio.to_thread(_fetch)
+            self._last_failure = 0.0
+            return result
+        except Exception as exc:
+            await self._handle_failure(exc)
+            raise
+
     async def get_historical_data(
         self,
         instrument_token: int,

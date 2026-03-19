@@ -32,7 +32,7 @@ from integrations.alpha_vantage_client import (
 )
 from integrations.anthropic_client import get_anthropic_client
 from integrations.news_aggregator import HybridNewsAggregator
-from integrations.nse_client import fetch_fii_dii_data
+from integrations.nse_client import fetch_corporate_actions_today, fetch_fii_dii_data
 from models.market_brief import MarketBrief
 from schemas.market_brief import (
     DxySchema,
@@ -72,8 +72,15 @@ RESEARCH_SYSTEM_PROMPT = (
     "us_markets, news_flags, watchlist_today, avoid_today, earnings_drift_candidates, "
     "recommended_stance, position_size_override. "
     "news_flags is a list of objects with keys: type, sentiment (POSITIVE/NEGATIVE/NEUTRAL), "
-    "urgency (HIGH/MEDIUM/LOW), stock (nullable), beat_pct (nullable). "
-    "earnings_drift_candidates is a list of objects with keys: stock, beat_pct.\n\n"
+    "urgency (HIGH/MEDIUM/LOW), stock (nullable), beat_pct (nullable — only non-null when a "
+    "reported beat percentage is cited in the headline, e.g. 'beats estimates by 8%'). "
+    "earnings_drift_candidates is a list of objects with keys: stock, beat_pct (nullable). "
+    "For stocks sourced from the earnings_calendar (upcoming results, not yet reported), "
+    "beat_pct must be null. Only set beat_pct to a non-null float when a confirmed EPS beat "
+    "percentage is explicitly cited in a news headline. "
+    "recommended_stance must be one of: FULL_SIZE_POSITIONS, HALF_SIZE_POSITIONS, AVOID_TRADING. "
+    "position_size_override is a nullable string; use null unless a specific override is warranted "
+    "(e.g. 'REDUCE_50PCT' during VIX STRESS).\n\n"
     "NEWS HEADLINE INTERPRETATION RULES:\n"
     "  • Each headline has an 'age_minutes' field. Weight headlines under 180 minutes "
     "(3 hours) as HIGH relevance — these are fresh overnight catalysts not yet priced in. "
@@ -120,7 +127,22 @@ RESEARCH_SYSTEM_PROMPT = (
     "signal; recommend HALF_SIZE_POSITIONS.\n"
     "    - change_pct < -0.5%: risk-on signal, mildly supportive for equities.\n"
     "    - Jewellery stocks (TITAN): gold rally > +1% is modestly BULLISH for TITAN as "
-    "investor interest in gold/silver jewellery rises; add to watchlist if no other negatives."
+    "investor interest in gold/silver jewellery rises; add to watchlist if no other negatives.\n\n"
+    "EARNINGS CALENDAR INTERPRETATION RULES:\n"
+    "  • earnings_calendar contains stocks with scheduled NSE results in the next 7 calendar "
+    "days: [{\"stock\": \"INFY\", \"earnings_date\": \"2026-03-12\"}, ...]. "
+    "An empty list means no results are due this week.\n"
+    "  • Results TODAY or TOMORROW: highest-uncertainty window. Pre-announcement drift is "
+    "unpredictable. Add to watchlist_today only if macro and news context strongly support a "
+    "positive surprise; otherwise include in avoid_today.\n"
+    "  • Results in 3–7 days: moderate uncertainty. If overall bias is BULLISH and no negative "
+    "stock-specific news exists, include in watchlist_today as a drift candidate.\n"
+    "  • Populate earnings_drift_candidates for every stock in earnings_calendar. "
+    "Set beat_pct to null — these are upcoming (not yet reported) results; actual beat "
+    "percentages are unknown. Do not fabricate beat_pct values.\n"
+    "  • If earnings_calendar is empty, return earnings_drift_candidates as [].\n"
+    "  • earnings_calendar stocks with upcoming results near a VIX STRESS or ELEVATED regime "
+    "should be treated as doubly uncertain — lean towards avoid_today."
 )
 
 
@@ -154,7 +176,7 @@ async def collect_pre_market_data() -> dict:
 
     (
         fii_dii, us_markets, dxy, sgx_nifty, india_vix,
-        crude_oil, gold, earnings_cal, news_items,
+        crude_oil, gold, earnings_cal, news_items, corp_actions,
     ) = await asyncio.gather(
         fetch_fii_dii_data(),
         fetch_us_market_close(),
@@ -165,6 +187,7 @@ async def collect_pre_market_data() -> dict:
         fetch_gold(),
         fetch_earnings_calendar(prior_watchlist),  # upcoming results in next 7 days
         _aggregator.fetch_all(watchlist=prior_watchlist),  # real-time RSS + Google News
+        fetch_corporate_actions_today(),  # ex-date stocks to mechanically exclude
         return_exceptions=True,
     )
 
@@ -201,6 +224,7 @@ async def collect_pre_market_data() -> dict:
         "gold": gold if not isinstance(gold, Exception) else {"price": 0.0, "change_pct": 0.0, "available": False},
         "news_headlines": raw_news,
         "earnings_calendar": earnings_cal if not isinstance(earnings_cal, Exception) else [],
+        "corporate_actions_today": corp_actions if not isinstance(corp_actions, Exception) else [],
     }
 
     logger.info("Pre-market data collection complete")
@@ -473,7 +497,10 @@ def _generate_mock_brief(raw_data: dict | None = None) -> MarketBriefLLMOutput:
         news_flags=news_flags,
         watchlist_today=["RELIANCE", "HDFCBANK", "INFY", "TCS", "ICICIBANK", "AXISBANK", "WIPRO"],
         avoid_today=[],
-        earnings_drift_candidates=[],
+        earnings_drift_candidates=[
+            EarningsDriftCandidate(stock=e["stock"], beat_pct=None)
+            for e in (raw_data.get("earnings_calendar") or []) if raw_data
+        ],
         recommended_stance=stance,
         position_size_override=None,
     )
@@ -622,6 +649,19 @@ async def run_research_agent() -> None:
                 "timestamp": datetime.now(IST).isoformat(),
             })
             return
+
+        # A4: Mechanical corporate-action override — force any ex-date stock into
+        # avoid_today regardless of what the LLM decided.  Ex-date stocks have
+        # their open adjusted by the exchange; VWAP, RSI and volume signals are
+        # all distorted for the entire session and must not be traded.
+        ex_date_stocks: list[str] = raw_data.get("corporate_actions_today", [])
+        if ex_date_stocks:
+            updated_avoid = list(dict.fromkeys(brief.avoid_today + ex_date_stocks))
+            brief = brief.model_copy(update={"avoid_today": updated_avoid})
+            logger.info(
+                "Corporate actions: %d ex-date stock(s) forced into avoid_today: %s",
+                len(ex_date_stocks), ex_date_stocks,
+            )
 
         # Step 3: Persist and broadcast
         await set_value("agent:research:step", "PERSISTING")

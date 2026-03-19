@@ -29,7 +29,15 @@ class AnthropicClient:
 
     def __init__(self) -> None:
         settings = get_settings()
-        self._client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        # timeout=30.0: Claude Sonnet can take 15-25 s on complex prompts.
+        # Without an explicit timeout the SDK uses httpx's default (5 s connect
+        # + unlimited read), which causes silent hangs that block the scanner
+        # queue indefinitely.  30 s gives enough headroom while still bounding
+        # the worst-case delay to a predictable window.
+        self._client = anthropic.AsyncAnthropic(
+            api_key=settings.anthropic_api_key,
+            timeout=30.0,
+        )
         self._model = settings.anthropic_model
 
     async def generate_structured(

@@ -58,7 +58,12 @@ class Settings(BaseSettings):
     # ── Telegram ──────────────────────────────────
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
-
+    # ── API Security ──────────────────────────
+    # Required in production: set ADMIN_API_KEY in .env to a strong random secret.
+    # All trading-control endpoints (halt, resume, start, stop) require the caller
+    # to supply this value in the X-Api-Key request header when non-empty.
+    # An empty string disables the check (development / paper-trading only).
+    admin_api_key: str = ""
     # ── CORS ──────────────────────────────────────
     cors_origins: str = "http://localhost:4200,http://localhost:4201"
 
@@ -85,6 +90,11 @@ class Settings(BaseSettings):
     # this percentage vs previous close.  NSE intraday longs on >1.5% gap-up
     # stocks have a high false-signal rate due to early mean-reversion pressure.
     gap_filter_pct: float = 1.5
+
+    # A2: Intraday NIFTY 50 trend filter — suppress all long signals when the index
+    # has drifted below this percentage from its session open price.
+    # -0.5% is the minimum meaningful drift that indicates broad market selling.
+    nifty_trend_filter_pct: float = -0.005
 
     # ── Derived helpers ───────────────────────────
     @property

@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 INSTRUMENT_MAP_KEY = "kite_instrument_map"
 INSTRUMENT_MAP_TTL = 24 * 60 * 60  # 24 hours
 
+# NIFTY 50 index instrument token — stable Kite/Zerodha value for NSE:NIFTY 50.
+# Used by the Scanner to subscribe to the index feed for the intraday trend filter.
+NIFTY50_TOKEN: int = 256265
+
 # ── Hardcoded fallback token map (paper / offline mode) ────────────────────────
 # Source: Zerodha NSE instrument dump — tokens are stable for NIFTY 50 large-caps.
 FALLBACK_TOKEN_MAP: Dict[str, int] = {

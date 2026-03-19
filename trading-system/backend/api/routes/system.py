@@ -8,7 +8,8 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Security
+from fastapi.security import APIKeyHeader
 
 from core.config import get_settings
 from core.database import check_db_health
@@ -33,6 +34,22 @@ from agents.trading_agent_manager import get_trading_agent_manager
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["System"])
+
+# ── API Key authentication ─────────────────────────────────────────────────────
+_api_key_header = APIKeyHeader(name="X-Api-Key", auto_error=False)
+
+
+async def _require_api_key(api_key: str = Security(_api_key_header)) -> None:
+    """Dependency that enforces the admin API key on trading-control endpoints.
+
+    When ADMIN_API_KEY is empty (dev / paper-trading mode), the check is skipped.
+    In production, every caller must supply the matching key in the X-Api-Key header.
+    """
+    expected = get_settings().admin_api_key
+    if not expected:
+        return  # No key configured — open access (development only)
+    if api_key != expected:
+        raise HTTPException(status_code=403, detail="Invalid or missing X-Api-Key")
 
 
 def _envelope(success: bool, data=None, error=None):
@@ -91,7 +108,7 @@ async def get_agent_status():
     })
 
 
-@router.post("/api/trading/halt")
+@router.post("/api/trading/halt", dependencies=[Depends(_require_api_key)])
 async def halt_trading():
     """Manually set the HALT flag — stops all new trade entries."""
     await set_value(HALT_KEY, "TRUE")
@@ -99,7 +116,7 @@ async def halt_trading():
     return _envelope(True, {"trading_halted": True})
 
 
-@router.post("/api/trading/resume")
+@router.post("/api/trading/resume", dependencies=[Depends(_require_api_key)])
 async def resume_trading():
     """Clear the HALT flag — allows trading to resume."""
     await set_value(HALT_KEY, "FALSE")
@@ -107,7 +124,7 @@ async def resume_trading():
     return _envelope(True, {"trading_halted": False})
 
 
-@router.post("/api/agent/trading/start")
+@router.post("/api/agent/trading/start", dependencies=[Depends(_require_api_key)])
 async def manual_start_trading():
     """
     Manually start the Trading Agent outside of scheduled hours.
@@ -119,7 +136,7 @@ async def manual_start_trading():
     return _envelope(success, {"result": result})
 
 
-@router.post("/api/agent/trading/stop")
+@router.post("/api/agent/trading/stop", dependencies=[Depends(_require_api_key)])
 async def manual_stop_trading():
     """Manually stop the Trading Agent (overrides the 15:30 scheduler)."""
     manager = get_trading_agent_manager()

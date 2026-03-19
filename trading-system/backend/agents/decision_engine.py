@@ -94,7 +94,29 @@ DECISION_SYSTEM_PROMPT = (
     "SIGNAL AUDIT RULES:\n"
     "  • Copy rsi_cited and volume_ratio_cited EXACTLY from the signal — they will be verified.\n"
     "  • List ALL failing conditions in conditions_not_met, even for REDUCE decisions.\n"
-    "  • Never fabricate or round signal values."
+    "  • Never fabricate or round signal values.\n\n"
+    "OUTPUT FIELD RULES:\n"
+    "  • product_type must always be 'MIS' (NSE intraday margin product). Never return CNC or NRML.\n"
+    "  • rationale must state the primary reason in one sentence: which thresholds passed/failed "
+    "and the decisive factor (e.g. 'RSI 58, vol 2.1×, VWAP+0.4%, RR 2.3 — all thresholds clear').\n"
+    "  • adjusted_qty: the signal.suggested_qty has already been halved upstream if "
+    "recommended_stance is HALF_SIZE_POSITIONS. Do not halve it again based on stance.\n\n"
+    "CONFIDENCE SCORE CALIBRATION (0–100):\n"
+    "  Start at 70 for a clean signal (all 6 thresholds in nominal range).\n"
+    "  +5 for each: volume > 2.0×, MACD histogram positive, EMA-9 > EMA-21, "
+    "VWAP deviation 0.1%–0.5% (sweet spot).\n"
+    "  −10 for each: EMA misaligned, MACD negative, VIX regime ELEVATED, "
+    "RSI in borderline zone (40–46 or 68–72), VWAP deviation > 0.8%.\n"
+    "  −20 for each: VIX regime STRESS, earnings results due today or tomorrow for this stock, "
+    "bias_confidence < 0.50.\n"
+    "  −10 if earnings results due in 3–7 days for this stock (pre-announcement uncertainty).\n"
+    "  Hard floor 0, hard ceiling 95.\n\n"
+    "MARKET BRIEF INTEGRATION:\n"
+    "  • BEARISH market_bias: reject all LONG signals regardless of technical quality.\n"
+    "  • NEUTRAL market_bias with bias_confidence < 0.50: treat as mildly bearish — "
+    "reduce confidence_score by 10 before applying the EXECUTE/REDUCE/REJECT mapping.\n"
+    "  • If the signal stock appears in earnings_drift_candidates (results within 7 days), "
+    "apply the earnings confidence penalties above before deciding."
 )
 
 
@@ -358,12 +380,23 @@ class DecisionEngine:
             if signal.atr and signal.atr > 0
             else "1.6% above entry price (min 1:2 risk-reward)"
         )
+        # Highlight if this stock has upcoming earnings in the brief
+        earnings_alert = ""
+        if self._market_brief and self._market_brief.earnings_drift_candidates:
+            for cand in self._market_brief.earnings_drift_candidates:
+                if cand.stock == signal.stock:
+                    earnings_alert = (
+                        f"\n\u26a0\ufe0f  EARNINGS ALERT: {signal.stock} has scheduled results "
+                        f"within 7 days — apply the appropriate confidence penalty before deciding."
+                    )
+                    break
+
         user_content = (
             f"TRADE SIGNAL:\n{json.dumps(signal.model_dump(), default=str)}\n\n"
             f"MARKET BRIEF:\n{brief_summary}\n\n"
             f"Stop-loss rule: {sl_rule}.\n"
             f"Minimum target: {tgt_rule}.\n"
-            f"Today is {datetime.now(IST).strftime('%A')}.\n\n"
+            f"Today is {datetime.now(IST).strftime('%A')}.{earnings_alert}\n\n"
             "THRESHOLDS QUICK REFERENCE (apply to signal_audit fields):\n"
             f"  RSI valid zone (LONG): {RSI_LONG_MIN}–{RSI_LONG_MAX}  "
             f"| hard reject < {RSI_HARD_REJECT_LOW} or > {RSI_HARD_REJECT_HIGH}\n"
