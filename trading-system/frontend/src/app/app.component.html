@@ -1,30 +1,47 @@
-<mat-toolbar color="primary" class="toolbar">
-  <button mat-icon-button (click)="sidenav.toggle()">
-    <mat-icon>menu</mat-icon>
-  </button>
-  <span>AutoTrader Dashboard</span>
-</mat-toolbar>
+<!-- Route navigation loading bar -->
+<mat-progress-bar *ngIf="routeLoading"
+  mode="indeterminate"
+  class="route-progress">
+</mat-progress-bar>
+
+<!-- Kite auth warning banner -->
+<app-kite-auth-banner *ngIf="!kiteAuthenticated"></app-kite-auth-banner>
+
+<!-- WS permanently dead banner -->
+<div class="ws-dead-banner" *ngIf="wsState === 'failed'">
+  <mat-icon>signal_wifi_bad</mat-icon>
+  Live feed is disconnected after repeated retries. Data shown may be stale.
+  <button mat-button (click)="reloadPage()">Reload page</button>
+</div>
 
 <mat-sidenav-container class="sidenav-container">
-  <mat-sidenav #sidenav mode="side" opened class="sidenav">
+  <mat-sidenav #sidenav
+    [mode]="isHandset ? 'over' : 'side'"
+    [opened]="!isHandset"
+    class="sidenav">
     <mat-nav-list>
-      <a mat-list-item routerLink="/dashboard" routerLinkActive="active">
+      <a mat-list-item routerLink="/dashboard" routerLinkActive="active"
+         (click)="closeOnMobile(sidenav)">
         <mat-icon matListItemIcon>dashboard</mat-icon>
         <span matListItemTitle>Dashboard</span>
       </a>
-      <a mat-list-item routerLink="/positions" routerLinkActive="active">
+      <a mat-list-item routerLink="/positions" routerLinkActive="active"
+         (click)="closeOnMobile(sidenav)">
         <mat-icon matListItemIcon>trending_up</mat-icon>
         <span matListItemTitle>Open Positions</span>
       </a>
-      <a mat-list-item routerLink="/trades" routerLinkActive="active">
+      <a mat-list-item routerLink="/trades" routerLinkActive="active"
+         (click)="closeOnMobile(sidenav)">
         <mat-icon matListItemIcon>receipt_long</mat-icon>
         <span matListItemTitle>Trade Log</span>
       </a>
-      <a mat-list-item routerLink="/pnl" routerLinkActive="active">
+      <a mat-list-item routerLink="/pnl" routerLinkActive="active"
+         (click)="closeOnMobile(sidenav)">
         <mat-icon matListItemIcon>show_chart</mat-icon>
         <span matListItemTitle>P&L Chart</span>
       </a>
-      <a mat-list-item routerLink="/alerts" routerLinkActive="active">
+      <a mat-list-item routerLink="/alerts" routerLinkActive="active"
+         (click)="closeOnMobile(sidenav)">
         <mat-icon matListItemIcon>notifications</mat-icon>
         <span matListItemTitle>System Alerts</span>
       </a>
@@ -32,6 +49,29 @@
   </mat-sidenav>
 
   <mat-sidenav-content class="content">
-    <router-outlet></router-outlet>
+    <mat-toolbar color="primary" class="toolbar">
+      <button mat-icon-button (click)="sidenav.toggle()" aria-label="Toggle navigation">
+        <mat-icon>menu</mat-icon>
+      </button>
+      <span>AutoTrader Dashboard</span>
+
+      <span class="toolbar-spacer"></span>
+
+      <!-- Paper trading badge -->
+      <span class="paper-badge" *ngIf="paperTrading" matTooltip="All orders are simulated — no real money at risk">
+        <mat-icon>science</mat-icon> PAPER
+      </span>
+
+      <!-- WebSocket connection chip -->
+      <span class="ws-chip" [class]="'ws-' + wsState"
+            [matTooltip]="wsState === 'failed' ? 'Live feed lost — refresh the page to reconnect' : 'Live data feed status'">
+        <mat-icon>{{ wsIcon }}</mat-icon>
+        <span class="ws-label">{{ wsLabel }}</span>
+      </span>
+    </mat-toolbar>
+
+    <div class="page-content">
+      <router-outlet></router-outlet>
+    </div>
   </mat-sidenav-content>
 </mat-sidenav-container>

@@ -1,5 +1,17 @@
 .chart-card {
   margin: 20px;
+
+  mat-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+}
+
+.period-toggle {
+  margin-left: auto;
 }
 
 canvas {

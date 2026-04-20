@@ -13,6 +13,7 @@ import {
   DailyPnl,
   AgentStatus,
   HealthCheck,
+  KiteAuthStatus,
   LtpMap,
 } from '../models';
 
@@ -40,6 +41,10 @@ export class ApiService {
 
   getOpenTrades(): Observable<Trade[]> {
     return this.http.get<Trade[]>(`${this.baseUrl}/trades/open`);
+  }
+
+  closeTrade(id: number): Observable<Trade> {
+    return this.http.post<Trade>(`${this.baseUrl}/trades/${id}/close`, {});
   }
 
   // ── P&L ───────────────────────────────────────
@@ -88,6 +93,20 @@ export class ApiService {
   healthCheck(): Observable<HealthCheck> {
     return this.http
       .get<ApiResponse<HealthCheck>>(`${this.baseUrl}/health`)
+      .pipe(map((r) => r.data));
+  }
+
+  // ── Kite Auth ─────────────────────────────────
+
+  getKiteAuthStatus(): Observable<KiteAuthStatus> {
+    return this.http
+      .get<ApiResponse<KiteAuthStatus>>(`${this.baseUrl}/auth/kite/status`)
+      .pipe(map((r) => r.data));
+  }
+
+  getKiteLoginUrl(): Observable<{ login_url: string }> {
+    return this.http
+      .get<ApiResponse<{ login_url: string }>>(`${this.baseUrl}/auth/kite/login-url`)
       .pipe(map((r) => r.data));
   }
 }

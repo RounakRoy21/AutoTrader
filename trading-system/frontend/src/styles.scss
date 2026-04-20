@@ -21,3 +21,9 @@ html, body {
 }
 
 .full-width { width: 100%; }
+
+// Error snackbar
+.snack-error .mdc-snackbar__surface {
+  background: #b71c1c !important;
+  color: #fff !important;
+}

@@ -4,9 +4,10 @@
  */
 
 import { Injectable, OnDestroy } from '@angular/core';
-import { BehaviorSubject, Subject, interval } from 'rxjs';
-import { takeUntil, switchMap, catchError } from 'rxjs/operators';
+import { BehaviorSubject, Subject, interval, Subscription } from 'rxjs';
+import { takeUntil, catchError, distinctUntilChanged } from 'rxjs/operators';
 import { EMPTY } from 'rxjs';
+import { MatSnackBar } from '@angular/material/snack-bar';
 
 import { ApiService } from './api.service';
 import { TradingWebSocketService } from './trading-websocket.service';
@@ -17,11 +18,15 @@ import {
   AgentStatus,
   SystemAlert,
   LtpMap,
+  HealthCheck,
+  KiteAuthStatus,
 } from '../models';
 
 @Injectable({ providedIn: 'root' })
 export class StateService implements OnDestroy {
   private destroy$ = new Subject<void>();
+  private _dataErrorShown = false;
+  private _pollSub: Subscription | null = null;
 
   // ── State subjects ────────────────────────────
   private _currentBrief$ = new BehaviorSubject<MarketBrief | null>(null);
@@ -34,6 +39,9 @@ export class StateService implements OnDestroy {
   });
   private _systemAlerts$ = new BehaviorSubject<SystemAlert[]>([]);
   private _ltpMap$ = new BehaviorSubject<LtpMap>({});
+  private _healthCheck$ = new BehaviorSubject<HealthCheck | null>(null);
+  private _kiteAuthenticated$ = new BehaviorSubject<boolean>(true);
+  private _paperTrading$ = new BehaviorSubject<boolean>(false);
 
   // ── Public observables ────────────────────
   readonly currentBrief$ = this._currentBrief$.asObservable();
@@ -42,23 +50,46 @@ export class StateService implements OnDestroy {
   readonly agentStatus$ = this._agentStatus$.asObservable();
   readonly systemAlerts$ = this._systemAlerts$.asObservable();
   readonly ltpMap$ = this._ltpMap$.asObservable();
+  readonly healthCheck$ = this._healthCheck$.asObservable();
+  readonly kiteAuthenticated$ = this._kiteAuthenticated$.asObservable();
+  readonly paperTrading$ = this._paperTrading$.asObservable();
 
   constructor(
     private api: ApiService,
     private ws: TradingWebSocketService,
+    private snackBar: MatSnackBar,
   ) {
     this.initPolling();
     this.initWebSocket();
   }
 
-  /** Poll REST endpoints every 15 seconds for state refresh. */
+  /** Poll REST endpoints every 15 seconds for state refresh.
+   * When the WebSocket is live, reduces to a 60s heartbeat so the WS
+   * carries the real-time load.  Polling resumes at full rate on disconnect.
+   */
   private initPolling(): void {
-    // Load initial data
     this.refreshAll();
 
-    interval(15_000)
+    // Dynamically adjust poll interval based on WS connection state.
+    // connected → 60s (just a heartbeat); anything else → 15s
+    this.ws.connectionState$
+      .pipe(distinctUntilChanged(), takeUntil(this.destroy$))
+      .subscribe((state) => {
+        if (this._pollSub) {
+          this._pollSub.unsubscribe();
+          this._pollSub = null;
+        }
+        const intervalMs = state === 'connected' ? 60_000 : 15_000;
+        this._pollSub = interval(intervalMs)
+          .pipe(takeUntil(this.destroy$))
+          .subscribe(() => this.refreshAll());
+      });
+
+    // Poll health + kite auth every 30 seconds (independent of WS)
+    this.refreshHealth();
+    interval(30_000)
       .pipe(takeUntil(this.destroy$))
-      .subscribe(() => this.refreshAll());
+      .subscribe(() => this.refreshHealth());
   }
 
   /** Subscribe to WebSocket events for real-time updates. */
@@ -112,11 +143,40 @@ export class StateService implements OnDestroy {
 
     this.api
       .getAgentStatus()
+      .pipe(
+        catchError(() => {
+          if (!this._dataErrorShown) {
+            this._dataErrorShown = true;
+            this.snackBar.open('Unable to reach backend — data may be stale.', 'Dismiss', {
+              duration: 6000,
+              panelClass: ['snack-error'],
+            });
+          }
+          return EMPTY;
+        }),
+      )
+      .subscribe((status) => {
+        this._dataErrorShown = false;
+        this._agentStatus$.next(status);
+        if (status.config !== undefined) {
+          this._paperTrading$.next(status.config.paper_trading);
+        }
+      });
+  }
+
+  /** Refresh health check and Kite auth status. */
+  refreshHealth(): void {
+    this.api
+      .healthCheck()
       .pipe(catchError(() => EMPTY))
-      .subscribe((status) => this._agentStatus$.next(status));
+      .subscribe((h) => {
+        this._healthCheck$.next(h);
+        this._kiteAuthenticated$.next(h.kite_api === 'authenticated');
+      });
   }
 
   ngOnDestroy(): void {
+    if (this._pollSub) this._pollSub.unsubscribe();
     this.destroy$.next();
     this.destroy$.complete();
   }

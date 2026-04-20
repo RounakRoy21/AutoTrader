@@ -6,12 +6,14 @@
 
 import { Injectable, OnDestroy } from '@angular/core';
 import { webSocket, WebSocketSubject } from 'rxjs/webSocket';
-import { Observable, Subject, timer, EMPTY } from 'rxjs';
+import { Observable, Subject, BehaviorSubject, timer, EMPTY } from 'rxjs';
 import { filter, map, takeUntil } from 'rxjs/operators';
 import { WsEvent, LtpMap } from '../models';
 
 const MAX_RETRIES = 10;
 const RECONNECT_BASE_MS = 1000;
+
+export type WsConnectionState = 'connecting' | 'connected' | 'disconnected' | 'failed';
 
 @Injectable({ providedIn: 'root' })
 export class TradingWebSocketService implements OnDestroy {
@@ -19,6 +21,9 @@ export class TradingWebSocketService implements OnDestroy {
   private messages$ = new Subject<WsEvent>();
   private destroy$ = new Subject<void>();
   private reconnectAttempt = 0;
+
+  private _connectionState$ = new BehaviorSubject<WsConnectionState>('connecting');
+  readonly connectionState$ = this._connectionState$.asObservable();
 
   /**
    * Derive WebSocket URL from the page's own origin.
@@ -36,17 +41,20 @@ export class TradingWebSocketService implements OnDestroy {
 
   /** Establish WebSocket connection with exponential backoff. */
   private connect(): void {
+    this._connectionState$.next('connecting');
     this.socket$ = webSocket<WsEvent>({
       url: this.getWsUrl(),
       openObserver: {
         next: () => {
           console.log('[WS] Connected');
           this.reconnectAttempt = 0;
+          this._connectionState$.next('connected');
         },
       },
       closeObserver: {
         next: () => {
           console.warn('[WS] Disconnected — scheduling reconnect');
+          this._connectionState$.next('disconnected');
           this.reconnect();
         },
       },
@@ -66,6 +74,7 @@ export class TradingWebSocketService implements OnDestroy {
   private reconnect(): void {
     if (this.reconnectAttempt >= MAX_RETRIES) {
       console.error('[WS] Max retries reached');
+      this._connectionState$.next('failed');
       return;
     }
     const delay = RECONNECT_BASE_MS * Math.pow(2, this.reconnectAttempt);

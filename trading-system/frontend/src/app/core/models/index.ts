@@ -80,6 +80,11 @@ export interface AgentStatus {
     daily_loss: number;
     drawdown_pct: number;
   };
+  config?: {
+    paper_trading: boolean;
+    max_trades_per_day: number;
+    max_open_positions: number;
+  };
 }
 
 export type LtpMap = Record<string, number>;
@@ -88,6 +93,11 @@ export interface HealthCheck {
   database: string;
   redis: string;
   kite_api: string;
+}
+
+export interface KiteAuthStatus {
+  authenticated: boolean;
+  message: string;
 }
 
 export interface WsEvent {

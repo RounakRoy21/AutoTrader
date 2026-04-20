@@ -18,3 +18,51 @@
   width: 260px;
   margin-bottom: 8px;
 }
+
+.expand-cell {
+  width: 48px;
+  padding: 0 4px;
+}
+
+.data-row {
+  cursor: pointer;
+  &.expanded-row { background: rgba(0, 0, 0, 0.04); }
+  &:hover { background: rgba(0, 0, 0, 0.02); }
+}
+
+.detail-row {
+  height: 0;
+  td { border-bottom: none; }
+}
+
+.detail-cell {
+  padding: 0 !important;
+  overflow: hidden;
+}
+
+.rationale-wrapper {
+  overflow: hidden;
+}
+
+.rationale-content {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px 24px;
+  background: #f9f9f9;
+  border-left: 4px solid #7986cb;
+
+  p {
+    margin: 0;
+    font-size: 0.875rem;
+    line-height: 1.6;
+    color: #424242;
+    white-space: pre-wrap;
+  }
+}
+
+.rationale-icon {
+  color: #7986cb;
+  flex-shrink: 0;
+  margin-top: 2px;
+}

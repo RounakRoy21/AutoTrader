@@ -1,9 +1,10 @@
 /**
  * DashboardComponent — landing page.
- * Shows live P&L ticker, agent status indicators, Market Brief summary, quick stats.
+ * Shows live P&L ticker, agent status indicators, Market Brief summary, quick stats,
+ * system health widget, VIX regime, and recommended stance.
  */
 
-import { Component, OnInit, OnDestroy } from '@angular/core';
+import { Component, OnInit, OnDestroy, ChangeDetectionStrategy, ChangeDetectorRef } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { Subject } from 'rxjs';
 import { takeUntil } from 'rxjs/operators';
@@ -14,14 +15,18 @@ import { MatIconModule } from '@angular/material/icon';
 import { MatButtonModule } from '@angular/material/button';
 import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
 import { MatProgressBarModule } from '@angular/material/progress-bar';
+import { MatDialogModule, MatDialog } from '@angular/material/dialog';
+import { MatTooltipModule } from '@angular/material/tooltip';
 
 import { StateService } from '../../core/services/state.service';
 import { ApiService } from '../../core/services/api.service';
-import { MarketBrief, Trade, AgentStatus } from '../../core/models';
+import { MarketBrief, Trade, AgentStatus, HealthCheck } from '../../core/models';
+import { ConfirmDialogComponent } from '../../shared/confirm-dialog/confirm-dialog.component';
 
 @Component({
   selector: 'app-dashboard',
   standalone: true,
+  changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     CommonModule,
     MatCardModule,
@@ -30,6 +35,8 @@ import { MarketBrief, Trade, AgentStatus } from '../../core/models';
     MatButtonModule,
     MatProgressSpinnerModule,
     MatProgressBarModule,
+    MatDialogModule,
+    MatTooltipModule,
   ],
   templateUrl: './dashboard.component.html',
   styleUrls: ['./dashboard.component.scss'],
@@ -44,30 +51,44 @@ export class DashboardComponent implements OnInit, OnDestroy {
     trading_agent: { status: 'INACTIVE', trading_halted: false, daily_trade_count: 0, last_signal_stock: null, last_signal_time: null },
     risk_manager: { status: 'INACTIVE', daily_loss: 0, drawdown_pct: 0 },
   };
+  health: HealthCheck | null = null;
   todayPnl = 0;
   todayTrades = 0;
+  unrealizedPnl = 0;
   winRate = 0;
   agentActionInProgress = false;
+  ltpMap: Record<string, number> = {};
 
   constructor(
     private state: StateService,
     private api: ApiService,
+    private dialog: MatDialog,
+    private cdr: ChangeDetectorRef,
   ) {}
 
   ngOnInit(): void {
     this.state.currentBrief$
       .pipe(takeUntil(this.destroy$))
-      .subscribe((b) => (this.brief = b));
+      .subscribe((b) => { this.brief = b; this.cdr.markForCheck(); });
 
     this.state.openPositions$
       .pipe(takeUntil(this.destroy$))
       .subscribe((pos) => {
         this.openPositions = pos;
+        this.cdr.markForCheck();
+      });
+
+    this.state.ltpMap$
+      .pipe(takeUntil(this.destroy$))
+      .subscribe((map) => {
+        this.ltpMap = map;
+        this.recalcUnrealized();
+        this.cdr.markForCheck();
       });
 
     this.state.agentStatus$
       .pipe(takeUntil(this.destroy$))
-      .subscribe((s) => (this.agentStatus = s));
+      .subscribe((s) => { this.agentStatus = s; this.cdr.markForCheck(); });
 
     this.state.dailyPnl$
       .pipe(takeUntil(this.destroy$))
@@ -79,11 +100,28 @@ export class DashboardComponent implements OnInit, OnDestroy {
           this.todayTrades = pnl[0].total_trades;
           this.todayPnl = pnl[0].realized_pnl;
         }
+        this.cdr.markForCheck();
       });
+
+    this.state.healthCheck$
+      .pipe(takeUntil(this.destroy$))
+      .subscribe((h) => { this.health = h; this.cdr.markForCheck(); });
+  }
+
+  private recalcUnrealized(): void {
+    this.unrealizedPnl = this.openPositions.reduce((sum, t) => {
+      const ltp = this.ltpMap[t.stock];
+      if (ltp == null) return sum;
+      return sum + (ltp - t.entry_price) * t.quantity;
+    }, 0);
   }
 
   halt(): void {
-    this.api.haltTrading().subscribe(() => this.state.refreshAll());
+    this.dialog.open(ConfirmDialogComponent, {
+      data: { title: 'Halt Trading', message: 'Stop all new trade entries until manually resumed?', confirmLabel: 'Halt', confirmColor: 'warn' },
+    }).afterClosed().subscribe((confirmed) => {
+      if (confirmed) this.api.haltTrading().subscribe(() => this.state.refreshAll());
+    });
   }
 
   resume(): void {
@@ -92,23 +130,24 @@ export class DashboardComponent implements OnInit, OnDestroy {
 
   startAgent(): void {
     this.agentActionInProgress = true;
+    this.cdr.markForCheck();
     this.api.startTradingAgent().subscribe({
-      next: () => {
-        this.agentActionInProgress = false;
-        this.state.refreshAll();
-      },
-      error: () => (this.agentActionInProgress = false),
+      next: () => { this.agentActionInProgress = false; this.state.refreshAll(); this.cdr.markForCheck(); },
+      error: () => { this.agentActionInProgress = false; this.cdr.markForCheck(); },
     });
   }
 
   stopAgent(): void {
-    this.agentActionInProgress = true;
-    this.api.stopTradingAgent().subscribe({
-      next: () => {
-        this.agentActionInProgress = false;
-        this.state.refreshAll();
-      },
-      error: () => (this.agentActionInProgress = false),
+    this.dialog.open(ConfirmDialogComponent, {
+      data: { title: 'Stop Trading Agent', message: 'Stop the trading agent? Open positions will NOT be closed automatically.', confirmLabel: 'Stop Agent', confirmColor: 'warn' },
+    }).afterClosed().subscribe((confirmed) => {
+      if (!confirmed) return;
+      this.agentActionInProgress = true;
+      this.cdr.markForCheck();
+      this.api.stopTradingAgent().subscribe({
+        next: () => { this.agentActionInProgress = false; this.state.refreshAll(); this.cdr.markForCheck(); },
+        error: () => { this.agentActionInProgress = false; this.cdr.markForCheck(); },
+      });
     });
   }
 
@@ -120,6 +159,51 @@ export class DashboardComponent implements OnInit, OnDestroy {
     if (this.drawdownPct >= 80) return 'warn';
     if (this.drawdownPct >= 50) return 'accent';
     return 'primary';
+  }
+
+  get totalPnl(): number {
+    return this.todayPnl + this.unrealizedPnl;
+  }
+
+  get maxTrades(): number {
+    return this.agentStatus.config?.max_trades_per_day ?? 6;
+  }
+
+  get maxPositions(): number {
+    return this.agentStatus.config?.max_open_positions ?? 3;
+  }
+
+  get vixValue(): number | null {
+    return (this.brief?.raw_json?.['india_vix'] as Record<string, number>)?.['value'] ?? null;
+  }
+
+  get vixRegime(): string {
+    return ((this.brief?.raw_json?.['india_vix'] as Record<string, string>)?.['regime'] ?? 'UNKNOWN');
+  }
+
+  get vixRegimeClass(): string {
+    switch (this.vixRegime) {
+      case 'STRESS': return 'regime-stress';
+      case 'ELEVATED': return 'regime-elevated';
+      case 'NORMAL': return 'regime-normal';
+      default: return '';
+    }
+  }
+
+  healthStatusClass(status: string | undefined): string {
+    if (!status) return 'health-unknown';
+    return status === 'healthy' || status === 'authenticated' ? 'health-ok' : 'health-bad';
+  }
+
+  healthIcon(status: string | undefined): string {
+    if (!status) return 'help';
+    return status === 'healthy' || status === 'authenticated' ? 'check_circle' : 'cancel';
+  }
+
+  get stanceLabel(): string {
+    const s = this.brief?.recommended_stance;
+    if (!s) return '';
+    return s.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
   }
 
   ngOnDestroy(): void {

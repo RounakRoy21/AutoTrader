@@ -14,8 +14,8 @@
         <span>Trading Agent: <strong>{{ agentStatus.trading_agent.status }}</strong></span>
       </div>
       <div class="status-row">
-        <span class="status-dot" [class.active]="agentStatus.risk_manager?.status === 'ACTIVE'"></span>
-        <span>Risk Manager: <strong>{{ agentStatus.risk_manager?.status ?? 'INACTIVE' }}</strong></span>
+        <span class="status-dot" [class.active]="agentStatus.risk_manager.status === 'ACTIVE'"></span>
+        <span>Risk Manager: <strong>{{ agentStatus.risk_manager.status }}</strong></span>
       </div>
 
       <div class="status-row halt-row" *ngIf="agentStatus.trading_agent.trading_halted">
@@ -72,11 +72,15 @@
       <mat-card-title>Today's P&L</mat-card-title>
     </mat-card-header>
     <mat-card-content>
-      <div class="pnl-value" [class.profit]="todayPnl >= 0" [class.loss]="todayPnl < 0">
-        ₹{{ todayPnl | number:'1.2-2' }}
+      <div class="pnl-value" [class.profit]="totalPnl >= 0" [class.loss]="totalPnl < 0">
+        ₹{{ totalPnl | number:'1.2-2' }}
+      </div>
+      <div class="pnl-breakdown">
+        <span>Realised: <span [class.profit]="todayPnl >= 0" [class.loss]="todayPnl < 0">₹{{ todayPnl | number:'1.0-0' }}</span></span>
+        <span>Unrealised: <span [class.profit]="unrealizedPnl >= 0" [class.loss]="unrealizedPnl < 0">₹{{ unrealizedPnl | number:'1.0-0' }}</span></span>
       </div>
       <div class="pnl-detail">
-        Open Positions: {{ openPositions.length }}
+        Open Positions: {{ openPositions.length }} / {{ maxPositions }}
       </div>
     </mat-card-content>
   </mat-card>
@@ -85,25 +89,44 @@
   <mat-card class="brief-card" *ngIf="brief">
     <mat-card-header>
       <mat-card-title>Market Brief</mat-card-title>
-      <mat-card-subtitle>Generated: {{ brief.generated_at | date:'shortTime' }}</mat-card-subtitle>
+      <mat-card-subtitle>{{ brief.generated_at | date:'HH:mm' }} — {{ brief.date | date:'d MMM y' }}</mat-card-subtitle>
     </mat-card-header>
     <mat-card-content>
-      <div class="bias-badge" [ngClass]="brief.market_bias.toLowerCase()">
-        {{ brief.market_bias }} ({{ brief.bias_confidence }}%)
+      <div class="brief-top-row">
+        <div class="bias-badge" [ngClass]="brief.market_bias.toLowerCase()">
+          {{ brief.market_bias }} ({{ brief.bias_confidence }}%)
+        </div>
+        <!-- VIX regime badge -->
+        <div *ngIf="vixValue !== null" class="vix-badge" [ngClass]="vixRegimeClass"
+             [matTooltip]="'India VIX: ' + (vixValue | number:'1.1-1')">
+          VIX {{ vixValue | number:'1.1-1' }}
+          <span class="vix-regime">{{ vixRegime }}</span>
+        </div>
       </div>
+
+      <!-- Recommended stance -->
+      <div *ngIf="brief.recommended_stance" class="stance-row">
+        <mat-icon class="stance-icon">policy</mat-icon>
+        <span class="stance-label">Stance:</span>
+        <span class="stance-value" [class.stance-avoid]="brief.recommended_stance === 'AVOID_TRADING'"
+                                    [class.stance-half]="brief.recommended_stance === 'HALF_SIZE_POSITIONS'">
+          {{ stanceLabel }}
+        </span>
+      </div>
+
       <div class="brief-signals">
         <div *ngIf="brief.fii_signal"><strong>FII/DII:</strong> {{ brief.fii_signal }}</div>
         <div *ngIf="brief.sgx_nifty_signal"><strong>SGX Nifty:</strong> {{ brief.sgx_nifty_signal }}</div>
         <div *ngIf="brief.dxy_signal"><strong>DXY:</strong> {{ brief.dxy_signal }}</div>
         <div *ngIf="brief.us_markets_signal"><strong>US Markets:</strong> {{ brief.us_markets_signal }}</div>
       </div>
-      <div class="watchlist" *ngIf="brief.watchlist?.length">
+      <div class="watchlist" *ngIf="brief.watchlist.length">
         <strong>Watchlist:</strong>
         <mat-chip-set>
           <mat-chip *ngFor="let s of brief.watchlist" highlighted>{{ s }}</mat-chip>
         </mat-chip-set>
       </div>
-      <div class="avoid-list" *ngIf="brief.avoid_list?.length">
+      <div class="avoid-list" *ngIf="brief.avoid_list.length">
         <strong>Avoid:</strong>
         <mat-chip-set>
           <mat-chip *ngFor="let s of brief.avoid_list" color="warn">{{ s }}</mat-chip>
@@ -119,13 +142,47 @@
     </mat-card-header>
     <mat-card-content>
       <div class="stat-item">
-        <span class="stat-label">Total Trades Today</span>
-        <span class="stat-value">{{ todayTrades }}</span>
+        <span class="stat-label">Trades Today</span>
+        <span class="stat-value" [class.loss]="agentStatus.trading_agent.daily_trade_count >= maxTrades">
+          {{ agentStatus.trading_agent.daily_trade_count }} / {{ maxTrades }}
+        </span>
       </div>
       <div class="stat-item">
         <span class="stat-label">Win Rate (30d)</span>
         <span class="stat-value">{{ winRate | number:'1.1-1' }}%</span>
       </div>
+    </mat-card-content>
+  </mat-card>
+
+  <!-- System Health -->
+  <mat-card class="health-card">
+    <mat-card-header>
+      <mat-card-title>System Health</mat-card-title>
+    </mat-card-header>
+    <mat-card-content>
+      <div *ngIf="health; else healthLoading">
+        <div class="health-row">
+          <mat-icon [ngClass]="healthStatusClass(health.database)">{{ healthIcon(health.database) }}</mat-icon>
+          <span>PostgreSQL</span>
+          <span class="health-label">{{ health.database }}</span>
+        </div>
+        <div class="health-row">
+          <mat-icon [ngClass]="healthStatusClass(health.redis)">{{ healthIcon(health.redis) }}</mat-icon>
+          <span>Redis</span>
+          <span class="health-label">{{ health.redis }}</span>
+        </div>
+        <div class="health-row">
+          <mat-icon [ngClass]="healthStatusClass(health.kite_api)">{{ healthIcon(health.kite_api) }}</mat-icon>
+          <span>Kite Connect</span>
+          <span class="health-label">{{ health.kite_api }}</span>
+        </div>
+      </div>
+      <ng-template #healthLoading>
+        <div class="health-loading">
+          <mat-spinner diameter="24"></mat-spinner>
+          <span>Checking...</span>
+        </div>
+      </ng-template>
     </mat-card-content>
   </mat-card>
 </div>

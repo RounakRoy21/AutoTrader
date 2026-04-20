@@ -27,4 +27,9 @@ export const routes: Routes = [
     loadComponent: () =>
       import('./features/system-alerts/system-alerts.component').then(m => m.SystemAlertsComponent),
   },
+  {
+    path: 'auth/kite',
+    loadComponent: () =>
+      import('./features/kite-auth/kite-auth-callback.component').then(m => m.KiteAuthCallbackComponent),
+  },
 ];

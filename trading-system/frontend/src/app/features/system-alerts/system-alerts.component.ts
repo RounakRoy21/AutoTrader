@@ -10,6 +10,8 @@ import {
   ViewChild,
   ElementRef,
   AfterViewChecked,
+  ChangeDetectionStrategy,
+  ChangeDetectorRef,
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { Subject } from 'rxjs';
@@ -19,6 +21,7 @@ import { MatCardModule } from '@angular/material/card';
 import { MatListModule } from '@angular/material/list';
 import { MatIconModule } from '@angular/material/icon';
 import { MatBadgeModule } from '@angular/material/badge';
+import { MatProgressBarModule } from '@angular/material/progress-bar';
 
 import { StateService } from '../../core/services/state.service';
 import { SystemAlert } from '../../core/models';
@@ -26,12 +29,14 @@ import { SystemAlert } from '../../core/models';
 @Component({
   selector: 'app-system-alerts',
   standalone: true,
+  changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     CommonModule,
     MatCardModule,
     MatListModule,
     MatIconModule,
     MatBadgeModule,
+    MatProgressBarModule,
   ],
   templateUrl: './system-alerts.component.html',
   styleUrls: ['./system-alerts.component.scss'],
@@ -43,15 +48,18 @@ export class SystemAlertsComponent implements OnInit, OnDestroy, AfterViewChecke
   private shouldScroll = false;
 
   alerts: SystemAlert[] = [];
+  loading = true;
 
-  constructor(private state: StateService) {}
+  constructor(private state: StateService, private cdr: ChangeDetectorRef) {}
 
   ngOnInit(): void {
     this.state.systemAlerts$
       .pipe(takeUntil(this.destroy$))
       .subscribe((a) => {
         this.alerts = a;
+        this.loading = false;
         this.shouldScroll = true;
+        this.cdr.markForCheck();
       });
   }
 

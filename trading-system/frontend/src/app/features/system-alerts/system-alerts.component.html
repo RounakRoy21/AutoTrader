@@ -3,6 +3,7 @@
     <mat-card-title>System Alerts</mat-card-title>
     <span class="alert-count" *ngIf="alerts.length">{{ alerts.length }}</span>
   </mat-card-header>
+  <mat-progress-bar *ngIf="loading" mode="query"></mat-progress-bar>
   <mat-card-content>
     <div class="alerts-scroll" #scrollContainer>
       <mat-list *ngIf="alerts.length; else empty">

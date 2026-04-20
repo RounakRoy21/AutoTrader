@@ -85,6 +85,7 @@ async def get_agent_status():
     except Exception:
         values = [None] * len(keys)
 
+    settings = get_settings()
     return _envelope(True, {
         "research_agent": {
             "status": values[0] or "INACTIVE",
@@ -104,6 +105,11 @@ async def get_agent_status():
             "status": values[10] or "INACTIVE",
             "daily_loss": float(values[11]) if values[11] else 0.0,
             "drawdown_pct": float(values[12]) if values[12] else 0.0,
+        },
+        "config": {
+            "paper_trading": settings.paper_trading,
+            "max_trades_per_day": settings.max_trades_per_day,
+            "max_open_positions": settings.max_open_positions,
         },
     })
 
