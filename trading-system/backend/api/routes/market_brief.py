@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import date
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy import select
@@ -15,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.research_agent import run_research_agent
 from core.database import get_db
+from core.nse_calendar import ist_today
 from core.redis_client import get_redis
 from core.redis_keys import LATEST_MARKET_BRIEF_KEY
 from models.market_brief import MarketBrief
@@ -68,8 +68,8 @@ async def trigger_research_agent(background_tasks: BackgroundTasks):
 
 @router.get("/today", response_model=MarketBriefResponse)
 async def get_today_brief(db: AsyncSession = Depends(get_db)):
-    """Return today's Market Brief.  If absent from DB, check Redis cache."""
-    today = date.today()
+    """Return today's Market Brief (IST date). If absent from DB, check Redis cache."""
+    today = ist_today()
     result = await db.execute(
         select(MarketBrief)
         .where(MarketBrief.date == today)

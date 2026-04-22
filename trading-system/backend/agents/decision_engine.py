@@ -18,6 +18,7 @@ import pytz
 from sqlalchemy import func, select
 
 from core.config import get_settings
+from core.nse_calendar import ist_today
 from core.database import get_db_context
 from core.redis_client import get_value, increment, publish, set_value
 from core.redis_keys import DAILY_TRADE_COUNT_KEY, HALT_KEY
@@ -179,7 +180,7 @@ class DecisionEngine:
         so it survives process restarts and Redis pub/sub misses.
         """
         try:
-            today = date.today()
+            today = ist_today()
             async with get_db_context() as session:
                 result = await session.execute(
                     select(func.count()).select_from(Trade).where(
@@ -329,7 +330,7 @@ class DecisionEngine:
                 dup_result = await session.execute(
                     select(func.count()).select_from(Trade).where(
                         Trade.stock == signal.stock,
-                        Trade.trade_date == date.today(),
+                        Trade.trade_date == ist_today(),
                         Trade.status.in_(["OPEN", "CLOSING"]),
                     )
                 )

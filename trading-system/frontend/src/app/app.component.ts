@@ -17,7 +17,7 @@ import { map, shareReplay } from 'rxjs/operators';
 
 import { StateService } from './core/services/state.service';
 import { TradingWebSocketService, WsConnectionState } from './core/services/trading-websocket.service';
-import { KiteAuthBannerComponent } from './shared/kite-auth-banner/kite-auth-banner.component';
+import { GrowwAuthBannerComponent } from './shared/kite-auth-banner/kite-auth-banner.component';
 
 @Component({
   selector: 'app-root',
@@ -34,7 +34,7 @@ import { KiteAuthBannerComponent } from './shared/kite-auth-banner/kite-auth-ban
     MatButtonModule,
     MatTooltipModule,
     MatProgressBarModule,
-    KiteAuthBannerComponent
+    GrowwAuthBannerComponent
 ],
   templateUrl: './app.component.html',
   styleUrls: ['./app.component.scss'],
@@ -44,7 +44,7 @@ export class AppComponent implements OnInit, OnDestroy {
   private destroy$ = new Subject<void>();
 
   wsState: WsConnectionState = 'connecting';
-  kiteAuthenticated = true;
+  growwAuthenticated = true;
   paperTrading = false;
   routeLoading = false;
   isHandset = false;
@@ -72,9 +72,9 @@ export class AppComponent implements OnInit, OnDestroy {
       .pipe(takeUntil(this.destroy$))
       .subscribe((s) => (this.wsState = s));
 
-    this.state.kiteAuthenticated$
+    this.state.growwAuthenticated$
       .pipe(takeUntil(this.destroy$))
-      .subscribe((v) => (this.kiteAuthenticated = v));
+      .subscribe((v) => (this.growwAuthenticated = v));
 
     this.state.paperTrading$
       .pipe(takeUntil(this.destroy$))

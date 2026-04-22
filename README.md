@@ -221,9 +221,9 @@ Open `.env` and fill in the required values:
 
 | Variable | Where to get it |
 |---|---|
-| `GROWW_CLIENT_ID` | Groww account → Settings → API Access |
-| `GROWW_PASSWORD` | Your Groww login password |
-| `GROWW_TOTP_SECRET` | Base32 TOTP secret shown once during Groww 2FA setup |
+| `GROWW_CLIENT_ID` | [groww.in/trade-api/api-keys](https://groww.in/trade-api/api-keys) → Generate TOTP token |
+| `GROWW_PASSWORD` | Not used in TOTP flow — leave blank |
+| `GROWW_TOTP_SECRET` | Base32 secret shown alongside the TOTP token on the same page |
 | `ANTHROPIC_API_KEY` | [console.anthropic.com](https://console.anthropic.com) |
 | `TELEGRAM_BOT_TOKEN` | Create a bot via [@BotFather](https://t.me/BotFather) |
 | `TELEGRAM_CHAT_ID` | Message [@userinfobot](https://t.me/userinfobot) to find yours |

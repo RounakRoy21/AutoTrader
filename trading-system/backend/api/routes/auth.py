@@ -31,9 +31,9 @@ router = APIRouter(prefix="/api/auth", tags=["Auth"])
 
 class LoginRequest(BaseModel):
     """Body for POST /api/auth/groww/login."""
-    client_id: str
-    password: str
-    totp: Optional[str] = None  # 6-digit TOTP; auto-generated if GROWW_TOTP_SECRET is set
+    client_id: Optional[str] = None  # falls back to GROWW_CLIENT_ID in .env
+    password: Optional[str] = None   # falls back to GROWW_PASSWORD in .env
+    totp: Optional[str] = None        # 6-digit TOTP; auto-generated if GROWW_TOTP_SECRET is set
 
 
 @router.get("/groww/status")
@@ -66,6 +66,17 @@ async def groww_login(body: LoginRequest):
     """
     settings = get_settings()
 
+    # Resolve credentials — body field overrides .env value.
+    # client_id here is the TOTP *API token* from Groww Cloud API Keys page
+    # (click "Generate TOTP token") — NOT a login email or password.
+    client_id = body.client_id or settings.groww_client_id
+    if not client_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Groww API key required — set GROWW_CLIENT_ID in .env "
+                   "(the TOTP token from groww.in/trade-api/api-keys → Generate TOTP token).",
+        )
+
     # Resolve TOTP
     totp_code = body.totp
     if not totp_code:
@@ -84,14 +95,9 @@ async def groww_login(body: LoginRequest):
     try:
         from growwapi import GrowwAPI
 
-        def _do_login():
-            gc = GrowwAPI()
-            gc.login(
-                client_id=body.client_id or settings.groww_client_id,
-                password=body.password or settings.groww_password,
-                totp=totp_code,
-            )
-            return gc.access_token
+        def _do_login() -> str:
+            # Static method: POSTs to /token/api/access, returns token string.
+            return GrowwAPI.get_access_token(api_key=client_id, totp=totp_code)
 
         access_token = await asyncio.to_thread(_do_login)
         if not access_token:

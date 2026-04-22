@@ -92,10 +92,10 @@ export type LtpMap = Record<string, number>;
 export interface HealthCheck {
   database: string;
   redis: string;
-  kite_api: string;
+  groww_api: string;
 }
 
-export interface KiteAuthStatus {
+export interface GrowwAuthStatus {
   authenticated: boolean;
   message: string;
 }

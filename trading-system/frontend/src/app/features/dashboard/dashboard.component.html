@@ -86,13 +86,32 @@
   </mat-card>
 
   <!-- Market Brief Summary -->
-  <mat-card class="brief-card" *ngIf="brief">
+  <mat-card class="brief-card">
     <mat-card-header>
       <mat-card-title>Market Brief</mat-card-title>
-      <mat-card-subtitle>{{ brief.generated_at | date:'HH:mm' }} — {{ brief.date | date:'d MMM y' }}</mat-card-subtitle>
+      <mat-card-subtitle *ngIf="brief">{{ brief.generated_at.slice(0, 5) }} &mdash; {{ brief.date | date:'d MMM y' }}</mat-card-subtitle>
+      <span class="brief-header-spacer"></span>
+      <button mat-icon-button
+              [matTooltip]="brief ? 'Refresh market brief' : 'Generate market brief'"
+              (click)="runBrief()"
+              [disabled]="briefRunInProgress">
+        <mat-icon *ngIf="!briefRunInProgress">refresh</mat-icon>
+        <mat-spinner *ngIf="briefRunInProgress" diameter="20"></mat-spinner>
+      </button>
     </mat-card-header>
     <mat-card-content>
-      <div class="brief-top-row">
+      <!-- Empty state -->
+      <div class="brief-empty" *ngIf="!brief">
+        <mat-icon>wb_sunny</mat-icon>
+        <p>No market brief for today.</p>
+        <button mat-stroked-button color="primary"
+                (click)="runBrief()"
+                [disabled]="briefRunInProgress">
+          <mat-spinner *ngIf="briefRunInProgress" diameter="16" style="display:inline-block;margin-right:6px"></mat-spinner>
+          {{ briefRunInProgress ? 'Generating...' : 'Run Research Agent' }}
+        </button>
+      </div>
+      <div class="brief-top-row" *ngIf="brief">
         <div class="bias-badge" [ngClass]="brief.market_bias.toLowerCase()">
           {{ brief.market_bias }} ({{ brief.bias_confidence }}%)
         </div>
@@ -105,31 +124,31 @@
       </div>
 
       <!-- Recommended stance -->
-      <div *ngIf="brief.recommended_stance" class="stance-row">
+      <div *ngIf="brief?.recommended_stance" class="stance-row">
         <mat-icon class="stance-icon">policy</mat-icon>
         <span class="stance-label">Stance:</span>
-        <span class="stance-value" [class.stance-avoid]="brief.recommended_stance === 'AVOID_TRADING'"
-                                    [class.stance-half]="brief.recommended_stance === 'HALF_SIZE_POSITIONS'">
+        <span class="stance-value" [class.stance-avoid]="brief?.recommended_stance === 'AVOID_TRADING'"
+                                    [class.stance-half]="brief?.recommended_stance === 'HALF_SIZE_POSITIONS'">
           {{ stanceLabel }}
         </span>
       </div>
 
-      <div class="brief-signals">
+      <div class="brief-signals" *ngIf="brief">
         <div *ngIf="brief.fii_signal"><strong>FII/DII:</strong> {{ brief.fii_signal }}</div>
         <div *ngIf="brief.sgx_nifty_signal"><strong>SGX Nifty:</strong> {{ brief.sgx_nifty_signal }}</div>
         <div *ngIf="brief.dxy_signal"><strong>DXY:</strong> {{ brief.dxy_signal }}</div>
         <div *ngIf="brief.us_markets_signal"><strong>US Markets:</strong> {{ brief.us_markets_signal }}</div>
       </div>
-      <div class="watchlist" *ngIf="brief.watchlist.length">
+      <div class="watchlist" *ngIf="brief?.watchlist?.length">
         <strong>Watchlist:</strong>
         <mat-chip-set>
-          <mat-chip *ngFor="let s of brief.watchlist" highlighted>{{ s }}</mat-chip>
+          <mat-chip *ngFor="let s of brief!.watchlist" highlighted>{{ s }}</mat-chip>
         </mat-chip-set>
       </div>
-      <div class="avoid-list" *ngIf="brief.avoid_list.length">
+      <div class="avoid-list" *ngIf="brief?.avoid_list?.length">
         <strong>Avoid:</strong>
         <mat-chip-set>
-          <mat-chip *ngFor="let s of brief.avoid_list" color="warn">{{ s }}</mat-chip>
+          <mat-chip *ngFor="let s of brief!.avoid_list" color="warn">{{ s }}</mat-chip>
         </mat-chip-set>
       </div>
     </mat-card-content>
@@ -172,9 +191,9 @@
           <span class="health-label">{{ health.redis }}</span>
         </div>
         <div class="health-row">
-          <mat-icon [ngClass]="healthStatusClass(health.kite_api)">{{ healthIcon(health.kite_api) }}</mat-icon>
-          <span>Kite Connect</span>
-          <span class="health-label">{{ health.kite_api }}</span>
+          <mat-icon [ngClass]="healthStatusClass(health.groww_api)">{{ healthIcon(health.groww_api) }}</mat-icon>
+          <span>Groww API</span>
+          <span class="health-label">{{ health.groww_api }}</span>
         </div>
       </div>
       <ng-template #healthLoading>

@@ -6,7 +6,7 @@
 
 import { Component, OnInit, OnDestroy, ChangeDetectionStrategy, ChangeDetectorRef } from '@angular/core';
 import { CommonModule } from '@angular/common';
-import { Subject } from 'rxjs';
+import { Subject, interval } from 'rxjs';
 import { takeUntil } from 'rxjs/operators';
 
 import { MatCardModule } from '@angular/material/card';
@@ -17,6 +17,7 @@ import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
 import { MatProgressBarModule } from '@angular/material/progress-bar';
 import { MatDialogModule, MatDialog } from '@angular/material/dialog';
 import { MatTooltipModule } from '@angular/material/tooltip';
+import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
 
 import { StateService } from '../../core/services/state.service';
 import { ApiService } from '../../core/services/api.service';
@@ -37,6 +38,7 @@ import { ConfirmDialogComponent } from '../../shared/confirm-dialog/confirm-dial
     MatProgressBarModule,
     MatDialogModule,
     MatTooltipModule,
+    MatSnackBarModule,
   ],
   templateUrl: './dashboard.component.html',
   styleUrls: ['./dashboard.component.scss'],
@@ -57,12 +59,14 @@ export class DashboardComponent implements OnInit, OnDestroy {
   unrealizedPnl = 0;
   winRate = 0;
   agentActionInProgress = false;
+  briefRunInProgress = false;
   ltpMap: Record<string, number> = {};
 
   constructor(
     private state: StateService,
     private api: ApiService,
     private dialog: MatDialog,
+    private snackBar: MatSnackBar,
     private cdr: ChangeDetectorRef,
   ) {}
 
@@ -204,6 +208,51 @@ export class DashboardComponent implements OnInit, OnDestroy {
     const s = this.brief?.recommended_stance;
     if (!s) return '';
     return s.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+  }
+
+  runBrief(): void {
+    this.briefRunInProgress = true;
+    this.cdr.markForCheck();
+    this.api.runMarketBrief().subscribe({
+      next: () => this.pollForBrief(),
+      error: (err) => {
+        this.briefRunInProgress = false;
+        const msg = err?.error?.detail ?? 'Failed to trigger Research Agent';
+        this.snackBar.open(msg, 'Dismiss', { duration: 6000 });
+        this.cdr.markForCheck();
+      },
+    });
+  }
+
+  private pollForBrief(): void {
+    const maxAttempts = 30; // 30 × 3s = 90s
+    let attempts = 0;
+    const poll = interval(3000)
+      .pipe(takeUntil(this.destroy$))
+      .subscribe(() => {
+        attempts++;
+        this.api.getTodayBrief().subscribe({
+          next: () => {
+            poll.unsubscribe();
+            this.briefRunInProgress = false;
+            this.snackBar.open('Market Brief generated', 'Dismiss', { duration: 4000 });
+            this.state.refreshAll();
+            this.cdr.markForCheck();
+          },
+          error: () => {
+            if (attempts >= maxAttempts) {
+              poll.unsubscribe();
+              this.briefRunInProgress = false;
+              this.snackBar.open(
+                'Research Agent is taking longer than expected — refresh manually.',
+                'Dismiss',
+                { duration: 6000 },
+              );
+              this.cdr.markForCheck();
+            }
+          },
+        });
+      });
   }
 
   ngOnDestroy(): void {

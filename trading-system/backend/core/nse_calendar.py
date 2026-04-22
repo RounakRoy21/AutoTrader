@@ -13,7 +13,20 @@ Update this file each December with the official holiday list for the next year.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
+
+_IST = ZoneInfo("Asia/Kolkata")
+
+
+def ist_today() -> date:
+    """Return the current date in IST (UTC+5:30).
+
+    All trading logic must use this instead of ``date.today()`` because the
+    Docker container runs in UTC.  At 18:30 UTC (00:00 IST the next day) the
+    UTC date would already be tomorrow while Indian markets have not yet opened.
+    """
+    return datetime.now(tz=_IST).date()
 
 # ── NSE Equity Market Holidays 2025 ───────────────────────────────────────────
 # Source: NSE circular NSCCL/ITP/F&O/2024-25/0166
@@ -53,6 +66,6 @@ def is_nse_holiday(d: date | None = None) -> bool:
     holidays that fall on weekdays.
     """
     if d is None:
-        d = date.today()
+        d = ist_today()
     year_holidays = _CALENDAR.get(d.year, frozenset())
     return d in year_holidays

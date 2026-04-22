@@ -4,8 +4,8 @@
   class="route-progress">
 </mat-progress-bar>
 
-<!-- Kite auth warning banner -->
-<app-kite-auth-banner *ngIf="!kiteAuthenticated"></app-kite-auth-banner>
+<!-- Groww auth warning banner -->
+<app-groww-auth-banner *ngIf="!growwAuthenticated"></app-groww-auth-banner>
 
 <!-- WS permanently dead banner -->
 <div class="ws-dead-banner" *ngIf="wsState === 'failed'">

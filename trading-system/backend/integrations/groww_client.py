@@ -40,6 +40,7 @@ from typing import Any, Callable, Dict, List, Optional
 from growwapi import GrowwAPI
 
 from core.config import get_settings
+from core.nse_calendar import ist_today
 from core.redis_client import get_value, set_value
 from core.redis_keys import HALT_KEY, GROWW_TOKEN_KEY
 
@@ -473,7 +474,7 @@ class GrowwClient:
         groww_interval = interval_map.get(interval, interval)
 
         groww = await self.get_groww()
-        to_date = date.today()
+        to_date = ist_today()
         from_date = to_date - timedelta(days=days_back)
 
         @_retry_sync

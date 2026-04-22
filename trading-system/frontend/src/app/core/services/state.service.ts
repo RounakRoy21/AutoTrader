@@ -19,7 +19,6 @@ import {
   SystemAlert,
   LtpMap,
   HealthCheck,
-  KiteAuthStatus,
 } from '../models';
 
 @Injectable({ providedIn: 'root' })
@@ -40,7 +39,7 @@ export class StateService implements OnDestroy {
   private _systemAlerts$ = new BehaviorSubject<SystemAlert[]>([]);
   private _ltpMap$ = new BehaviorSubject<LtpMap>({});
   private _healthCheck$ = new BehaviorSubject<HealthCheck | null>(null);
-  private _kiteAuthenticated$ = new BehaviorSubject<boolean>(true);
+  private _growwAuthenticated$ = new BehaviorSubject<boolean>(true);
   private _paperTrading$ = new BehaviorSubject<boolean>(false);
 
   // ── Public observables ────────────────────
@@ -51,7 +50,7 @@ export class StateService implements OnDestroy {
   readonly systemAlerts$ = this._systemAlerts$.asObservable();
   readonly ltpMap$ = this._ltpMap$.asObservable();
   readonly healthCheck$ = this._healthCheck$.asObservable();
-  readonly kiteAuthenticated$ = this._kiteAuthenticated$.asObservable();
+  readonly growwAuthenticated$ = this._growwAuthenticated$.asObservable();
   readonly paperTrading$ = this._paperTrading$.asObservable();
 
   constructor(
@@ -85,7 +84,7 @@ export class StateService implements OnDestroy {
           .subscribe(() => this.refreshAll());
       });
 
-    // Poll health + kite auth every 30 seconds (independent of WS)
+    // Poll health + groww auth every 30 seconds (independent of WS)
     this.refreshHealth();
     interval(30_000)
       .pipe(takeUntil(this.destroy$))
@@ -164,14 +163,14 @@ export class StateService implements OnDestroy {
       });
   }
 
-  /** Refresh health check and Kite auth status. */
+  /** Refresh health check and Groww auth status. */
   refreshHealth(): void {
     this.api
       .healthCheck()
       .pipe(catchError(() => EMPTY))
       .subscribe((h) => {
         this._healthCheck$.next(h);
-        this._kiteAuthenticated$.next(h.kite_api === 'authenticated');
+        this._growwAuthenticated$.next(h.groww_api === 'authenticated');
       });
   }
 

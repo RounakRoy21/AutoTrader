@@ -18,6 +18,8 @@ from typing import Dict, List, Optional
 import pytz
 from sqlalchemy import select, update
 
+from core.nse_calendar import ist_today
+
 from core.config import get_settings
 from core.database import get_db_context
 from core.redis_client import get_value, publish, set_value
@@ -493,7 +495,7 @@ class RiskManager:
         if halt == "TRUE":
             return  # already halted
 
-        today = date.today()
+        today = ist_today()
 
         # ── Realised losses from closed trades ──
         async with get_db_context() as session:
@@ -562,7 +564,7 @@ class RiskManager:
         Reconciles orphaned CLOSING trades before computing the report.
         """
         self._eod_reported_today = True
-        today = date.today()
+        today = ist_today()
 
         # ── Reconcile orphaned CLOSING trades ─────────────────────
         # If a process crash left trades in CLOSING state, they'll never

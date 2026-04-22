@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import date
 from typing import Optional
+
+from core.nse_calendar import ist_today
 
 from sqlalchemy import func, select
 
@@ -143,7 +144,7 @@ class TradingAgentManager:
         trading day and must not carry over into the next session.
         """
         try:
-            today = date.today()
+            today = ist_today()
             async with get_db_context() as session:
                 result = await session.execute(
                     select(func.count()).select_from(Trade).where(

@@ -13,7 +13,7 @@ import {
   DailyPnl,
   AgentStatus,
   HealthCheck,
-  KiteAuthStatus,
+  GrowwAuthStatus,
   LtpMap,
 } from '../models';
 
@@ -27,6 +27,10 @@ export class ApiService {
 
   getTodayBrief(): Observable<MarketBrief> {
     return this.http.get<MarketBrief>(`${this.baseUrl}/market-brief/today`);
+  }
+
+  runMarketBrief(): Observable<ApiResponse<{ message: string }>> {
+    return this.http.post<ApiResponse<{ message: string }>>(`${this.baseUrl}/market-brief/run`, {});
   }
 
   // ── Trades ────────────────────────────────────
@@ -96,17 +100,18 @@ export class ApiService {
       .pipe(map((r) => r.data));
   }
 
-  // ── Kite Auth ─────────────────────────────────
+  // ── Groww Auth ────────────────────────────────
 
-  getKiteAuthStatus(): Observable<KiteAuthStatus> {
+  getGrowwAuthStatus(): Observable<GrowwAuthStatus> {
     return this.http
-      .get<ApiResponse<KiteAuthStatus>>(`${this.baseUrl}/auth/kite/status`)
+      .get<ApiResponse<GrowwAuthStatus>>(`${this.baseUrl}/auth/groww/status`)
       .pipe(map((r) => r.data));
   }
 
-  getKiteLoginUrl(): Observable<{ login_url: string }> {
+  growwLogin(): Observable<GrowwAuthStatus> {
+    // Credentials are read from env vars on the backend; body can be empty.
     return this.http
-      .get<ApiResponse<{ login_url: string }>>(`${this.baseUrl}/auth/kite/login-url`)
+      .post<ApiResponse<GrowwAuthStatus>>(`${this.baseUrl}/auth/groww/login`, {})
       .pipe(map((r) => r.data));
   }
 }
