@@ -24,7 +24,6 @@ import { KiteAuthBannerComponent } from './shared/kite-auth-banner/kite-auth-ban
   standalone: true,
   imports: [
     CommonModule,
-    AsyncPipe,
     RouterOutlet,
     RouterLink,
     RouterLinkActive,
@@ -35,8 +34,8 @@ import { KiteAuthBannerComponent } from './shared/kite-auth-banner/kite-auth-ban
     MatButtonModule,
     MatTooltipModule,
     MatProgressBarModule,
-    KiteAuthBannerComponent,
-  ],
+    KiteAuthBannerComponent
+],
   templateUrl: './app.component.html',
   styleUrls: ['./app.component.scss'],
 })

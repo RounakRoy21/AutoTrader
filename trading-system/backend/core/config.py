@@ -42,10 +42,10 @@ class Settings(BaseSettings):
     redis_password: str = ""
     redis_url: str = "redis://redis:6379/0"
 
-    # ── Zerodha Kite Connect ──────────────────────
-    kite_api_key: str = ""
-    kite_api_secret: str = ""
-    kite_redirect_url: str = "http://localhost:8000/api/auth/kite/callback"
+    # ── Groww API ─────────────────────────────────
+    groww_client_id: str = ""
+    groww_password: str = ""
+    groww_totp_secret: str = ""  # Base32 TOTP secret for pyotp
 
     # ── Anthropic (Claude) ────────────────────────
     anthropic_api_key: str = ""

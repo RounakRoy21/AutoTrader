@@ -16,7 +16,7 @@ from core.database import check_db_health
 from core.redis_client import check_redis_health, get_redis, get_value, set_value
 from core.redis_keys import (
     HALT_KEY,
-    KITE_TOKEN_KEY,
+    GROWW_TOKEN_KEY,
     RESEARCH_STATUS_KEY,
     TRADING_STATUS_KEY,
     RESEARCH_STEP_KEY,
@@ -152,13 +152,13 @@ async def manual_stop_trading():
 
 @router.get("/api/health")
 async def health_check():
-    """System health check: database, Redis, and Kite API reachability."""
+    """System health check: database, Redis, and Groww API reachability."""
     db_ok = await check_db_health()
     redis_ok = await check_redis_health()
 
-    # Kite health: just check if we have a valid token in Redis
-    kite_token = await get_value(KITE_TOKEN_KEY)
-    kite_ok = kite_token is not None and len(kite_token) > 0
+    # Groww health: check if we have a valid session token in Redis
+    groww_token = await get_value(GROWW_TOKEN_KEY)
+    groww_ok = groww_token is not None and len(groww_token) > 0
 
     all_ok = db_ok and redis_ok
     return _envelope(
@@ -166,6 +166,6 @@ async def health_check():
         data={
             "database": "healthy" if db_ok else "unhealthy",
             "redis": "healthy" if redis_ok else "unhealthy",
-            "kite_api": "authenticated" if kite_ok else "no_token",
+            "groww_api": "authenticated" if groww_ok else "no_token",
         },
     )

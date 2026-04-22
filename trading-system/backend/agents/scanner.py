@@ -1,10 +1,14 @@
 """
 Scanner module — Real-time tick processing and signal generation.
 
-Subscribes to live tick data via Kite Connect WebSocket (KiteTicker).
+Subscribes to live tick data via GrowwFeed WebSocket.
 Maintains a rolling in-memory OHLCV dataframe per stock using pandas.
 Recalculates VWAP, RSI(14), and Volume Ratio on every new tick.
 Fires a signal when all three entry conditions are met simultaneously.
+
+GrowwFeed delivers only LTP + timestamp per tick (no volume_traded or OHLC fields).
+Volume and OHLC data are supplemented via a periodic REST polling thread that calls
+get_ohlc() every ~60 seconds and updates _ohlc_cache[symbol].
 """
 
 from __future__ import annotations
@@ -20,7 +24,7 @@ import pandas as pd
 import pytz
 
 from core.config import get_settings
-from integrations.kite_client import get_kite_client
+from integrations.groww_client import get_groww_client
 from integrations.instrument_service import get_instrument_map, get_symbol, NIFTY50_TOKEN
 from integrations.ltp_store import set_ltp
 from integrations.mock_tick_generator import MockTickGenerator
@@ -29,6 +33,14 @@ from schemas.trade import ScannerSignal
 logger = logging.getLogger(__name__)
 
 IST = pytz.timezone("Asia/Kolkata")
+
+# ── GrowwFeed OHLCV supplement cache ─────────────────────────────────────────
+# GrowwFeed delivers only {ltp, tsInMillis} per tick.
+# A background polling thread (started in scanner.start()) populates this dict
+# every ~60 seconds via groww_client.get_ltp() / get_quote().
+# Keys = trading symbol (e.g. "RELIANCE"); values = {"open", "high", "low",
+# "close", "volume"} from the latest REST snapshot.
+_ohlc_cache: Dict[str, Dict[str, Any]] = {}
 
 
 class CandleBuilder:
@@ -94,11 +106,11 @@ class TickDataStore:
     Key design decisions (production hardening):
     - Tick list is capped at MAX_TICKS to prevent memory leaks over a full
       trading session (~450K raw ticks/day for 20 symbols).
-    - RSI is computed on ``last_price`` (NOT ``ohlc.close``), because in live
-      Kite tick data ``ohlc.close`` is the *previous day's* close — a static
-      value that would produce a meaningless RSI.
-    - VWAP computes per-tick volume deltas from Kite's *cumulative*
-      ``volume_traded`` field, ensuring correct typical-price weighting.
+    - RSI is computed on ``last_price``.
+    - VWAP uses volume from the REST OHLCV poll cache (_ohlc_cache) since
+      GrowwFeed does not deliver volume_traded per tick.
+    - ``_open_price`` / ``_prev_close`` are seeded from the REST OHLC poll at
+      session start (GrowwFeed ticks have no ohlc field).
     """
 
     MAX_TICKS = 1_000  # keep last N ticks (≈ 16 min @ 1 tick/sec)
@@ -117,27 +129,39 @@ class TickDataStore:
 
     def add_tick(self, tick: Dict[str, Any]) -> None:
         """Append a tick (capped at MAX_TICKS) and mark the dataframe stale."""
-        cum_vol = tick.get("volume_traded", 0)
-        # Kite's volume_traded is cumulative for the day.
-        # First tick: record as baseline only (delta=0).  On a mid-day restart
-        # cum_vol could be 500K+; treating it as a delta would inject a false
-        # volume spike into the first candle and skew indicators.
+        # GrowwFeed delivers {ltp, tsInMillis}. Volume comes from the REST poll cache.
+        symbol = tick.get("tradingsymbol", self.symbol)
+        # _ohlc_cache is a module-level dict in this same file; no import needed
+        cached_ohlc = _ohlc_cache.get(symbol, {})
+        # GrowwFeed: volume comes from REST poll cache. Fallback to tick["volume_traded"]
+        # for mock ticks and tests that don't populate the cache.
+        cum_vol = cached_ohlc.get("volume") or tick.get("volume_traded", 0)
+        # Volume delta: treat as 0 on first tick to avoid false spikes on mid-day restart.
         if self._prev_cum_volume == 0:
             vol_delta = 0
         else:
             vol_delta = max(0, cum_vol - self._prev_cum_volume)
         self._prev_cum_volume = cum_vol
 
-        ts = tick.get("exchange_timestamp") or datetime.now(IST)
-        price = tick.get("last_price", 0.0)
+        # GrowwFeed uses tsInMillis; fall back to exchange_timestamp (mock/test)
+        # or now() if neither is present.
+        ts_ms = tick.get("tsInMillis")
+        if ts_ms:
+            ts = datetime.fromtimestamp(ts_ms / 1000, tz=IST)
+        else:
+            ts_raw = tick.get("exchange_timestamp")
+            if ts_raw is not None:
+                ts = ts_raw if ts_raw.tzinfo else IST.localize(ts_raw)
+            else:
+                ts = datetime.now(IST)
+        price = tick.get("ltp") or tick.get("last_price", 0.0)
 
-        # SH2: Capture today's open and previous day's close from the very first
-        # tick of the session. Kite's ohlc.open = today's day open; ohlc.close =
-        # previous day's close (a static field that never changes intraday).
-        ohlc = tick.get("ohlc", {})
+        # SH2: Seed open/prev_close from the REST OHLC poll cache on first tick,
+        # or from tick["ohlc"] (mock/test format).
+        tick_ohlc = tick.get("ohlc", {})
         if self._open_price == 0.0:
-            open_price = float(ohlc.get("open", 0.0))
-            prev_close = float(ohlc.get("close", 0.0))
+            open_price = float(cached_ohlc.get("open") or tick_ohlc.get("open", 0.0))
+            prev_close = float(cached_ohlc.get("close") or tick_ohlc.get("close", 0.0))
             if open_price > 0:
                 self._open_price = open_price
             if prev_close > 0:
@@ -148,10 +172,10 @@ class TickDataStore:
             "last_price": price,
             "volume_delta": vol_delta,
             "cum_volume": cum_vol,
-            "high": ohlc.get("high", 0.0),
-            "low": ohlc.get("low", 0.0),
-            "open": ohlc.get("open", 0.0),
-            "close": ohlc.get("close", 0.0),
+            "high": cached_ohlc.get("high") or tick_ohlc.get("high", 0.0),
+            "low": cached_ohlc.get("low") or tick_ohlc.get("low", 0.0),
+            "open": cached_ohlc.get("open") or tick_ohlc.get("open", 0.0),
+            "close": cached_ohlc.get("close") or tick_ohlc.get("close", 0.0),
         })
         # SH1: Mark df stale instead of rebuilding on every tick.
         # pd.DataFrame(deque) is O(N); rebuilding eagerly 20–40×/sec on the
@@ -175,10 +199,9 @@ class TickDataStore:
     def compute_vwap(self) -> float:
         """Calculate intraday VWAP using per-tick volume deltas.
 
-        Uses last_price directly — NOT ``(high + low + close) / 3`` — because
-        Kite's ``ohlc.high`` / ``ohlc.low`` are cumulative *day* extremes that
-        grow monotonically.  Using them as a per-tick typical price would
-        progressively skew the VWAP upward throughout the session.
+        Uses last_price directly. Volume comes from the REST OHLCV poll cache
+        (GrowwFeed does not deliver volume_traded). Volume deltas are computed
+        from the cached cumulative volume between REST poll intervals.
         """
         if self._df is None or self._df.empty:
             return 0.0
@@ -191,7 +214,7 @@ class TickDataStore:
         return float(last_val) if not np.isnan(last_val) else 0.0
 
     def compute_rsi(self, period: int = 14) -> float:
-        """Calculate RSI(14) using Wilder's smoothing on last_price (NOT ohlc.close)."""
+        """Calculate RSI(14) using Wilder's smoothing on last_price."""
         if self._df is None or len(self._df) < period + 1:
             return 50.0  # neutral default until we have enough ticks
         price = self._df["last_price"]
@@ -361,7 +384,7 @@ class Scanner:
 
         # A1: Hard capital cap — each position must fit within its capital envelope.
         # Without this, the risk formula produces notional values far exceeding
-        # available capital, resulting in Kite margin rejections and silent order loss.
+        # available capital, resulting in Groww margin rejections and silent order loss.
         if ltp > 0 and settings.max_open_positions > 0:
             max_notional_per_position = settings.total_capital / settings.max_open_positions
             qty_from_capital = max(1, int(max_notional_per_position / ltp))
@@ -448,6 +471,7 @@ class Scanner:
 
         # Condition 1: Price > VWAP
         if ltp <= vwap:
+            return None
         # Condition 2: RSI between 45 and 65 (scanner pre-filter; see docstring)
         if not (45 <= rsi <= 65):
             return None
@@ -512,24 +536,22 @@ class Scanner:
         return signal
 
     def _on_ticks(self, ws, ticks: List[Dict[str, Any]]) -> None:
-        """Callback invoked by KiteTicker or MockTickGenerator on each tick batch."""
+        """Callback invoked by GrowwFeed or MockTickGenerator on each tick batch."""
         for tick in ticks:
-            token = tick.get("instrument_token")
+            token = tick.get("instrument_token") or tick.get("exchange_token")
 
             # A2: Intercept NIFTY 50 index ticks to maintain the macro trend state.
-            # The index is subscribed in _on_connect() but has no TickDataStore —
-            # we only need its open and LTP, not a full OHLCV history.
+            # The index is subscribed in _on_connect() but has no TickDataStore.
             if token == NIFTY50_TOKEN:
-                price = tick.get("last_price", 0.0)
+                price = tick.get("ltp") or tick.get("last_price", 0.0)
                 if price > 0:
                     self._nifty_ltp = price
-                    # Capture session open on the very first tick of the day.
-                    ohlc = tick.get("ohlc", {})
-                    open_price = float(ohlc.get("open", 0.0))
-                    if self._nifty_open_price == 0.0 and open_price > 0:
-                        self._nifty_open_price = open_price
+                    # Seed open price from the REST OHLC poll cache (GrowwFeed has no ohlc field)
+                    cached = _ohlc_cache.get("NIFTY 50", {})
+                    if self._nifty_open_price == 0.0 and cached.get("open", 0.0) > 0:
+                        self._nifty_open_price = float(cached["open"])
                         logger.info(
-                            "[Scanner] NIFTY 50 open price captured: ₹%.2f", open_price
+                            "[Scanner] NIFTY 50 open price captured: ₹%.2f", self._nifty_open_price
                         )
                 continue  # Do not process as a stock signal
 
@@ -539,9 +561,8 @@ class Scanner:
 
             if symbol not in self._stores:
                 # In live mode, all known symbols are pre-loaded by _load_avg_volumes()
-                # before the ticker starts.  An unknown token here is an instrument
-                # outside the focus list — create a store without volume data but
-                # log a warning so it is visible in production.  (SM4)
+                # before the feed starts.  An unknown token here is an instrument
+                # outside the focus list.
                 if not self._settings.paper_trading:
                     logger.warning(
                         "[Scanner] Tick for unexpected symbol %s (token=%s) — "
@@ -553,17 +574,17 @@ class Scanner:
             store.add_tick(tick)
 
             # Keep the shared LTP store current (thread-safe, sync-safe)
-            set_ltp(symbol, tick.get("last_price", 0.0))
+            ltp = tick.get("ltp") or tick.get("last_price", 0.0)
+            set_ltp(symbol, ltp)
 
             signal = self._check_signal(store)
             if signal is not None:
                 try:
                     # asyncio.Queue is NOT thread-safe.  In live mode _on_ticks
-                    # is called from KiteTicker's WebSocket thread, so we must
+                    # is called from GrowwFeed's WebSocket thread, so we must
                     # schedule the put on the event loop.  In paper mode the
                     # callback runs on the event loop already, so both paths
-                    # are safe (call_soon_threadsafe is a no-overhead passthrough
-                    # when called from the loop's own thread).
+                    # are safe.
                     if self._loop is not None:
                         self._loop.call_soon_threadsafe(
                             self._signal_queue.put_nowait, signal
@@ -584,12 +605,12 @@ class Scanner:
         Best-effort: symbols whose historical fetch fails are initialised with 0.0
         (volume check bypassed only for that symbol, a warning is logged).
         """
-        kite_client = get_kite_client()
+        groww_client = get_groww_client()
         instrument_map = get_instrument_map()
         loaded = 0
         for symbol, token in instrument_map.items():
             try:
-                candles = await kite_client.get_historical_data(
+                candles = await groww_client.get_historical_data(
                     token, interval="day", days_back=30
                 )
                 volumes = [c["volume"] for c in candles if c.get("volume", 0) > 0]
@@ -617,25 +638,23 @@ class Scanner:
     def _on_connect(self, ws, response) -> None:
         """Subscribe to instruments on WebSocket connect."""
         tokens = list(get_instrument_map().values())
-        # A2: Always subscribe to the NIFTY 50 index for the intraday trend filter,
-        # even if it is not in the focus stock list.  LTP mode is sufficient — we
-        # only need last_price and ohlc.open, not full market depth.
+        # A2: Always subscribe to the NIFTY 50 index for the intraday trend filter.
         if NIFTY50_TOKEN not in tokens:
             tokens.append(NIFTY50_TOKEN)
         if tokens:
             ws.subscribe(tokens)
             ws.set_mode(ws.MODE_FULL, tokens)
-            logger.info("KiteTicker subscribed to %d instruments (incl. NIFTY 50 index)", len(tokens))
+            logger.info("GrowwFeed subscribed to %d instruments (incl. NIFTY 50 index)", len(tokens))
 
     def _on_close(self, ws, code, reason) -> None:
-        logger.warning("KiteTicker closed: code=%s reason=%s", code, reason)
+        logger.warning("GrowwFeed closed: code=%s reason=%s", code, reason)
         self._running = False
 
     def _on_error(self, ws, code, reason) -> None:
-        logger.error("KiteTicker error: code=%s reason=%s", code, reason)
+        logger.error("GrowwFeed error: code=%s reason=%s", code, reason)
 
     async def start(self) -> None:
-        """Start the scanner: MockTickGenerator in paper mode, KiteTicker in live mode."""
+        """Start the scanner: MockTickGenerator in paper mode, GrowwFeed in live mode."""
         self._running = True
         self._loop = asyncio.get_running_loop()
 
@@ -644,20 +663,20 @@ class Scanner:
             self._mock_generator = MockTickGenerator(on_ticks_callback=self._on_ticks)
             await self._mock_generator.run()
         else:
-            logger.info("[Scanner] Live mode — loading historical volumes before KiteTicker")
+            logger.info("[Scanner] Live mode — loading historical volumes before GrowwFeed")
             # SC1: Pre-populate TickDataStore instances with 20-day avg volumes so the
             # volume filter is active from the first tick, not silently bypassed.
             await self._load_avg_volumes()
 
-            kite_client = get_kite_client()
-            ticker = await kite_client.create_ticker()
+            groww_client = get_groww_client()
+            ticker = await groww_client.create_ticker()
 
             ticker.on_ticks = self._on_ticks
             ticker.on_connect = self._on_connect
             ticker.on_close = self._on_close
             ticker.on_error = self._on_error
 
-            # KiteTicker.connect is blocking; run in a thread
+            # GrowwFeed.connect is blocking; run in a thread
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, ticker.connect, True)
 

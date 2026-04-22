@@ -17,7 +17,7 @@ from core.config import get_settings
 from core.database import get_db
 from core.redis_client import publish
 from integrations import ltp_store
-from integrations.kite_client import get_kite_client
+from integrations.groww_client import get_groww_client
 from models.trade import Trade
 from schemas.trade import TradeResponse
 
@@ -91,8 +91,8 @@ async def close_trade_manually(trade_id: int, db: AsyncSession = Depends(get_db)
     # ── Phase 1b: cancel any GTT stop-loss (live mode only) ──
     if not settings.paper_trading and trade.gtt_trigger_id:
         try:
-            kite = get_kite_client()
-            await kite.delete_gtt(trade.gtt_trigger_id)
+            groww = get_groww_client()
+            await groww.delete_gtt(trade.gtt_trigger_id)
         except Exception:
             pass  # Non-fatal; GTT may already be triggered or expired
 
@@ -102,8 +102,8 @@ async def close_trade_manually(trade_id: int, db: AsyncSession = Depends(get_db)
         exit_price = ltp_store.get_ltp(trade.stock) or trade.entry_price
     else:
         try:
-            kite = get_kite_client()
-            ltp_data = await kite.get_ltp([f"NSE:{trade.stock}"])
+            groww = get_groww_client()
+            ltp_data = await groww.get_ltp([f"NSE:{trade.stock}"])
             exit_price = ltp_data[f"NSE:{trade.stock}"]["last_price"]
         except Exception as exc:
             # Revert to OPEN so the operator can retry
@@ -116,8 +116,8 @@ async def close_trade_manually(trade_id: int, db: AsyncSession = Depends(get_db)
     # ── Phase 2: place SELL order ─────────────────────────────
     try:
         if not settings.paper_trading:
-            kite = get_kite_client()
-            await kite.place_order(
+            groww = get_groww_client()
+            await groww.place_order(
                 tradingsymbol=trade.stock,
                 exchange=trade.exchange,
                 transaction_type="SELL",

@@ -130,10 +130,10 @@ Write-Host ""
 Write-Host "  Mode:       $paper"        -ForegroundColor White
 Write-Host "  Dashboard:  http://localhost:4200"           -ForegroundColor White
 Write-Host "  API health: http://localhost:8000/api/health" -ForegroundColor White
-Write-Host "  API docs:   http://localhost:8000/api/docs"   -ForegroundColor White
+Write-Host "  API docs:   http://localhost:8000/docs"       -ForegroundColor White
 Write-Host ""
-Write-Host "  Kite login: http://localhost:8000/api/auth/kite/login" -ForegroundColor Yellow
-Write-Host "  (complete this before 09:15 IST each trading day)" -ForegroundColor Yellow
+Write-Host "  Groww auth (one-time): POST http://localhost:8000/api/auth/groww/login" -ForegroundColor Yellow
+Write-Host "  (only needed once — TOTP tokens do not expire)" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "  Useful commands:"                                      -ForegroundColor DarkGray
 Write-Host "    docker compose logs -f backend                   # live backend logs" -ForegroundColor DarkGray

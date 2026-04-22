@@ -14,7 +14,7 @@ All eight build phases are done:
 
 | What works | Detail |
 |---|---|
-| Live tick ingestion | Kite WebSocket → CandleBuilder → VWAP/RSI/Volume signals |
+| Live tick ingestion | Groww WebSocket (GrowwFeed) → CandleBuilder → VWAP/RSI/Volume signals |
 | LLM decision making | Claude evaluates every signal with quantified thresholds |
 | Signal audit & guard | 3-layer validator (hard reject → soft reduce → conditions audit) |
 | Risk management | Stop-loss, GTT, trailing SL, daily drawdown halt, square-off |
@@ -26,7 +26,7 @@ All eight build phases are done:
 ### ❌ Not ready for: historical backtesting
 
 The system is built as a **live event-driven system**, not a backtesting framework. It streams
-real-time ticks from Kite WebSocket and makes decisions in OHLCV candle-time. To backtest,
+real-time ticks from Groww WebSocket and makes decisions in OHLCV candle-time. To backtest,
 you would need to feed historical OHLCV data through a replay harness — that component does not
 exist yet.
 
@@ -37,7 +37,7 @@ capital, and it is what the system is designed for.
 If you need true historical backtesting, the right tool is a separate framework
 (e.g. [vectorbt](https://vectorbt.pro/) or [backtrader](https://www.backtrader.com/)) where you
 re-implement the same signal conditions (RSI 40–72, volume 1.5×, VWAP 0–1.5%) and run them over
-Kite historical data or NSE EOD dumps. That is a separate project.
+Groww historical data or NSE EOD dumps. That is a separate project.
 
 ---
 
@@ -50,7 +50,7 @@ Kite historical data or NSE EOD dumps. That is a separate project.
 │  ┌──────────┐  ┌──────────┐  ┌───────────────────────────┐  │
 │  │ Postgres │  │  Redis   │  │  FastAPI backend          │  │
 │  │  :5432   │  │  :6379   │  │  :8000                    │  │
-│  └──────────┘  └──────────┘  │  ├─ Kite Connect SDK      │  │
+│  └──────────┘  └──────────┘  │  ├─ Groww API SDK         │  │
 │                              │  ├─ Anthropic SDK         │  │
 │  ┌──────────────────────────┐│  ├─ Alpha Vantage HTTP    │  │
 │  │  nginx + Angular  :80    ││  ├─ Yahoo Finance HTTP    │  │
@@ -59,7 +59,7 @@ Kite historical data or NSE EOD dumps. That is a separate project.
 │                              └───────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
            │               │              │
-  Zerodha Kite        Anthropic       Alpha Vantage / Yahoo Finance
+  Groww               Anthropic       Alpha Vantage / Yahoo Finance
   (broker + ticks)   (Claude LLM)    (market data)
 ```
 
@@ -69,23 +69,19 @@ Kite historical data or NSE EOD dumps. That is a separate project.
 
 Do all of these before touching any config files.
 
-### 1.1 Zerodha (mandatory — this is the broker)
+### 1.1 Groww (mandatory — this is the broker)
 
-1. Open a Zerodha trading + demat account at **zerodha.com**.
+1. Open a Groww trading + demat account at **groww.in**.
    Takes 1–2 days for verification if you have Aadhaar.
-2. Log in to the **Kite Connect developer portal**: [kite.trade/developers](https://kite.trade/developers)
-3. Click **Create new app**.
-   - App name: anything (e.g. `AutoTrader`)
-   - App type: **Connect**
-   - Redirect URL: `http://<YOUR_SERVER_IP>/api/auth/kite/callback`
-     (use `http://localhost:8000/api/auth/kite/callback` for local dev)
-4. Subscribe to Kite Connect: **₹2,000/month** (billed to Zerodha) — this is unavoidable.
-5. Note down `API Key` and `API Secret` from the app page.
+2. Enable **API access** in your Groww account settings.
+3. Note down your **Client ID**, set a **password**, and configure a **TOTP authenticator app**
+   (Google Authenticator or Authy) using the TOTP secret shown once during setup.
+4. Groww API access is **free** — no monthly subscription required.
+   (Saves ₹1,500/month vs Zerodha Kite Connect.)
 
-> **Important — daily login requirement:** Kite Connect tokens expire every day at ~07:30 IST.
-> The system has a Telegram alert that fires each morning to remind you. You click a link,
-> log in via browser, and the new token is stored in Redis automatically.
-> There is **no fully unattended overnight restart** — this is a Zerodha architectural constraint.
+> **No daily login required:** Groww TOTP tokens do not expire.
+> Set `GROWW_TOTP_SECRET` in `.env` and the backend auto-generates the TOTP on login.
+> One-time login via `POST /api/auth/groww/login` is sufficient.
 
 ### 1.2 Anthropic (mandatory — powers the Decision Engine)
 
@@ -207,10 +203,10 @@ REDIS_PORT=6379
 REDIS_PASSWORD=             # leave blank is fine on a private Docker network
 REDIS_URL=redis://redis:6379/0
 
-# ── Zerodha ─────────────────────────────────────────────
-KITE_API_KEY=<your API Key from kite.trade/developers>
-KITE_API_SECRET=<your API Secret>
-KITE_REDIRECT_URL=http://<YOUR_SERVER_IP>/api/auth/kite/callback
+# ── Groww ────────────────────────────────────────────────
+GROWW_CLIENT_ID=<your Groww client ID>
+GROWW_PASSWORD=<your Groww password>
+GROWW_TOTP_SECRET=<base32 TOTP secret from Groww 2FA setup>
 
 # ── Anthropic ───────────────────────────────────────────
 ANTHROPIC_API_KEY=<sk-ant-api03-...>
@@ -286,19 +282,21 @@ You should see 4–5 tables.
 
 ---
 
-## Step 6 — Daily Kite Login (every trading day)
+## Step 6 — Authenticate with Groww (one-time)
 
-Kite Connect tokens expire overnight. Each morning before market open:
+Groww TOTP tokens do not expire — this is a one-time setup:
 
-1. Your Telegram bot will send a message: *"⚠ Kite token expired — please log in"*
-2. Open a browser and go to: `http://<YOUR_SERVER_IP>/api/auth/kite/login`
-3. Redirects to Zerodha's login page — log in with your Zerodha credentials + TOTP.
-4. Zerodha redirects back to your server's callback URL.
-5. The backend stores the new token in Redis.
-6. Telegram confirms: *"✅ Kite token refreshed"*
+1. If `GROWW_TOTP_SECRET` is set in `.env`, the backend auto-generates the TOTP code:
+   ```bash
+   curl -X POST http://localhost:8000/api/auth/groww/login \
+     -H 'Content-Type: application/json' \
+     -d '{"client_id":"", "password":""}'
+   ```
+   (Leave `client_id` and `password` empty to use `.env` values.)
+2. You should get `{"success": true, ...}` back.
+3. Verify via: `GET http://localhost:8000/api/auth/groww/status`
 
-> Do this between **08:45–09:00 IST** — before `check_kite_token` fires at 09:00 IST
-> and the Scanner starts subscribing to ticks at market open (09:15 IST).
+> Once authenticated, the token persists in Redis indefinitely — no daily re-login needed.
 
 ---
 
@@ -316,7 +314,7 @@ Check each section:
 |---|---|
 | System status → **Database: OK** | Postgres connected |
 | System status → **Redis: OK** | Redis connected |
-| System status → **Kite: connected** | Today's token is valid |
+| System status → **Groww: connected** | Today's token is valid |
 | Market Brief section populates by 09:05 IST | Research Agent ran |
 | Positions table starts updating after 09:15 | Scanner is running |
 | Telegram message: *"Market open"* | Trading session started |
@@ -354,9 +352,9 @@ docker compose exec postgres psql -U autotrader -d autotrader \
 Keep `PAPER_TRADING=true` in `.env` for at least **2 full trading weeks** before any live capital.
 
 During this period, the system will:
-- Generate real signals from live Kite tick data
+- Generate real signals from live Groww tick data
 - Run those signals through Claude decision engine with real thresholds
-- Simulate order placement (log only, no real Zerodha orders)
+- Simulate order placement (log only, no real Groww orders)
 - Track paper P&L in the database
 - Send all normal Telegram alerts
 
@@ -389,7 +387,7 @@ docker compose logs backend | grep "PAPER_TRADING\|paper"
 # Should see: "Paper trading mode: DISABLED"
 ```
 
-From this point, every `EXECUTE` decision places a real Zerodha market order.
+From this point, every `EXECUTE` decision places a real Groww market order.
 Start with a **small capital** (₹50k–₹1 lakh). Scale up only after 2–4 weeks of
 consistent live results.
 
@@ -424,8 +422,8 @@ docker compose down -v
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Dashboard shows "Kite: disconnected" | Token expired or not yet set | Do Step 6 |
-| Scanner not firing signals | Token issue or no stocks on watchlist | Check logs; verify Kite token |
+| Dashboard shows "Groww: disconnected" | Token not set | Run POST /api/auth/groww/login |
+| Scanner not firing signals | Token issue or no stocks on watchlist | Check logs; verify Groww token |
 | Decision Engine logs "placeholder key" | `ANTHROPIC_API_KEY` is blank in `.env` | Fill in the key, restart backend |
 | Port 80 not reachable from browser | OCI VCN ingress rule missing | Add TCP 80 ingress in OCI console |
 | `alembic upgrade head` fails | Database not yet reachable | Wait for postgres healthcheck, retry |
@@ -439,7 +437,7 @@ docker compose down -v
 | Service | Cost |
 |---|---|
 | Oracle Cloud VM (Ampere A1 4 OCPU / 24 GB) | **Free** |
-| Zerodha Kite Connect subscription | **₹2,000/month** |
+| Groww API access | **Free** (no monthly subscription) |
 | Anthropic Claude Sonnet (~30 trades/day, 22 days) | **~$20–40/month** |
 | Alpha Vantage (free tier) | **Free** |
 | Yahoo Finance (^NSEI, ^INDIAVIX) | **Free** |
@@ -447,4 +445,4 @@ docker compose down -v
 | Telegram Bot API | **Free** |
 | **Total** | **~₹4,500–6,000/month** |
 
-Brokerage charges (₹20/order at Zerodha) are separate and come out of trading capital.
+Brokerage charges (Groww flat fee per order) are separate and come out of trading capital.

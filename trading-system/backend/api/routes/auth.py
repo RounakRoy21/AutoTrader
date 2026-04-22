@@ -1,79 +1,129 @@
 """
-Kite Connect OAuth callback route.
-Captures the request_token after user login and exchanges it for an access_token.
+Groww API authentication routes.
+
+Groww uses TOTP-based login (no OAuth redirect, no daily re-auth).
+The session token returned after login persists until explicitly revoked
+via the Groww app — no TTL is set in Redis.
+
+Endpoints:
+  GET  /api/auth/groww/status   — check if a session token is present
+  POST /api/auth/groww/login    — perform TOTP login, store token in Redis
+  POST /api/auth/groww/logout   — remove token from Redis and invalidate cache
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
-from kiteconnect import KiteConnect
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 
 from core.config import get_settings
-from core.redis_client import get_value, set_value
-from core.redis_keys import KITE_TOKEN_KEY
-from integrations.kite_client import get_kite_client
+from core.redis_client import delete_value, get_value, set_value
+from core.redis_keys import GROWW_TOKEN_KEY
+from integrations.groww_client import get_groww_client
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
 
-KITE_TOKEN_TTL = 24 * 60 * 60  # 24 hours
+
+class LoginRequest(BaseModel):
+    """Body for POST /api/auth/groww/login."""
+    client_id: str
+    password: str
+    totp: Optional[str] = None  # 6-digit TOTP; auto-generated if GROWW_TOTP_SECRET is set
 
 
-@router.get("/kite/status")
-async def kite_token_status():
-    """Report whether a valid Kite access token is present in Redis."""
-    token = await get_value(KITE_TOKEN_KEY)
+@router.get("/groww/status")
+async def groww_token_status():
+    """Report whether a valid Groww session token is present in Redis."""
+    token = await get_value(GROWW_TOKEN_KEY)
     has_token = bool(token)
     return {
         "success": True,
         "data": {
             "authenticated": has_token,
-            "message": "Token present" if has_token else "No token — please visit /api/auth/kite/login-url",
+            "message": (
+                "Session token present"
+                if has_token
+                else "No token — POST /api/auth/groww/login to authenticate"
+            ),
         },
         "error": None,
     }
 
 
-@router.get("/kite/login-url")
-async def get_kite_login_url():
-    """Return the Kite login URL for the user to authenticate."""
-    settings = get_settings()
-    kite = KiteConnect(api_key=settings.kite_api_key)
-    url = kite.login_url()
-    return {"success": True, "data": {"login_url": url}, "error": None}
-
-
-@router.get("/kite/callback")
-async def kite_callback(request_token: str = Query(...)):
+@router.post("/groww/login")
+async def groww_login(body: LoginRequest):
     """
-    OAuth callback for Zerodha Kite.
-    Exchanges the request_token for an access_token and stores it in Redis.
+    Perform TOTP-based Groww login and store the session token in Redis.
+
+    If ``totp`` is omitted in the request body, the server generates it
+    automatically from GROWW_TOTP_SECRET (if configured in .env).
+    Tokens have no expiry — no TTL is applied.
     """
     settings = get_settings()
+
+    # Resolve TOTP
+    totp_code = body.totp
+    if not totp_code:
+        if not settings.groww_totp_secret:
+            raise HTTPException(
+                status_code=400,
+                detail="TOTP code required — either provide it in the request body "
+                       "or set GROWW_TOTP_SECRET in .env for auto-generation.",
+            )
+        try:
+            import pyotp
+            totp_code = pyotp.TOTP(settings.groww_totp_secret).now()
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"TOTP generation failed: {exc}")
+
     try:
-        kite = KiteConnect(api_key=settings.kite_api_key)
-        # generate_session() is a blocking HTTP call — run off the event loop
-        data = await asyncio.to_thread(
-            kite.generate_session,
-            request_token,
-            api_secret=settings.kite_api_secret,
-        )
-        access_token = data["access_token"]
+        from growwapi import GrowwAPI
 
-        await set_value(KITE_TOKEN_KEY, access_token, ttl=KITE_TOKEN_TTL)
-        # Invalidate the in-memory cache so kite_client re-reads the new token
-        get_kite_client().invalidate_token()
-        logger.info("Kite access_token stored in Redis (TTL=%ds)", KITE_TOKEN_TTL)
+        def _do_login():
+            gc = GrowwAPI()
+            gc.login(
+                client_id=body.client_id or settings.groww_client_id,
+                password=body.password or settings.groww_password,
+                totp=totp_code,
+            )
+            return gc.access_token
+
+        access_token = await asyncio.to_thread(_do_login)
+        if not access_token:
+            raise ValueError("Login succeeded but no access_token was returned")
+
+        # No TTL — Groww session tokens do not expire on their own
+        await set_value(GROWW_TOKEN_KEY, access_token)
+        # Invalidate the in-memory cache so groww_client picks up the new token
+        get_groww_client().invalidate_token()
+        logger.info("Groww access_token stored in Redis (no TTL)")
 
         return {
             "success": True,
-            "data": {"message": "Kite authentication successful. You may close this window."},
+            "data": {"message": "Groww authentication successful."},
             "error": None,
         }
+    except HTTPException:
+        raise
     except Exception as exc:
-        logger.error("Kite token exchange failed: %s", exc)
-        raise HTTPException(status_code=500, detail=f"Kite auth failed: {exc}")
+        logger.error("Groww login failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Groww login failed: {exc}")
+
+
+@router.post("/groww/logout")
+async def groww_logout():
+    """Remove the Groww session token from Redis and invalidate the in-memory cache."""
+    await delete_value(GROWW_TOKEN_KEY)
+    get_groww_client().invalidate_token()
+    logger.info("Groww session token removed from Redis")
+    return {
+        "success": True,
+        "data": {"message": "Logged out. POST /api/auth/groww/login to re-authenticate."},
+        "error": None,
+    }
 

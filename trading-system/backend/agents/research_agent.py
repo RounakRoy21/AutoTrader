@@ -27,12 +27,14 @@ from integrations.alpha_vantage_client import (
     fetch_earnings_calendar,
     fetch_gold,
     fetch_india_vix,
+    fetch_nikkei,
     fetch_sgx_nifty,
     fetch_us_market_close,
+    fetch_usdinr,
 )
 from integrations.anthropic_client import get_anthropic_client
 from integrations.news_aggregator import HybridNewsAggregator
-from integrations.nse_client import fetch_corporate_actions_today, fetch_fii_dii_data
+from integrations.nse_client import fetch_corporate_actions_today, fetch_fii_dii_data, fetch_nse_indices
 from models.market_brief import MarketBrief
 from schemas.market_brief import (
     DxySchema,
@@ -60,8 +62,10 @@ IST = pytz.timezone("Asia/Kolkata")
 RESEARCH_SYSTEM_PROMPT = (
     "You are a pre-market analyst for Indian equity markets with 20 years of "
     "experience. You will be given raw data including FII/DII activity, US market "
-    "performance, the Dollar Index trend, SGX NIFTY futures direction, financial "
-    "news headlines, and an earnings calendar. Your job is to synthesize this into "
+    "performance, S&P 500 overnight futures (ES=F), Nikkei 225 live performance, "
+    "the Dollar Index (ICE DXY), USD/INR exchange rate, "
+    "financial news headlines, and an earnings calendar. "
+    "Your job is to synthesize this into "
     "a structured market brief. Be conservative in your bias scoring. Assign a "
     "BULLISH, BEARISH, or NEUTRAL market bias along with a confidence score between "
     "0.0 and 1.0. Identify which NIFTY 50 stocks to watch today and which to avoid. "
@@ -71,6 +75,8 @@ RESEARCH_SYSTEM_PROMPT = (
     "date, generated_at, market_bias, bias_confidence, sgx_nifty, fii_dii, dxy, "
     "us_markets, news_flags, watchlist_today, avoid_today, earnings_drift_candidates, "
     "recommended_stance, position_size_override. "
+    "sgx_nifty is now sourced from S&P 500 futures (ES=F) — it represents the estimated "
+    "Nifty 50 opening gap derived from overnight futures, not GIFT Nifty.\n"
     "news_flags is a list of objects with keys: type, sentiment (POSITIVE/NEGATIVE/NEUTRAL), "
     "urgency (HIGH/MEDIUM/LOW), stock (nullable), beat_pct (nullable — only non-null when a "
     "reported beat percentage is cited in the headline, e.g. 'beats estimates by 8%'). "
@@ -93,6 +99,22 @@ RESEARCH_SYSTEM_PROMPT = (
     "sources; google_news aggregates and may include opinion pieces.\n"
     "  • A headline about a SEBI action, court order, promoter pledge, or block deal "
     "is higher urgency than a routine analyst target change.\n\n"
+    "OVERNIGHT GAP AND ASIAN SESSION RULES:\n"
+    "  • sgx_nifty is derived from S&P 500 futures (ES=F) overnight change × 0.65 "
+    "(Nifty/SPX historical beta). It is the best available estimate of Nifty gap direction.\n"
+    "  • sgx_nifty.signal=GAP_UP (est. Nifty >+0.2%): bullish lean, "
+    "supports FULL_SIZE_POSITIONS if other signals agree.\n"
+    "  • sgx_nifty.signal=GAP_DOWN (est. Nifty <-0.2%): bearish lean, "
+    "gaps down >0.5% warrant HALF_SIZE_POSITIONS even on BULLISH bias.\n"
+    "  • sgx_nifty.signal=FLAT: no directional edge from futures; "
+    "rely on other signals.\n"
+    "  • nikkei.signal is the live Nikkei 225 performance (Tokyo market open at 6 AM IST). "
+    "It is an independent Asian risk signal with ~0.5 correlation to Nifty.\n"
+    "  • nikkei.signal=NEGATIVE and sgx_nifty.signal=GAP_DOWN together: "
+    "strong pan-Asian risk-off — lean BEARISH, recommend HALF_SIZE_POSITIONS.\n"
+    "  • nikkei.signal=POSITIVE and sgx_nifty.signal=GAP_UP together: "
+    "broad Asian risk-on, adds confidence to BULLISH bias.\n"
+    "  • nikkei.available=False: Tokyo data unavailable — ignore the field.\n\n"
     "INDIA VIX INTERPRETATION RULES:\n"
     "  • india_vix.value is the NSE volatility index (30-day implied vol of Nifty options).\n"
     "  • regime=LOW (<14): complacency — momentum strategies work well, full-size positions "
@@ -128,6 +150,19 @@ RESEARCH_SYSTEM_PROMPT = (
     "    - change_pct < -0.5%: risk-on signal, mildly supportive for equities.\n"
     "    - Jewellery stocks (TITAN): gold rally > +1% is modestly BULLISH for TITAN as "
     "investor interest in gold/silver jewellery rises; add to watchlist if no other negatives.\n\n"
+    "DXY AND USD/INR INTERPRETATION RULES:\n"
+    "  • dxy.value is the ICE US Dollar Index level (typically 95–110). "
+    "dxy.trend: STRENGTHENING = USD gaining vs basket; WEAKENING = USD losing vs basket.\n"
+    "  • usdinr.value is the USD/INR spot rate (e.g. 84.5 means 1 USD = ₹84.5). "
+    "usdinr.available=False means the fetch failed — ignore the field.\n"
+    "  • usdinr.trend: INR_WEAKENING = rupee depreciating (USD/INR rising), "
+    "INR_STRENGTHENING = rupee appreciating, STABLE = no significant move.\n"
+    "  • INR_WEAKENING is the most India-specific bearish signal: "
+    "FIIs sell Indian equities to avoid currency losses on repatriation. "
+    "Compress bias_confidence by 10% on INR_WEAKENING days.\n"
+    "  • INR_STRENGTHENING is mildly bullish — supports FII inflows.\n"
+    "  • Combined signal: dxy STRENGTHENING + INR_WEAKENING together = "
+    "strong EM risk-off, lean BEARISH or recommend HALF_SIZE_POSITIONS.\n\n"
     "EARNINGS CALENDAR INTERPRETATION RULES:\n"
     "  • earnings_calendar contains stocks with scheduled NSE results in the next 7 calendar "
     "days: [{\"stock\": \"INFY\", \"earnings_date\": \"2026-03-12\"}, ...]. "
@@ -177,6 +212,7 @@ async def collect_pre_market_data() -> dict:
     (
         fii_dii, us_markets, dxy, sgx_nifty, india_vix,
         crude_oil, gold, earnings_cal, news_items, corp_actions,
+        nse_indices, usdinr, nikkei,
     ) = await asyncio.gather(
         fetch_fii_dii_data(),
         fetch_us_market_close(),
@@ -185,11 +221,42 @@ async def collect_pre_market_data() -> dict:
         fetch_india_vix(),
         fetch_crude_oil(),
         fetch_gold(),
-        fetch_earnings_calendar(prior_watchlist),  # upcoming results in next 7 days
-        _aggregator.fetch_all(watchlist=prior_watchlist),  # real-time RSS + Google News
-        fetch_corporate_actions_today(),  # ex-date stocks to mechanically exclude
+        fetch_earnings_calendar(prior_watchlist),
+        _aggregator.fetch_all(watchlist=prior_watchlist),
+        fetch_corporate_actions_today(),
+        fetch_nse_indices(),
+        fetch_usdinr(),
+        fetch_nikkei(),
         return_exceptions=True,
     )
+
+    # ── NSE data override ────────────────────────────────────────────────────
+    # NSE's own API is the authoritative source for India VIX (it's an NSE
+    # product) and live Nifty 50 values.  Override the Yahoo Finance results
+    # when NSE data is available and valid.  Yahoo Finance remains the fallback
+    # if NSE returns an error or the markets are not yet open.
+    if not isinstance(nse_indices, Exception) and nse_indices.get("available"):
+        nse_vix = nse_indices.get("india_vix")
+        nse_n50 = nse_indices.get("nifty50")
+
+        if nse_vix and nse_vix.get("value", 0) > 0:
+            india_vix = {"value": nse_vix["value"], "regime": nse_vix["regime"]}
+            logger.info(
+                "India VIX overridden from NSE: %.2f regime=%s",
+                nse_vix["value"], nse_vix["regime"],
+            )
+
+        if nse_n50 and nse_n50.get("current", 0) > 0:
+            pct = nse_n50["percent_change"]
+            sgx_nifty = {
+                "value": nse_n50["current"],
+                "change_pct": pct,
+                "signal": "GAP_UP" if pct > 0.2 else ("GAP_DOWN" if pct < -0.2 else "FLAT"),
+            }
+            logger.info(
+                "Nifty50 overridden from NSE: %.2f (%.3f%%)",
+                nse_n50["current"], pct,
+            )
 
     # Handle any failures gracefully
     # mode='json' gives ISO-8601 datetimes; exclude 'link' because URLs
@@ -218,8 +285,19 @@ async def collect_pre_market_data() -> dict:
         "fii_dii": fii_dii if not isinstance(fii_dii, Exception) else {"error": str(fii_dii)},
         "us_markets": us_markets if not isinstance(us_markets, Exception) else {"error": str(us_markets)},
         "dxy": dxy if not isinstance(dxy, Exception) else {"error": str(dxy)},
+        # sgx_nifty key kept for LLM prompt compatibility; value is now sourced from
+        # NSE allIndices (live Nifty50) when available, Yahoo Finance otherwise.
         "sgx_nifty": sgx_nifty if not isinstance(sgx_nifty, Exception) else {"error": str(sgx_nifty)},
         "india_vix": india_vix if not isinstance(india_vix, Exception) else {"value": 0.0, "regime": "UNKNOWN"},
+        # sector_indices: passed as supplementary context (not in LLM prompt today,
+        # available for future use or manual inspection via logs)
+        "nse_sector_indices": (
+            nse_indices.get("sector_indices", {})
+            if not isinstance(nse_indices, Exception) and nse_indices.get("available")
+            else {}
+        ),
+        "usdinr": usdinr if not isinstance(usdinr, Exception) else {"value": 0.0, "change_pct": 0.0, "trend": "STABLE", "available": False},
+        "nikkei": nikkei if not isinstance(nikkei, Exception) else {"value": 0.0, "change_pct": 0.0, "signal": "FLAT", "available": False},
         "crude_oil": crude_oil if not isinstance(crude_oil, Exception) else {"price": 0.0, "change_pct": 0.0, "available": False},
         "gold": gold if not isinstance(gold, Exception) else {"price": 0.0, "change_pct": 0.0, "available": False},
         "news_headlines": raw_news,

@@ -260,8 +260,10 @@ class TestSignalLogic:
         qty = scanner._calculate_suggested_qty(ltp)
         # max_loss = 1M * 0.015 = 15000
         # sl_amount = 1000 * 0.008 = 8
-        # qty = 15000 / 8 = 1875
-        assert qty == 1875
+        # qty_from_risk = 15000 / 8 = 1875
+        # capital cap: 1M / 3 positions / 1000 ltp = 333
+        # result = min(1875, 333) = 333
+        assert qty == 333
 
     def test_suggested_qty_zero_ltp(self):
         queue = asyncio.Queue()
@@ -456,8 +458,10 @@ class TestAtrQty:
         qty = scanner._calculate_suggested_qty(1000.0, atr=5.0, n_candles=45)
         # max_loss = 1M * 0.015 = 15000
         # sl_distance = 5.0 * 1.5 = 7.5
-        # qty = 15000 / 7.5 = 2000
-        assert qty == 2000
+        # qty_from_risk = 15000 / 7.5 = 2000
+        # capital cap: 1M / 3 / 1000 = 333
+        # result = min(2000, 333) = 333
+        assert qty == 333
 
     def test_atr_qty_requires_min_candles(self, settings):
         """ATR-based sizing must fall back to fixed-pct when < 45 candles (SH3)."""
@@ -467,8 +471,10 @@ class TestAtrQty:
 
         # n_candles=30 (early session) → ATR not trusted → fixed-pct fallback
         qty_early = scanner._calculate_suggested_qty(1000.0, atr=5.0, n_candles=30)
-        # fixed: max_loss=15000, sl=1000*0.008=8, qty=1875
-        assert qty_early == 1875
+        # fixed: max_loss=15000, sl=1000*0.008=8, qty_from_risk=1875
+        # capital cap: 1M / 3 / 1000 = 333
+        # result = min(1875, 333) = 333
+        assert qty_early == 333
 
     def test_fallback_without_atr(self, settings):
         queue = asyncio.Queue()
@@ -476,8 +482,9 @@ class TestAtrQty:
         scanner._settings = settings
 
         qty = scanner._calculate_suggested_qty(1000.0)
-        # max_loss = 15000, sl = 1000 * 0.008 = 8, qty = 1875
-        assert qty == 1875
+        # max_loss = 15000, sl = 1000 * 0.008 = 8, qty_from_risk = 1875
+        # capital cap: 1M / 3 / 1000 = 333 → min(1875, 333) = 333
+        assert qty == 333
 
 
 # ═══════════════════════════════════════════════════════════════════════════

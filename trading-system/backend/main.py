@@ -33,7 +33,6 @@ from api.websocket import router as ws_router, start_ws_background_tasks
 
 # ── Agent imports ──────────────────────────────────
 from agents.research_agent import run_research_agent
-from agents.token_refresh import check_kite_token
 from agents.trading_agent_manager import get_trading_agent_manager
 from integrations.instrument_service import load_instrument_map
 
@@ -71,7 +70,7 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("⚠️ Redis unreachable — running in fallback mode")
 
-    # 3. Load instrument token map (Kite API → Redis → hardcoded fallback)
+    # 3. Load instrument token map (Groww API → Redis → hardcoded fallback)
     try:
         token_map = await load_instrument_map()
         logger.info("✅ Instrument map loaded (%d symbols)", len(token_map))
@@ -86,13 +85,7 @@ async def lifespan(app: FastAPI):
         minute=0,
     )
 
-    # 5. Schedule Kite token refresh check at 8:50 AM IST (Mon-Fri)
-    schedule_cron(
-        func=check_kite_token,
-        job_id="kite_token_check",
-        hour=8,
-        minute=50,
-    )
+    # 5. (Groww TOTP tokens do not expire — no daily token refresh job needed)
 
     # 6. Trading Agent — auto-start at 09:15 IST, auto-stop at 15:30 IST (Mon-Fri)
     trading_manager = get_trading_agent_manager()

@@ -2,7 +2,7 @@
 Thread-safe in-memory LTP (Last Traded Price) store.
 
 The Scanner writes here on every tick; the RiskManager reads from here
-in paper trading mode (where real Kite LTP calls aren't possible).
+in paper trading mode (where real Groww LTP calls aren't possible).
 Uses a simple RLock so it is safe to call from both the asyncio event
 loop (Scanner / paper mode) and the RiskManager daemon thread.
 """

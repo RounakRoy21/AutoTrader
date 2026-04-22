@@ -128,6 +128,15 @@ async def set_value(key: str, value: str, ttl: Optional[int] = None) -> None:
         logger.error("Redis SET failed for %s: %s", key, exc)
 
 
+async def delete_value(key: str) -> None:
+    """Delete a key from Redis."""
+    try:
+        r = await get_redis()
+        await r.delete(key)
+    except Exception as exc:
+        logger.error("Redis DEL failed for %s: %s", key, exc)
+
+
 async def increment(key: str) -> int:
     """Atomically increment a Redis key and return the new value."""
     try:

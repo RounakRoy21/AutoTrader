@@ -4,7 +4,7 @@ This file summarizes the accounts, configuration steps, and actions required bef
 
 **Accounts to create**
 
-- Zerodha (Kite Connect): Trading account + Kite Connect subscription (create an app to get `KITE_API_KEY` & `KITE_API_SECRET`).
+- Groww: Trading account + API access enabled (get `GROWW_CLIENT_ID`, `GROWW_PASSWORD`, and note the TOTP secret as `GROWW_TOTP_SECRET`).
 - Oracle Cloud Free Tier: create an account and provision an Ampere A1 instance (Ubuntu).
 - Anthropic: API account; obtain `ANTHROPIC_API_KEY`.
 - Alpha Vantage: get `ALPHAVANTAGE_API_KEY` (free tier, 25 req/day — used for US close and DXY).
@@ -14,10 +14,10 @@ This file summarizes the accounts, configuration steps, and actions required bef
 
 **Post-account configuration**
 
-- Zerodha/Kite:
-  - Subscribe to Kite Connect and create an app.
-  - Set OAuth redirect URL to `http://<your-server-ip>/api/auth/kite/callback`.
-  - Keep `KITE_API_KEY` and `KITE_API_SECRET` ready for `.env`.
+- Groww:
+  - Enable API access in your Groww account settings.
+  - Configure a TOTP authenticator app; note the base32 secret as `GROWW_TOTP_SECRET`.
+  - Keep `GROWW_CLIENT_ID`, `GROWW_PASSWORD`, `GROWW_TOTP_SECRET` ready for `.env`.
 - Anthropic / AlphaVantage:
   - Place API keys in the backend `.env` file.
 - Telegram:
@@ -43,15 +43,15 @@ This file summarizes the accounts, configuration steps, and actions required bef
 - [x] Phase 7: Frontend live data (LTP streaming, open-position P&L, agent controls) — **complete**
 - [x] Phase 8: Docker + deployment hardening — **complete**
 - End-to-end testing in `PAPER_TRADING=true` mode for at least 1–2 weeks.
-- Validate Telegram daily Kite re-auth alert and OAuth flow.
-- Confirm GTT / order placement behavior in the Zerodha paper environment.
+- Validate Groww TOTP authentication via POST /api/auth/groww/login.
+- Confirm OCO/GTT order placement behavior in the Groww paper environment.
 
 **Before the first live trade (mandatory)**
 
 1. Set `PAPER_TRADING=true` and run the full stack for 1–2 weeks.
 2. Use a conservative `TOTAL_CAPITAL` in `.env` (₹50k–₹100k recommended for initial testing).
 3. Monitor the dashboard, trade logs, and Telegram alerts for unexpected behaviour.
-4. Verify that stop-losses / GTTs placed by the system appear in Zerodha's dashboard.
+4. Verify that stop-losses / OCO orders placed by the system appear in Groww's order book.
 5. Only switch `PAPER_TRADING=false` after consistent, satisfactory paper-trading results.
 
 **Quick local commands**

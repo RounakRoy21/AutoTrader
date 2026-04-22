@@ -9,8 +9,9 @@ cross-module key dependencies explicit and searchable.
 # ── Trading control ────────────────────────────────────────────────────────────
 HALT_KEY = "trading_halt"               # "TRUE" | "FALSE"
 
-# ── Kite authentication ────────────────────────────────────────────────────────
-KITE_TOKEN_KEY = "kite_access_token"    # Zerodha access token (24h TTL)
+# ── Groww authentication ──────────────────────────────────────────────────────
+GROWW_TOKEN_KEY = "groww_session_token"  # Groww access token (no expiry, persists until revoked)
+KITE_TOKEN_KEY = GROWW_TOKEN_KEY          # backward-compat alias (kite_client.py)
 
 # ── Agent status ───────────────────────────────────────────────────────────────
 RESEARCH_STATUS_KEY = "agent:research:status"   # "ACTIVE" | "INACTIVE" | "ERROR"

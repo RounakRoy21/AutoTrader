@@ -2,7 +2,7 @@
 Trading Agent — Orchestrates Scanner, Decision Engine, and Risk Manager.
 
 Activates at 9:15 AM IST, deactivates at 3:30 PM IST.
-On startup, runs state recovery to reconstruct open positions from Kite.
+On startup, runs state recovery to reconstruct open positions from Groww.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from core.database import get_db_context
 from core.redis_client import get_value, increment, publish, set_value, subscribe
 from core.redis_keys import HALT_KEY, TRADING_STATUS_KEY, DAILY_TRADE_COUNT_KEY
 from integrations import ltp_store as ltp_store_module
-from integrations.kite_client import get_kite_client
+from integrations.groww_client import get_groww_client
 from integrations.telegram_client import send_telegram, send_trade_entry_alert
 from models.trade import Trade
 from schemas.decision import DecisionOutput
@@ -55,43 +55,43 @@ class TradingAgent:
 
     async def state_recovery(self) -> None:
         """
-        MANDATORY first step: reconcile open Kite positions with the DB.
+        MANDATORY first step: reconcile open Groww positions with the DB.
 
         Safety invariant: the Risk Manager queries ONLY the DB for open trades.
         If the process crashed after a live order was placed but before the DB
-        row was committed, Kite holds a real position the Risk Manager will
+        row was committed, Groww holds a real position the Risk Manager will
         never see — meaning no SL enforcement, no EOD close, no P&L tracking.
 
         This method creates a synthetic OPEN Trade record for every orphaned
-        Kite position so the Risk Manager can manage it normally.  SL and target
+        Groww position so the Risk Manager can manage it normally.  SL and target
         are estimated from configured percentages; the rationale field is set to
         "RECOVERED — no DB record found on startup" so the operator can
         distinguish synthetic rows from normally entered trades.
         """
-        logger.info("Running state recovery — reconciling Kite positions with DB…")
+        logger.info("Running state recovery — reconciling Groww positions with DB…")
 
-        # Paper trading: no Kite positions exist, nothing to reconcile.
+        # Paper trading: no Groww positions exist, nothing to reconcile.
         if self._settings.paper_trading:
-            logger.info("Paper trading mode — skipping Kite state recovery")
+            logger.info("Paper trading mode — skipping Groww state recovery")
             return
 
         try:
-            kite = get_kite_client()
-            positions = await kite.get_positions()
+            groww = get_groww_client()
+            positions = await groww.get_positions()
             net_positions = positions.get("net", [])
-            open_kite: dict = {
+            open_groww: dict = {
                 p["tradingsymbol"]: p
                 for p in net_positions
                 if p.get("quantity", 0) != 0
             }
         except Exception as exc:
             logger.error(
-                "State recovery: Kite positions fetch failed: %s — proceeding with DB state", exc
+                "State recovery: Groww positions fetch failed: %s — proceeding with DB state", exc
             )
             return
 
-        if not open_kite:
-            logger.info("State recovery: no open positions in Kite")
+        if not open_groww:
+            logger.info("State recovery: no open positions in Groww")
             return
 
         today = datetime.now(IST).date()
@@ -108,17 +108,17 @@ class TradingAgent:
                 )
                 db_open = {t.stock: t for t in result.scalars().all()}
 
-            orphans = {sym: pos for sym, pos in open_kite.items() if sym not in db_open}
+            orphans = {sym: pos for sym, pos in open_groww.items() if sym not in db_open}
 
             if not orphans:
                 logger.info(
-                    "State recovery complete: %d Kite position(s), all matched in DB",
-                    len(open_kite),
+                    "State recovery complete: %d Groww position(s), all matched in DB",
+                    len(open_groww),
                 )
                 return
 
             logger.warning(
-                "State recovery: %d orphaned Kite position(s) with no DB record — "
+                "State recovery: %d orphaned Groww position(s) with no DB record — "
                 "creating synthetic OPEN entries: %s",
                 len(orphans), list(orphans.keys()),
             )
@@ -160,7 +160,7 @@ class TradingAgent:
                 "type": "warning",
                 "message": (
                     f"State recovery created {len(orphans)} synthetic trade record(s) for "
-                    f"orphaned Kite position(s): {list(orphans.keys())}. "
+                    f"orphaned Groww position(s): {list(orphans.keys())}. "
                     f"SL/target estimated from config. Manual review recommended."
                 ),
                 "timestamp": datetime.now(IST).isoformat(),

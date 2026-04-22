@@ -1,5 +1,10 @@
 """
-NSE India API wrapper — fetches FII/DII trade data and corporate actions.
+NSE India API wrapper — fetches FII/DII trade data, corporate actions, and live indices.
+
+All endpoints use the same anti-scraping workaround: hit the homepage first so
+NSE sets a valid session cookie, then hit the JSON API endpoint.  The market-data
+pages are JavaScript-rendered — there is no HTML table to parse.  The page's own
+JS calls the same JSON endpoints we use here.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ IST = pytz.timezone("Asia/Kolkata")
 
 NSE_FII_DII_URL = "https://www.nseindia.com/api/fiidiiTradeReact"
 NSE_CORP_ACTIONS_URL = "https://www.nseindia.com/api/corporates-corporateActions"
+NSE_ALL_INDICES_URL = "https://www.nseindia.com/api/allIndices"
 TIMEOUT = 10
 
 # NSE requires specific headers to avoid 403
@@ -29,6 +35,40 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.nseindia.com/",
 }
+
+# Indices extracted from the allIndices response that are relevant to the
+# research agent.  Broad-market, sector, and volatility indices only.
+_KEY_INDICES = {
+    "NIFTY 50",
+    "INDIA VIX",
+    "NIFTY BANK",
+    "NIFTY IT",
+    "NIFTY PHARMA",
+    "NIFTY AUTO",
+    "NIFTY FMCG",
+    "NIFTY METAL",
+    "NIFTY ENERGY",
+    "NIFTY REALTY",
+    "NIFTY PSU BANK",
+    "NIFTY PRIVATE BANK",
+    "NIFTY FINANCIAL SERVICES",
+}
+
+
+def _safe_float(value: Any) -> float:
+    """Convert an NSE API value to float, returning 0.0 on any failure.
+
+    NSE sends numbers as plain floats, but edge cases include None, "-", or
+    comma-formatted strings like "24,378.10" in some legacy endpoints.
+    """
+    try:
+        if value is None or value == "-" or value == "":
+            return 0.0
+        if isinstance(value, str):
+            value = value.replace(",", "")
+        return float(value)
+    except (ValueError, TypeError):
+        return 0.0
 
 
 async def fetch_fii_dii_data() -> Dict[str, Any]:
@@ -141,3 +181,108 @@ async def fetch_corporate_actions_today() -> List[str]:
         logger.error("NSE corp actions fetch failed: %s", exc)
 
     return symbols
+
+
+async def fetch_nse_indices() -> Dict[str, Any]:
+    """
+    Fetch live market indices from the NSE India JSON API.
+
+    The nseindia.com/market-data/live-market-indices page is JavaScript-rendered
+    and has no scrapable HTML table.  Its JS calls this endpoint internally.
+    We use the same homepage-cookie pattern as fetch_fii_dii_data().
+
+    Returns
+    -------
+    dict with keys:
+        available (bool)        — False if the request failed
+        timestamp (str | None)  — "22-Apr-2026 15:29:52" or None
+        nifty50 (dict | None):
+            current, previous_close, percent_change, open, high, low,
+            year_high, year_low
+        india_vix (dict | None):
+            value, percent_change, previous_close, regime
+            regime: LOW (<14) | NORMAL (14-20) | ELEVATED (20-25) | STRESS (>25)
+        sector_indices (dict[str, dict]):
+            keyed by index name (e.g. "NIFTY BANK"), each entry has
+            current, previous_close, percent_change
+    """
+    result: Dict[str, Any] = {
+        "available": False,
+        "timestamp": None,
+        "nifty50": None,
+        "india_vix": None,
+        "sector_indices": {},
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT, headers=HEADERS) as client:
+            # Establish session cookie — NSE blocks unauthenticated API calls.
+            await client.get("https://www.nseindia.com/")
+            resp = await client.get(NSE_ALL_INDICES_URL)
+            resp.raise_for_status()
+            data = resp.json()
+
+        result["available"] = True
+        result["timestamp"] = data.get("timestamp")
+
+        for entry in data.get("data", []):
+            name = (entry.get("index") or entry.get("indexSymbol") or "").strip()
+            if name not in _KEY_INDICES:
+                continue
+
+            current = _safe_float(entry.get("current"))
+            prev_close = _safe_float(entry.get("previousClose"))
+            pct_change = _safe_float(entry.get("percentChange"))
+
+            if name == "NIFTY 50":
+                result["nifty50"] = {
+                    "current": current,
+                    "previous_close": prev_close,
+                    "percent_change": pct_change,
+                    "open": _safe_float(entry.get("open")),
+                    "high": _safe_float(entry.get("high")),
+                    "low": _safe_float(entry.get("low")),
+                    "year_high": _safe_float(entry.get("yearHigh")),
+                    "year_low": _safe_float(entry.get("yearLow")),
+                }
+
+            elif name == "INDIA VIX":
+                vix = current
+                if vix < 14:
+                    regime = "LOW"
+                elif vix <= 20:
+                    regime = "NORMAL"
+                elif vix <= 25:
+                    regime = "ELEVATED"
+                elif vix > 25:
+                    regime = "STRESS"
+                else:
+                    regime = "UNKNOWN"
+                result["india_vix"] = {
+                    "value": round(vix, 2),
+                    "percent_change": pct_change,
+                    "previous_close": prev_close,
+                    "regime": regime,
+                }
+
+            else:
+                result["sector_indices"][name] = {
+                    "current": current,
+                    "percent_change": pct_change,
+                    "previous_close": prev_close,
+                }
+
+        logger.info(
+            "NSE allIndices: Nifty50=%.2f VIX=%.2f (regime=%s) timestamp=%s",
+            result["nifty50"]["current"] if result["nifty50"] else 0.0,
+            result["india_vix"]["value"] if result["india_vix"] else 0.0,
+            result["india_vix"]["regime"] if result["india_vix"] else "N/A",
+            result["timestamp"],
+        )
+
+    except httpx.HTTPStatusError as exc:
+        logger.error("NSE allIndices HTTP error: %s", exc)
+    except Exception as exc:
+        logger.error("NSE allIndices fetch failed: %s", exc)
+
+    return result

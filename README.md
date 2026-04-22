@@ -1,6 +1,6 @@
 # AutoTrader
 
-An automated NSE intraday equity trading system. Streams live tick data from Zerodha Kite Connect, generates technical signals, and routes them through a Claude LLM decision engine before placing real or paper trades. Fully containerised — one command deploys the entire stack on a free Oracle Cloud VM.
+An automated NSE intraday equity trading system. Streams live tick data from Groww API (GrowwFeed WebSocket), generates technical signals, and routes them through a Claude LLM decision engine before placing real or paper trades. Fully containerised — one command deploys the entire stack on a free Oracle Cloud VM.
 
 ---
 
@@ -11,7 +11,7 @@ An automated NSE intraday equity trading system. Streams live tick data from Zer
                      │                 FastAPI Backend                     │
 09:15–15:30 IST      │                                                     │
                      │  ┌────────────┐    ┌─────────────────────────────┐  │
-  Kite WebSocket ───►│  │  Scanner   │───►│     Decision Engine         │  │
+  GrowwFeed WS ───►│  │  Scanner   │───►│     Decision Engine         │  │
   (live ticks)       │  │            │    │  (Claude Haiku 4.5)         │  │
                      │  │  VWAP      │    │  SignalAudit thresholds:    │  │
                      │  │  RSI 14    │    │  • RSI 40–72                │  │
@@ -65,7 +65,7 @@ An automated NSE intraday equity trading system. Streams live tick data from Zer
 ## Features
 
 **Signal Generation (Scanner)**
-- Real-time OHLCV candle building from Kite WebSocket ticks (1-min and 5-min)
+- Real-time OHLCV candle building from GrowwFeed WebSocket ticks (1-min and 5-min)
 - VWAP, RSI(14), Volume Ratio computed on every candle close
 - EMA-9/21 alignment and MACD histogram for trend confirmation
 - ATR-based SL and target sizing
@@ -81,7 +81,7 @@ An automated NSE intraday equity trading system. Streams live tick data from Zer
 
 **Risk Manager** (zero LLM, deterministic)
 - Poll-based (every 5 seconds) monitoring of all open positions
-- Stop-loss and target monitoring with GTT orders on Kite
+- Stop-loss and target monitoring with OCO orders on Groww
 - Trailing stop-loss activation above configurable profit threshold
 - Daily drawdown limit — halts all trading if breached
 - Hard square-off of all positions at 15:00 IST
@@ -101,14 +101,14 @@ An automated NSE intraday equity trading system. Streams live tick data from Zer
 
 **Trading Agent**
 - Orchestrates Scanner → Decision Engine → Risk Manager lifecycle
-- State recovery on restart: reconstructs open positions from Kite API
+- State recovery on restart: reconstructs open positions from Groww API
 - Paper trading mode: full end-to-end simulation with zero real orders
 - Telegram alerts for every notable event
 
 **API & Dashboard**
 - FastAPI REST + WebSocket backend
 - Angular 17 frontend: live P&L, open positions, trade log, system alerts
-- OAuth flow for daily Kite token refresh
+- TOTP-based Groww authentication (no daily re-login needed)
 
 **Infrastructure**
 - Docker Compose: PostgreSQL 16 + Redis 7 + FastAPI + nginx/Angular
@@ -129,7 +129,7 @@ An automated NSE intraday equity trading system. Streams live tick data from Zer
 | Cache / pub-sub | Redis 7 |
 | Migrations | Alembic |
 | Scheduling | APScheduler 3.10 |
-| Broker | Zerodha Kite Connect v5 |
+| Broker | Groww API (growwapi SDK) |
 | LLM | Anthropic Claude — Sonnet 4.6 (Research Agent), Haiku 4.5 (Decision Engine) |
 | Market data | Alpha Vantage (US close, DXY), Yahoo Finance (Nifty 50 close, India VIX, crude oil, gold, earnings calendar), NSE HTTP |
 | News | HybridNewsAggregator — 5 Indian financial RSS feeds + Google News RSS (no API key) |
@@ -152,7 +152,7 @@ trading-system/
 │   │   ├── trading_agent_manager.py
 │   │   ├── risk_manager.py         # Deterministic position monitoring
 │   │   ├── research_agent.py       # Pre-market data + market brief
-│   │   └── token_refresh.py        # Daily Kite OAuth token renewal
+│   │   └── token_refresh.py        # (stub) TOTP tokens do not expire
 │   ├── api/routes/                 # REST endpoints (trades, P&L, system, auth)
 │   ├── api/websocket.py            # Live data WebSocket
 │   ├── core/
@@ -161,7 +161,7 @@ trading-system/
 │   │   ├── redis_client.py
 │   │   └── scheduler.py
 │   ├── integrations/
-│   │   ├── kite_client.py          # Kite Connect wrapper (retry + circuit breaker)
+│   │   ├── groww_client.py         # Groww API wrapper (retry + circuit breaker)
 │   │   ├── anthropic_client.py
 │   │   ├── alpha_vantage_client.py # US close, DXY (Alpha Vantage); Nifty 50, India VIX,
 │   │   │                           #   crude oil, gold, earnings calendar (Yahoo Finance)
@@ -196,33 +196,115 @@ trading-system/
 
 ---
 
-## Quick Start (Local Development)
+## Quick Start
 
-**Prerequisites:** Docker Desktop, Git
+### Prerequisites
+
+| Requirement | Notes |
+|---|---|
+| [Docker Desktop](https://www.docker.com/products/docker-desktop/) | Windows / macOS — includes Compose |
+| Docker Engine + Compose plugin | Linux — `curl -fsSL https://get.docker.com \| sh` |
+| Git | For cloning |
+
+---
+
+### Step 1 — Clone and configure
 
 ```bash
 git clone https://github.com/YOUR_USERNAME/AutoTrader.git
 cd AutoTrader/trading-system
 
-# Create and fill in your .env
 cp .env.example .env
-# Edit .env: add KITE_API_KEY, ANTHROPIC_API_KEY, etc.
-
-# Start the full stack (waits for health checks, runs migrations automatically)
-chmod +x start.sh && ./start.sh
-
-# On Windows (Docker Desktop):
-# .\start.ps1
-#
-# Rebuild images after code changes:
-# ./start.sh --build  (or .\start.ps1 -Build)
 ```
 
-Open **http://localhost:4200** for the dashboard.
-Open **http://localhost:8000/docs** for the API explorer.
+Open `.env` and fill in the required values:
 
-For development without Kite credentials, leave `KITE_API_KEY` blank — the system
-falls back to the mock tick generator (`MockTickGenerator`) automatically.
+| Variable | Where to get it |
+|---|---|
+| `GROWW_CLIENT_ID` | Groww account → Settings → API Access |
+| `GROWW_PASSWORD` | Your Groww login password |
+| `GROWW_TOTP_SECRET` | Base32 TOTP secret shown once during Groww 2FA setup |
+| `ANTHROPIC_API_KEY` | [console.anthropic.com](https://console.anthropic.com) |
+| `TELEGRAM_BOT_TOKEN` | Create a bot via [@BotFather](https://t.me/BotFather) |
+| `TELEGRAM_CHAT_ID` | Message [@userinfobot](https://t.me/userinfobot) to find yours |
+| `POSTGRES_PASSWORD` | Any strong random string |
+| `DATABASE_URL` | Update the password portion to match `POSTGRES_PASSWORD` |
+| `ADMIN_API_KEY` | Any strong random string (protects trading-control endpoints) |
+
+> **Minimum viable `.env` for paper trading:** `GROWW_*`, `ANTHROPIC_API_KEY`, `POSTGRES_PASSWORD`, `DATABASE_URL`, `ADMIN_API_KEY`.
+> `ALPHA_VANTAGE_API_KEY`, `TELEGRAM_*` are optional but recommended.
+
+---
+
+### Step 2 — Start the stack
+
+**Windows (Docker Desktop):**
+```powershell
+.\start.ps1
+```
+
+**Linux / macOS:**
+```bash
+chmod +x start.sh && ./start.sh
+```
+
+The script will:
+1. Verify `.env` is filled in and Docker is running
+2. Start all 4 containers (postgres, redis, backend, frontend)
+3. Wait for each service to pass its health check
+4. Run Alembic database migrations automatically
+5. Print URLs and status
+
+Add `--build` (Linux) or `-Build` (Windows) to rebuild images after code changes.
+
+---
+
+### Step 3 — Authenticate with Groww (one-time only)
+
+Groww TOTP tokens don’t expire, so this is done once:
+
+```bash
+curl -X POST http://localhost:8000/api/auth/groww/login \
+  -H "Content-Type: application/json" \
+  -d '{"client_id":"", "password":""}'
+```
+
+> Leave `client_id` and `password` empty — they are read from `.env` automatically.
+> The TOTP code is auto-generated from `GROWW_TOTP_SECRET`.
+
+Verify: `GET http://localhost:8000/api/auth/groww/status` should return `{"authenticated": true}`.
+
+---
+
+### Step 4 — Open the dashboard
+
+| URL | What it is |
+|---|---|
+| http://localhost:4200 | Angular dashboard (live P&L, positions, alerts) |
+| http://localhost:8000/docs | FastAPI interactive API explorer |
+| http://localhost:8000/api/health | Health check (broker status, agent status) |
+
+---
+
+### Stopping and restarting
+
+```bash
+./start.sh --stop        # graceful shutdown (preserves database volume)
+./start.sh               # restart
+./start.sh --status      # show container status
+```
+
+Windows:
+```powershell
+.\start.ps1 -Stop
+.\start.ps1 -Status
+```
+
+---
+
+### Offline / no-credentials development
+
+Leave `GROWW_CLIENT_ID` blank in `.env`. The system automatically falls back to `MockTickGenerator`, which simulates realistic ±2% random-walk tick data. All signal logic, the decision engine, risk manager, and database writes function identically.
 
 ---
 
@@ -247,7 +329,9 @@ All configuration lives in `trading-system/.env`. Key variables:
 | `MAX_OPEN_POSITIONS` | Maximum simultaneous open positions | `3` |
 | `MAX_TRADES_PER_DAY` | Hard daily trade count ceiling | `6` |
 | `DAILY_DRAWDOWN_LIMIT_PCT` | % loss that triggers a trading halt | `0.03` |
-| `KITE_API_KEY` | Zerodha Kite Connect API key | — |
+| `GROWW_CLIENT_ID` | Groww account client ID | — |
+| `GROWW_PASSWORD` | Groww account password | — |
+| `GROWW_TOTP_SECRET` | Base32 TOTP secret for 2FA | — |
 | `ALPHA_VANTAGE_API_KEY` | Alpha Vantage API key (US market close, DXY) | — |
 | `ANTHROPIC_API_KEY` | Claude API key | — |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token | — |
@@ -261,23 +345,23 @@ See `trading-system/PRODUCTION_SETUP.md` for the full production deployment guid
 
 See **[PRODUCTION_SETUP.md](trading-system/PRODUCTION_SETUP.md)** for the complete step-by-step guide covering:
 
-- Account setup (Zerodha, Anthropic, Oracle Cloud, Telegram)
+- Account setup (Groww, Anthropic, Oracle Cloud, Telegram)
 - `.env` configuration
 - Oracle Cloud VCN firewall rules
 - `./deploy.sh` — one-command deploy on a fresh Ubuntu VM
-- Daily Kite OAuth login flow
+- One-time Groww TOTP authentication via POST /api/auth/groww/login
 - Paper trading period guidance
 - Going live checklist
 
-**Cost summary:** Oracle VM is free. Kite Connect ₹2,000/month. Anthropic ~$20–40/month. Everything else free.
+**Cost summary:** Oracle VM is free. Groww API access free. Anthropic ~$20–40/month. Everything else free.
 
 ---
 
 ## Important Notes
 
-- **Daily Kite login required.** Zerodha access tokens expire every day. The system sends a Telegram alert each morning — click the link, log in via browser, done. This is a Zerodha platform constraint with no workaround.
+- **No daily re-authentication.** Groww TOTP tokens do not expire. Authenticate once with `POST /api/auth/groww/login` and the token persists in Redis until you explicitly log out.
 - **Long-only, NSE MIS (intraday).** The system does not hold overnight positions. All trades are squared off by 15:00 IST at the latest.
-- **Not a backtesting framework.** The system is built for live event-driven trading. For historical backtesting, use a separate tool (vectorbt, backtrader) and replay Kite historical OHLCV data through the same signal conditions.
+- **Not a backtesting framework.** The system is built for live event-driven trading. For historical backtesting, use a separate tool (vectorbt, backtrader) and replay Groww historical OHLCV data through the same signal conditions.
 - **Start with `PAPER_TRADING=true`.** Run for at least 2 full trading weeks before enabling real orders.
 
 ---

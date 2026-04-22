@@ -22,7 +22,7 @@ from core.config import get_settings
 from core.database import get_db_context
 from core.redis_client import get_value, publish, set_value
 from core.redis_keys import HALT_KEY
-from integrations.kite_client import get_kite_client
+from integrations.groww_client import get_groww_client
 from integrations import ltp_store
 from integrations.telegram_client import (
     send_eod_report,
@@ -167,7 +167,7 @@ class RiskManager:
 
         # Build a symbol → LTP mapping:
         #   • Paper mode  → LTP store (written by Scanner on every tick)
-        #   • Live mode   → Kite REST LTP (real market data)
+        #   • Live mode   → Groww REST LTP (real market data)
         settings = self._settings
         ltp_map: Dict[str, float] = {}
 
@@ -183,10 +183,10 @@ class RiskManager:
                     )
                 ltp_map[trade.stock] = price
         else:
-            kite = get_kite_client()
+            groww = get_groww_client()
             try:
                 instruments = [f"NSE:{t.stock}" for t in open_trades]
-                raw = await kite.get_ltp(instruments)
+                raw = await groww.get_ltp(instruments)
                 ltp_map = {t.stock: raw[f"NSE:{t.stock}"]["last_price"] for t in open_trades
                            if f"NSE:{t.stock}" in raw}
             except Exception as exc:
@@ -330,8 +330,8 @@ class RiskManager:
         # the window between sell and cancellation, which would double-sell.
         if not settings.paper_trading and getattr(trade, "gtt_trigger_id", None):
             try:
-                kite = get_kite_client()
-                await kite.delete_gtt(trade.gtt_trigger_id)
+                groww = get_groww_client()
+                await groww.delete_gtt(trade.gtt_trigger_id)
                 logger.info("Cancelled GTT trigger_id=%s for %s", trade.gtt_trigger_id, trade.stock)
             except Exception as gtt_exc:
                 # Non-fatal: GTT may have already been triggered or expired
@@ -340,11 +340,11 @@ class RiskManager:
                     trade.gtt_trigger_id, trade.stock, gtt_exc,
                 )
 
-        # Phase 2 — Place sell order via Kite
+        # Phase 2 — Place sell order via Groww
         try:
             if not settings.paper_trading:
-                kite = get_kite_client()
-                await kite.place_order(
+                groww = get_groww_client()
+                await groww.place_order(
                     tradingsymbol=trade.stock,
                     transaction_type="SELL",
                     quantity=trade.quantity,
@@ -486,7 +486,7 @@ class RiskManager:
         """If total daily loss (realised + unrealised) exceeds 3% of capital, halt trading.
 
         Accepts an optional *ltp_map* (symbol → price) from the main poll cycle
-        to avoid redundant Kite API calls.  Falls back to ltp_store / Kite when
+        to avoid redundant Groww API calls.  Falls back to ltp_store / Groww when
         the map is not provided or the symbol is missing.
         """
         halt = await get_value(HALT_KEY)
@@ -519,8 +519,8 @@ class RiskManager:
                     ltp = ltp_store.get_ltp(trade.stock)
                 else:
                     try:
-                        kite = get_kite_client()
-                        raw = await kite.get_ltp([f"NSE:{trade.stock}"])
+                        groww = get_groww_client()
+                        raw = await groww.get_ltp([f"NSE:{trade.stock}"])
                         ltp = raw.get(f"NSE:{trade.stock}", {}).get("last_price")
                     except Exception:
                         ltp = None

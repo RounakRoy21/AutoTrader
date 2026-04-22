@@ -1,13 +1,13 @@
 """
-Mock Tick Generator — simulates a KiteTicker feed for paper trading mode.
+Mock Tick Generator — simulates a GrowwFeed WebSocket for paper trading mode.
 
 Instead of a live WebSocket, this module drives the Scanner by:
-  1. Fetching today's OHLC snapshot for each focus stock via Kite LTP (or
-     hardcoded seed prices if Kite is unavailable).
+  1. Fetching today's OHLC snapshot for each focus stock via Groww LTP (or
+     hardcoded seed prices if Groww is unavailable).
   2. Running a random-walk simulation that produces tick-like dicts every second,
      constrained within a ±2% intraday range from the open price.
   3. Pushing those ticks through the same `_on_ticks` callback used by the real
-     KiteTicker, so the Scanner pipeline is identical in both modes.
+     GrowwFeed, so the Scanner pipeline is identical in both modes.
 
 The simulation honours:
   - Market hours: 09:15–15:30 IST (Mon–Fri)
@@ -36,7 +36,7 @@ MARKET_OPEN = dtime(9, 15)
 MARKET_CLOSE = dtime(15, 30)
 TICK_INTERVAL_SECONDS = 1.0
 
-# Seed prices used when Kite LTP is unavailable (approximate CMP for paper mode)
+# Seed prices used when Groww LTP is unavailable (approximate CMP for paper mode)
 SEED_PRICES: Dict[str, float] = {
     "RELIANCE":    2950.0,
     "HDFCBANK":    1620.0,
@@ -77,14 +77,14 @@ class MockTickGenerator:
         self._open_prices: Dict[str, float] = {}  # session open price — price bound pivot
         self._day_high: Dict[str, float] = {}   # running session high per symbol
         self._day_low: Dict[str, float] = {}    # running session low per symbol
-        self._cum_volume: Dict[str, int] = {}   # cumulative volume per symbol (like real Kite)
+        self._cum_volume: Dict[str, int] = {}   # cumulative volume per symbol
 
     def _is_market_open(self) -> bool:
         now = datetime.now(IST).time()
         return MARKET_OPEN <= now <= MARKET_CLOSE
 
     def _seed_prices(self) -> None:
-        """Initialise starting prices from Kite LTP or hardcoded seeds."""
+        """Initialise starting prices from Groww LTP or hardcoded seeds."""
         for symbol in get_instrument_map().keys():
             if symbol not in self._prices:
                 seed = SEED_PRICES.get(symbol, 1000.0)
@@ -96,14 +96,14 @@ class MockTickGenerator:
                 self._day_low[symbol] = seed
                 self._cum_volume[symbol] = 0
 
-    async def _try_seed_from_kite(self) -> None:
-        """Optionally seed prices from live Kite LTP (best-effort)."""
+    async def _try_seed_from_groww(self) -> None:
+        """Optionally seed prices from live Groww LTP (best-effort)."""
         try:
-            from integrations.kite_client import get_kite_client  # lazy
-            kite_client = get_kite_client()
+            from integrations.groww_client import get_groww_client  # lazy
+            groww_client = get_groww_client()
             symbols = list(get_instrument_map().keys())
             instruments = [f"NSE:{sym}" for sym in symbols]
-            ltp_data = await kite_client.get_ltp(instruments)
+            ltp_data = await groww_client.get_ltp(instruments)
             for sym in symbols:
                 key = f"NSE:{sym}"
                 if key in ltp_data and ltp_data[key].get("last_price"):
@@ -162,10 +162,15 @@ class MockTickGenerator:
 
         token = get_instrument_map().get(symbol, 0)
 
+        # GrowwFeed tick format: {ltp, tsInMillis} + supplemental ohlc/volume fields
+        # for paper mode we include ohlc/volume so TickDataStore._ohlc_cache is seeded.
         return {
             "instrument_token": token,
-            "exchange_timestamp": now_ist,
+            "exchange_token": token,
+            "tradingsymbol": symbol,
+            "ltp": new_price,
             "last_price": new_price,
+            "tsInMillis": int(now_ist.timestamp() * 1000),
             "volume_traded": self._cum_volume[symbol],
             "ohlc": {
                 "open": open_price,
@@ -178,7 +183,7 @@ class MockTickGenerator:
     async def run(self) -> None:
         """Main loop: emit ticks every second during market hours."""
         self._seed_prices()
-        await self._try_seed_from_kite()
+        await self._try_seed_from_groww()
 
         self._running = True
         logger.info("[MockTick] Paper trading tick generator started — %d symbols",
@@ -194,7 +199,7 @@ class MockTickGenerator:
             for symbol in list(get_instrument_map().keys()):
                 ticks.append(self._next_tick(symbol))
 
-            # Drive the Scanner's tick callback directly (same interface as KiteTicker)
+            # Drive the Scanner's tick callback directly (same interface as GrowwFeed)
             try:
                 self._on_ticks(ws=None, ticks=ticks)
             except Exception as exc:

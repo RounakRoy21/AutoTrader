@@ -2,9 +2,20 @@
 Market data integrations for the Research Agent.
 
 Sources:
-  - Alpha Vantage  : US market close (S&P 500, NASDAQ), Dollar Index (DXY)
-  - Yahoo Finance  : Nifty 50 previous-session close (^NSEI), India VIX (^INDIAVIX),
+  - Alpha Vantage  : US market close (S&P 500, NASDAQ via SPY/QQQ ETFs)
+  - Yahoo Finance  : Dollar Index (DX-Y.NYB), USD/INR (USDINR=X),
+                     Nifty 50 previous-session close (^NSEI), India VIX (^INDIAVIX),
                      WTI crude oil futures (CL=F), gold futures (GC=F)
+
+DXY source rationale
+--------------------
+The previous implementation used Alpha Vantage EUR/USD (FX_DAILY) as a DXY proxy.
+EUR is only 57.6 % of the ICE Dollar Index basket.  On days when JPY (13.6 %),
+GBP (11.9 %), or CAD (9.1 %) move sharply — BoJ interventions, UK budget days,
+Bank of Canada meetings — the EUR/USD trend diverges from true DXY direction.
+Yahoo Finance publishes the actual ICE DXY futures contract as DX-Y.NYB using
+the same unofficial endpoint pattern we use for crude oil and gold.  The
+EUR/USD proxy is retained as a fallback only.
 
 All functions are async and share a single module-level httpx.AsyncClient.
 """
@@ -84,12 +95,61 @@ async def fetch_us_market_close() -> Dict[str, Any]:
 
 async def fetch_dxy() -> Dict[str, Any]:
     """
-    Fetch Dollar Index (DXY) current value and 5-day trend.
-    Returns dict with value, trend, change_5d.
+    Fetch the ICE US Dollar Index (DXY) value and 5-day trend.
+
+    Primary source: Yahoo Finance DX-Y.NYB — the actual ICE DXY futures contract.
+    Covers the full basket: EUR 57.6%, JPY 13.6%, GBP 11.9%, CAD 9.1%,
+    SEK 4.2%, CHF 3.6%.  Value is in the familiar ~95–110 range.
+
+    Fallback: Alpha Vantage EUR/USD (FX_DAILY).  Directionally correct ~85% of
+    the time but misses JPY/GBP/CAD-driven moves.  Value in this path is the
+    raw USD/EUR rate (~0.90–0.95), still usable for trend direction only.
+
+    Returns dict with value, trend (STRENGTHENING/WEAKENING/FLAT), change_5d.
     """
-    data = await _query("FX_DAILY", "USD", to_currency="EUR", outputsize="compact")
     result: Dict[str, Any] = {"value": 0.0, "trend": "FLAT", "change_5d": 0.0}
 
+    # ── Primary: Yahoo Finance DX-Y.NYB (real ICE DXY futures) ───────────────
+    try:
+        client = _get_http_client()
+        resp = await client.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB",
+            params={"interval": "1d", "range": "7d"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json",
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        chart_result = data["chart"]["result"][0]
+        meta = chart_result["meta"]
+        closes = chart_result.get("indicators", {}).get("quote", [{}])[0].get("close", [])
+        # Filter out None values that appear for non-trading days
+        closes = [c for c in closes if c is not None]
+
+        current = float(meta.get("regularMarketPrice") or 0.0)
+        if current > 0 and len(closes) >= 2:
+            oldest = closes[0]
+            change = ((current - oldest) / oldest) * 100
+            result["value"] = round(current, 3)
+            result["change_5d"] = round(change, 3)
+            if change > 0.5:
+                result["trend"] = "STRENGTHENING"
+            elif change < -0.5:
+                result["trend"] = "WEAKENING"
+            logger.info(
+                "DXY (ICE DX-Y.NYB): %.3f  5d_chg=%.3f%%  trend=%s",
+                current, change, result["trend"],
+            )
+            return result
+    except Exception as exc:
+        logger.warning("Yahoo Finance DX-Y.NYB failed (%s) — falling back to EUR/USD proxy", exc)
+
+    # ── Fallback: Alpha Vantage EUR/USD ───────────────────────────────────────
+    # EUR is 57.6% of DXY so this is directionally correct on most days.
+    # Value returned here is the USD/EUR rate (~0.90–0.95), NOT the DXY level.
+    data = await _query("FX_DAILY", "USD", to_currency="EUR", outputsize="compact")
     if data and "Time Series FX (Daily)" in data:
         ts = data["Time Series FX (Daily)"]
         dates = sorted(ts.keys(), reverse=True)[:5]
@@ -97,29 +157,139 @@ async def fetch_dxy() -> Dict[str, Any]:
             latest = float(ts[dates[0]]["4. close"])
             oldest = float(ts[dates[-1]]["4. close"])
             change = ((latest - oldest) / oldest) * 100
-            result["value"] = latest
+            result["value"] = latest        # USD/EUR rate, not DXY level
             result["change_5d"] = round(change, 3)
             if change > 0.5:
                 result["trend"] = "STRENGTHENING"
             elif change < -0.5:
                 result["trend"] = "WEAKENING"
+            logger.warning(
+                "DXY fallback (EUR/USD proxy): %.4f  5d_chg=%.3f%%  trend=%s",
+                latest, change, result["trend"],
+            )
 
-    logger.info("DXY data: %s", result)
+    return result
+
+
+async def fetch_usdinr() -> Dict[str, Any]:
+    """
+    Fetch USD/INR exchange rate from Yahoo Finance (USDINR=X).
+
+    USD/INR is the most India-specific USD signal:
+      - Rising USD/INR (INR weakening) → higher import costs, FII outflows → bearish Nifty
+      - Falling USD/INR (INR strengthening) → FII inflows, RBI comfortable → mildly bullish
+
+    Returns dict with:
+        value (float)         — current USD/INR spot rate (e.g. 84.5)
+        change_pct (float)    — overnight % change vs previous close
+        trend (str)           — INR_WEAKENING | INR_STRENGTHENING | STABLE
+        available (bool)      — False if fetch failed
+    """
+    result: Dict[str, Any] = {
+        "value": 0.0,
+        "change_pct": 0.0,
+        "trend": "STABLE",
+        "available": False,
+    }
+    try:
+        client = _get_http_client()
+        resp = await client.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/USDINR%3DX",
+            params={"interval": "1d", "range": "2d"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json",
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        meta = data["chart"]["result"][0]["meta"]
+        price = float(meta.get("regularMarketPrice") or 0.0)
+        prev_close = float(
+            meta.get("previousClose") or meta.get("chartPreviousClose") or 0.0
+        )
+        if price > 0 and prev_close > 0:
+            change_pct = round(((price - prev_close) / prev_close) * 100, 3)
+            result["value"] = round(price, 4)
+            result["change_pct"] = change_pct
+            result["available"] = True
+            # INR weakens when USD/INR rises (more rupees per dollar)
+            if change_pct > 0.15:
+                result["trend"] = "INR_WEAKENING"
+            elif change_pct < -0.15:
+                result["trend"] = "INR_STRENGTHENING"
+            logger.info(
+                "USD/INR: %.4f  chg=%.3f%%  trend=%s",
+                price, change_pct, result["trend"],
+            )
+    except Exception as exc:
+        logger.warning("Yahoo Finance USD/INR fetch failed: %s", exc)
     return result
 
 
 async def fetch_sgx_nifty() -> Dict[str, Any]:
     """
-    Fetch Nifty 50 previous-session close from Yahoo Finance (^NSEI) as a
-    directional proxy for the overnight gap.
+    Estimate the Nifty 50 opening gap direction using overnight S&P 500 futures.
 
-    At 6 AM IST this reflects yesterday's close vs previous close, which
-    provides the baseline.  GIFT Nifty live pre-market futures are not
-    available on any free API; this is the best freely available substitute.
+    WHY ES=F INSTEAD OF ^NSEI
+    -------------------------
+    At 6 AM IST, Yahoo Finance's ^NSEI returns yesterday's 3:30 PM closing price
+    vs the day before — a 16-hour-old data point that is fully priced in.  It
+    tells us nothing about what happened overnight.
 
-    Falls back to {value: 0, change_pct: 0, signal: FLAT} on any failure.
+    S&P 500 futures (ES=F) trade virtually 24/7 and at 6 AM IST reflect:
+      - The US close at 4 PM ET (1:30 AM IST)
+      - Any post-close developments
+      - Asian session early risk sentiment (Nikkei, KOSPI open at 5:30 AM IST)
+
+    Nifty 50 has a historical beta of ~0.65 to the S&P 500.  The overnight
+    ES=F % change × 0.65 is the best freely available synthetic Nifty gap
+    estimate and is what Indian institutional desks actually use.
+
+    Returns the same schema as before (value, change_pct, signal) for backward
+    compatibility with the database and LLM prompt.
     """
-    result: Dict[str, Any] = {"value": 0.0, "change_pct": 0.0, "signal": "FLAT"}
+    result: Dict[str, Any] = {"value": 0.0, "change_pct": 0.0, "signal": "FLAT", "source": "fallback"}
+
+    # ── Primary: S&P 500 futures (ES=F) ──────────────────────────────────────
+    try:
+        client = _get_http_client()
+        resp = await client.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/ES%3DF",
+            params={"interval": "1d", "range": "2d"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json",
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        meta = data["chart"]["result"][0]["meta"]
+        price = float(meta.get("regularMarketPrice") or 0.0)
+        prev_close = float(
+            meta.get("previousClose") or meta.get("chartPreviousClose") or 0.0
+        )
+        if price > 0 and prev_close > 0:
+            es_change_pct = round(((price - prev_close) / prev_close) * 100, 3)
+            # Apply Nifty/SPX beta (~0.65) to estimate Nifty gap
+            nifty_est_pct = round(es_change_pct * 0.65, 3)
+            result["value"] = price
+            result["change_pct"] = nifty_est_pct
+            result["es_change_pct"] = es_change_pct   # raw futures change for context
+            result["source"] = "es_futures"
+            if nifty_est_pct > 0.2:
+                result["signal"] = "GAP_UP"
+            elif nifty_est_pct < -0.2:
+                result["signal"] = "GAP_DOWN"
+            logger.info(
+                "Nifty gap estimate via ES=F: ES %.2f chg=%.3f%% → Nifty est=%.3f%% signal=%s",
+                price, es_change_pct, nifty_est_pct, result["signal"],
+            )
+            return result
+    except Exception as exc:
+        logger.warning("ES=F futures fetch failed (%s) — falling back to ^NSEI close", exc)
+
+    # ── Fallback: previous Nifty close (stale but better than nothing) ────────
     try:
         client = _get_http_client()
         resp = await client.get(
@@ -141,16 +311,76 @@ async def fetch_sgx_nifty() -> Dict[str, Any]:
             change_pct = round(((price - prev_close) / prev_close) * 100, 3)
             result["value"] = price
             result["change_pct"] = change_pct
+            result["source"] = "nsei_close"
             if change_pct > 0.2:
                 result["signal"] = "GAP_UP"
             elif change_pct < -0.2:
                 result["signal"] = "GAP_DOWN"
-            logger.info(
-                "Nifty50 via Yahoo Finance: close=%.2f change=%.3f%% signal=%s",
+            logger.warning(
+                "Nifty gap fallback (^NSEI close — stale): %.2f chg=%.3f%% signal=%s",
                 price, change_pct, result["signal"],
             )
     except Exception as exc:
-        logger.warning("Yahoo Finance Nifty50 fetch failed: %s — using FLAT", exc)
+        logger.warning("Yahoo Finance ^NSEI fallback also failed: %s — using FLAT", exc)
+    return result
+
+
+async def fetch_nikkei() -> Dict[str, Any]:
+    """
+    Fetch live Nikkei 225 performance from Yahoo Finance (^N225).
+
+    At 6 AM IST, the Tokyo Stock Exchange has been open since 5:30 AM IST.
+    Nikkei is the only major Asian index actually trading when the research
+    agent runs.  Hang Seng and Shanghai open at 7 AM IST (too late).
+
+    Nifty/Nikkei correlation is ~0.5–0.6, lower than Nifty/SPX but still
+    a meaningful independent signal — especially on BoJ policy days or when
+    JPY makes large moves (which also affect DXY).
+
+    Returns dict with:
+        value (float)       — current Nikkei 225 level
+        change_pct (float)  — % change vs previous close
+        signal (str)        — POSITIVE | NEGATIVE | FLAT
+        available (bool)    — False if fetch failed
+    """
+    result: Dict[str, Any] = {
+        "value": 0.0,
+        "change_pct": 0.0,
+        "signal": "FLAT",
+        "available": False,
+    }
+    try:
+        client = _get_http_client()
+        resp = await client.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/%5EN225",
+            params={"interval": "1d", "range": "2d"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json",
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        meta = data["chart"]["result"][0]["meta"]
+        price = float(meta.get("regularMarketPrice") or 0.0)
+        prev_close = float(
+            meta.get("previousClose") or meta.get("chartPreviousClose") or 0.0
+        )
+        if price > 0 and prev_close > 0:
+            change_pct = round(((price - prev_close) / prev_close) * 100, 3)
+            result["value"] = round(price, 2)
+            result["change_pct"] = change_pct
+            result["available"] = True
+            if change_pct > 0.3:
+                result["signal"] = "POSITIVE"
+            elif change_pct < -0.3:
+                result["signal"] = "NEGATIVE"
+            logger.info(
+                "Nikkei 225: %.2f  chg=%.3f%%  signal=%s",
+                price, change_pct, result["signal"],
+            )
+    except Exception as exc:
+        logger.warning("Yahoo Finance Nikkei fetch failed: %s", exc)
     return result
 
 
