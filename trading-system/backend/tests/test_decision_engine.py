@@ -9,15 +9,25 @@ import asyncio
 from datetime import date, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytz
 import pytest
 
 from agents.decision_engine import DecisionEngine
 from schemas.decision import Decision, DecisionOutput, ProductType, SignalAudit
 from schemas.market_brief import (
+    MarketBias,
     MarketBriefLLMOutput,
     RecommendedStance,
 )
 from schemas.trade import ScannerSignal
+
+# Real IST datetimes used to pin market-hours gate in pre-check tests.
+# Using concrete datetime objects (not MagicMock) ensures .weekday(),
+# .replace(), and comparison operators work correctly in _pre_check.
+_IST         = pytz.timezone("Asia/Kolkata")
+_MARKET_DT   = _IST.localize(datetime(2026, 4, 29, 10, 30, 0))   # Tuesday 10:30
+_MONDAY_DT   = _IST.localize(datetime(2026, 4, 27, 10, 30, 0))   # Monday  10:30
+_FRIDAY_PM_DT = _IST.localize(datetime(2026, 5, 1, 14, 30, 0))   # Friday  14:30
 
 
 def _audit(**overrides) -> SignalAudit:
@@ -92,7 +102,9 @@ class TestValidateDecision:
             signal_audit=_audit(),
         )
         result = engine._validate_decision(signal, decision)
-        assert result.stop_loss_price == 2450.0    # unchanged
+        # _validate_decision always recomputes SL from signal.ltp regardless of what
+        # the LLM returned; the "wider" SL is replaced by the ATR/%-derived minimum.
+        assert result.stop_loss_price == round(2500.0 * (1 - 0.008), 2)  # 2480.0
 
     # ── Target clamping ────────────────────────────────────────────────
 
@@ -135,7 +147,9 @@ class TestValidateDecision:
             signal_audit=_audit(),
         )
         result = engine._validate_decision(signal, decision)
-        assert result.target_price == 2600.0
+        # _validate_decision always recomputes target from signal.ltp; the generous
+        # target is replaced by the ATR/%-derived value.
+        assert result.target_price == round(2500.0 * (1 + 0.016), 2)  # 2540.0
 
     # ── Quantity clamping ──────────────────────────────────────────────
 
@@ -150,7 +164,7 @@ class TestValidateDecision:
             signal_audit=_audit(),
         )
         result = engine._validate_decision(signal, decision)
-        assert result.adjusted_qty == 1
+        assert result.adjusted_qty == 100  # clamped to signal.suggested_qty, not literal 1
 
     def test_qty_exceeds_suggested_capped(self, engine, signal):
         decision = DecisionOutput(
@@ -232,17 +246,22 @@ class TestPreCheck:
     """Pre-flight checks before LLM call."""
 
     @pytest.mark.asyncio
+    @patch("agents.decision_engine.datetime")
     @patch("agents.decision_engine.get_value")
-    async def test_halt_rejects(self, mock_get_value, engine, signal):
+    async def test_halt_rejects(self, mock_get_value, mock_dt, engine, signal):
+        mock_dt.now.return_value = _MARKET_DT
         mock_get_value.return_value = "TRUE"
         passed, reason, _ = await engine._pre_check(signal)
         assert not passed
         assert "halted" in reason.lower()
 
     @pytest.mark.asyncio
+    @patch("agents.decision_engine.datetime")
     @patch("agents.decision_engine.get_value", return_value=None)
-    async def test_avoid_list_rejects(self, mock_get_value, engine, signal):
+    async def test_avoid_list_rejects(self, mock_get_value, mock_dt, engine, signal):
+        mock_dt.now.return_value = _MARKET_DT
         brief = MagicMock(spec=MarketBriefLLMOutput)
+        brief.market_bias = MarketBias.NEUTRAL
         brief.recommended_stance = RecommendedStance.FULL_SIZE_POSITIONS
         brief.avoid_today = ["RELIANCE"]
         brief.watchlist_today = []
@@ -254,9 +273,12 @@ class TestPreCheck:
         assert "avoid" in reason.lower()
 
     @pytest.mark.asyncio
+    @patch("agents.decision_engine.datetime")
     @patch("agents.decision_engine.get_value", return_value=None)
-    async def test_watchlist_filter(self, mock_get_value, engine, signal):
+    async def test_watchlist_filter(self, mock_get_value, mock_dt, engine, signal):
+        mock_dt.now.return_value = _MARKET_DT
         brief = MagicMock(spec=MarketBriefLLMOutput)
+        brief.market_bias = MarketBias.NEUTRAL
         brief.recommended_stance = RecommendedStance.FULL_SIZE_POSITIONS
         brief.avoid_today = []
         brief.watchlist_today = ["HDFCBANK", "TCS"]   # RELIANCE not included
@@ -268,8 +290,10 @@ class TestPreCheck:
         assert "watchlist" in reason.lower()
 
     @pytest.mark.asyncio
+    @patch("agents.decision_engine.datetime")
     @patch("agents.decision_engine.get_value", return_value=None)
-    async def test_avoid_trading_stance_rejects(self, mock_get_value, engine, signal):
+    async def test_avoid_trading_stance_rejects(self, mock_get_value, mock_dt, engine, signal):
+        mock_dt.now.return_value = _MARKET_DT
         brief = MagicMock(spec=MarketBriefLLMOutput)
         brief.recommended_stance = RecommendedStance.AVOID_TRADING
         engine._market_brief = brief
@@ -280,9 +304,12 @@ class TestPreCheck:
         assert "avoid" in reason.lower()
 
     @pytest.mark.asyncio
+    @patch("agents.decision_engine.datetime")
     @patch("agents.decision_engine.get_value", return_value=None)
-    async def test_half_size_stance_halves_qty(self, mock_get_value, engine, signal):
+    async def test_half_size_stance_halves_qty(self, mock_get_value, mock_dt, engine, signal):
+        mock_dt.now.return_value = _MARKET_DT
         brief = MagicMock(spec=MarketBriefLLMOutput)
+        brief.market_bias = MarketBias.NEUTRAL
         brief.recommended_stance = RecommendedStance.HALF_SIZE_POSITIONS
         brief.avoid_today = []
         brief.watchlist_today = ["RELIANCE"]
@@ -295,8 +322,10 @@ class TestPreCheck:
             assert modified.suggested_qty == 50   # 100 // 2
 
     @pytest.mark.asyncio
+    @patch("agents.decision_engine.datetime")
     @patch("agents.decision_engine.get_value", return_value=None)
-    async def test_max_positions_rejects(self, mock_get_value, engine, signal):
+    async def test_max_positions_rejects(self, mock_get_value, mock_dt, engine, signal):
+        mock_dt.now.return_value = _MARKET_DT
         engine._market_brief = None
         engine._count_open_positions = AsyncMock(return_value=3)
 
@@ -305,8 +334,11 @@ class TestPreCheck:
         assert "max open positions" in reason.lower()
 
     @pytest.mark.asyncio
+    @patch("agents.decision_engine.datetime")
     @patch("agents.decision_engine.get_value")
-    async def test_max_daily_trades_rejects(self, mock_get_value, engine, signal):
+    async def test_max_daily_trades_rejects(self, mock_get_value, mock_dt, engine, signal):
+        mock_dt.now.return_value = _MARKET_DT
+
         async def side_effect(key):
             if key == "trading_halt":
                 return None
@@ -324,8 +356,10 @@ class TestPreCheck:
             assert "max daily trades" in reason.lower()
 
     @pytest.mark.asyncio
+    @patch("agents.decision_engine.datetime")
     @patch("agents.decision_engine.get_value", return_value=None)
-    async def test_duplicate_position_rejects(self, mock_get_value, engine, signal):
+    async def test_duplicate_position_rejects(self, mock_get_value, mock_dt, engine, signal):
+        mock_dt.now.return_value = _MARKET_DT
         engine._market_brief = None
         engine._count_open_positions = AsyncMock(return_value=1)
 
@@ -336,9 +370,11 @@ class TestPreCheck:
             assert "already open" in reason.lower()
 
     @pytest.mark.asyncio
+    @patch("agents.decision_engine.datetime")
     @patch("agents.decision_engine.get_value", return_value=None)
-    async def test_no_brief_skips_stance_and_watchlist(self, mock_get_value, engine, signal):
+    async def test_no_brief_skips_stance_and_watchlist(self, mock_get_value, mock_dt, engine, signal):
         """Without a market brief, stance/watchlist checks should be skipped."""
+        mock_dt.now.return_value = _MARKET_DT
         engine._market_brief = None
         engine._count_open_positions = AsyncMock(return_value=0)
 
@@ -351,12 +387,7 @@ class TestPreCheck:
     @patch("agents.decision_engine.datetime")
     async def test_monday_half_size(self, mock_dt, mock_get_value, engine, signal):
         """Monday rule should halve quantity independently of stance."""
-        # Make it Monday
-        mock_now = MagicMock()
-        mock_now.strftime.return_value = "Monday"
-        mock_now.hour = 10
-        mock_now.minute = 30
-        mock_dt.now.return_value = mock_now
+        mock_dt.now.return_value = _MONDAY_DT
 
         engine._market_brief = None
         engine._count_open_positions = AsyncMock(return_value=0)
@@ -371,12 +402,8 @@ class TestPreCheck:
     @patch("agents.decision_engine.datetime")
     async def test_friday_afternoon_rejects(self, mock_dt, mock_get_value, engine, signal):
         """No new entries on Friday after 2 PM."""
-        mock_now = MagicMock()
-        mock_now.strftime.return_value = "Friday"
-        mock_now.hour = 14
-        mock_now.minute = 30
-        mock_dt.now.return_value = mock_now
-
+        mock_dt.now.return_value = _FRIDAY_PM_DT
+        engine._settings.paper_extended_hours = False  # ensure Friday PM gate is active
         engine._market_brief = None
         engine._count_open_positions = AsyncMock(return_value=0)
 
@@ -440,8 +467,11 @@ class TestAtrDecision:
 class TestProtectionPreChecks:
 
     @pytest.mark.asyncio
+    @patch("agents.decision_engine.datetime")
     @patch("agents.decision_engine.get_value")
-    async def test_stock_lock_rejects(self, mock_get_value, engine, signal):
+    async def test_stock_lock_rejects(self, mock_get_value, mock_dt, engine, signal):
+        mock_dt.now.return_value = _MARKET_DT
+
         async def side_effect(key):
             if key == "trading_halt":
                 return None
@@ -455,16 +485,21 @@ class TestProtectionPreChecks:
         assert "locked" in reason.lower()
 
     @pytest.mark.asyncio
+    @patch("agents.decision_engine.datetime")
     @patch("agents.decision_engine.set_value", new_callable=AsyncMock)
     @patch("agents.decision_engine.get_value")
     async def test_consecutive_loss_pause_rejects(
-        self, mock_get_value, mock_set_value, engine, signal
+        self, mock_get_value, mock_set_value, mock_dt, engine, signal
     ):
-        import pytz
-        from datetime import timedelta
+        mock_dt.now.return_value = _MARKET_DT
 
-        IST = pytz.timezone("Asia/Kolkata")
-        future = (datetime.now(IST) + timedelta(minutes=15)).isoformat()
+        from datetime import datetime as _real_dt, timedelta
+
+        # Delegate fromisoformat to real impl so datetime arithmetic works inside _pre_check.
+        mock_dt.fromisoformat.side_effect = _real_dt.fromisoformat
+
+        # future is relative to _MARKET_DT so the pause is still active at mock time
+        future = (_MARKET_DT + timedelta(minutes=15)).isoformat()
 
         async def side_effect(key):
             if key == "trading_halt":
@@ -498,13 +533,10 @@ class TestSizeReductionStacking:
         self, mock_dt, mock_get_value, engine, signal
     ):
         """On Monday with HALF_SIZE stance, qty should be halved ONCE, not quartered."""
-        mock_now = MagicMock()
-        mock_now.strftime.return_value = "Monday"
-        mock_now.hour = 10
-        mock_now.minute = 30
-        mock_dt.now.return_value = mock_now
+        mock_dt.now.return_value = _MONDAY_DT
 
         brief = MagicMock(spec=MarketBriefLLMOutput)
+        brief.market_bias = MarketBias.NEUTRAL
         brief.recommended_stance = RecommendedStance.HALF_SIZE_POSITIONS
         brief.avoid_today = []
         brief.watchlist_today = ["RELIANCE"]
@@ -524,13 +556,10 @@ class TestSizeReductionStacking:
         self, mock_dt, mock_get_value, engine, signal
     ):
         """On non-Monday with HALF_SIZE stance, qty should still be halved."""
-        mock_now = MagicMock()
-        mock_now.strftime.return_value = "Tuesday"
-        mock_now.hour = 10
-        mock_now.minute = 30
-        mock_dt.now.return_value = mock_now
+        mock_dt.now.return_value = _MARKET_DT  # Tuesday
 
         brief = MagicMock(spec=MarketBriefLLMOutput)
+        brief.market_bias = MarketBias.NEUTRAL
         brief.recommended_stance = RecommendedStance.HALF_SIZE_POSITIONS
         brief.avoid_today = []
         brief.watchlist_today = ["RELIANCE"]

@@ -337,6 +337,34 @@ class DecisionEngine:
                 size_reduced = True
                 logger.info("Half-size stance: reduced quantity to %d", signal.suggested_qty)
 
+            # MEDIUM-urgency stock-specific news → halve quantity as a precaution.
+            # HIGH-urgency flags are already forwarded to the LLM brief; MEDIUM flags
+            # are not, but they still represent meaningful event risk for the specific
+            # stock being evaluated (e.g. post-earnings drift, analyst downgrades).
+            if not size_reduced:
+                medium_flags = [
+                    f for f in self._market_brief.news_flags
+                    if f.stock == signal.stock and f.urgency == NewsUrgency.MEDIUM
+                ]
+                if medium_flags:
+                    signal = signal.model_copy(
+                        update={"suggested_qty": max(1, signal.suggested_qty // 2)}
+                    )
+                    size_reduced = True
+                    headline = medium_flags[0].headline or "no headline"
+                    logger.info(
+                        "MEDIUM news flag for %s — halving qty to %d: %s",
+                        signal.stock, signal.suggested_qty, headline,
+                    )
+                    await publish("system_alerts", {
+                        "type": "warning",
+                        "message": (
+                            f"Qty halved for {signal.stock}: MEDIUM-urgency news active "
+                            f"— \"{headline}\""
+                        ),
+                        "timestamp": datetime.now(IST).isoformat(),
+                    })
+
         # Check max open positions (authoritative DB query — not an in-memory counter)
         open_count = await self._count_open_positions()
         if open_count >= self._settings.max_open_positions:
@@ -745,6 +773,24 @@ class DecisionEngine:
         })
         await self._push_feed_entry(signal, stage="LLM", decision=decision.decision.value,
                                     rationale=decision.rationale, dec=decision)
+
+        # Warn when EMA/MACD indicators are absent — candle history too short for
+        # trend confirmation.  This typically happens after a mid-session restart.
+        if signal.ema_9 is None and signal.ema_21 is None and signal.macd_histogram is None:
+            logger.warning(
+                "Indicator gap: %s approved without EMA/MACD (insufficient candle history)",
+                signal.stock,
+            )
+            await publish("system_alerts", {
+                "type": "warning",
+                "message": (
+                    f"Trade approved for {signal.stock} without EMA/MACD confirmation "
+                    f"(candle history too short — EMA requires 21+ candles, MACD requires 26+). "
+                    f"Lower-confidence signal."
+                ),
+                "timestamp": datetime.now(IST).isoformat(),
+            })
+
         return decision
 
     async def _push_feed_entry(

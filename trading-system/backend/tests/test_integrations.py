@@ -47,10 +47,11 @@ class TestGrowwClientDeleteGtt:
 
         client = GrowwClient()
         mock_broker = MagicMock()
-        mock_broker.delete_gtt = MagicMock(return_value=None)
+        mock_broker.cancel_order = MagicMock(return_value=None)
 
-        with patch.object(client, "_settings") as mock_settings, \
-             patch.object(client, "get_kite", new=AsyncMock(return_value=mock_broker)):
+        with patch("integrations.groww_client.get_value", new=AsyncMock(return_value="real-order-id")), \
+             patch.object(client, "_settings") as mock_settings, \
+             patch.object(client, "get_groww", new=AsyncMock(return_value=mock_broker)):
             mock_settings.paper_trading = False
             with patch("asyncio.to_thread", new=AsyncMock(return_value=None)):
                 await client.delete_gtt(trigger_id=99999)
