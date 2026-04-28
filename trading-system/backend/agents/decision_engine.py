@@ -25,7 +25,7 @@ from core.redis_keys import DAILY_TRADE_COUNT_KEY, DECISION_FEED_KEY, HALT_KEY
 from integrations.anthropic_client import get_anthropic_client
 from models.trade import Trade
 from schemas.decision import Decision, DecisionOutput, SignalAudit
-from schemas.market_brief import MarketBriefLLMOutput, RecommendedStance
+from schemas.market_brief import MarketBias, MarketBriefLLMOutput, RecommendedStance
 from schemas.trade import ScannerSignal
 
 logger = logging.getLogger(__name__)
@@ -303,6 +303,10 @@ class DecisionEngine:
             stance = self._market_brief.recommended_stance
             if stance == RecommendedStance.AVOID_TRADING:
                 return False, "Market brief recommends avoiding trading today", signal
+
+            # Bearish market + long-only system = hard reject before LLM call
+            if self._market_brief.market_bias == MarketBias.BEARISH:
+                return False, "Bearish market bias — no long entries", signal
 
             watchlist = self._market_brief.watchlist_today
             avoid = self._market_brief.avoid_today

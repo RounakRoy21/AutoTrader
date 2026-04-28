@@ -56,6 +56,7 @@ An automated NSE intraday equity trading system. Streams live tick data from Gro
                              │  Live P&L              │
                              │  Open Positions        │
                              │  Trade Log             │
+                             │  Decision Feed         │
                              │  System Alerts         │
                              └────────────────────────┘
 ```
@@ -65,7 +66,7 @@ An automated NSE intraday equity trading system. Streams live tick data from Gro
 ## Features
 
 **Signal Generation (Scanner)**
-- Real-time OHLCV candle building from GrowwFeed WebSocket ticks (1-min and 5-min)
+- Real-time candle building from GrowwFeed WebSocket ticks (1-min and 5-min). GrowwFeed delivers LTP + timestamp only — volume and OHLC are supplemented via periodic Groww REST polling in the scanner
 - VWAP, RSI(14), Volume Ratio computed on every candle close
 - EMA-9/21 alignment and MACD histogram for trend confirmation
 - ATR-based SL and target sizing
@@ -107,7 +108,8 @@ An automated NSE intraday equity trading system. Streams live tick data from Gro
 
 **API & Dashboard**
 - FastAPI REST + WebSocket backend
-- Angular 17 frontend: live P&L, open positions, trade log, system alerts
+- Angular 17 frontend: live P&L, open positions, trade log, decision feed (real-time LLM decision log), system alerts
+- In-browser Groww TOTP authentication page (`/auth/groww`)
 - TOTP-based Groww authentication (no daily re-login needed)
 
 **Infrastructure**
@@ -174,13 +176,15 @@ trading-system/
 │   ├── models/                     # SQLAlchemy ORM models
 │   ├── schemas/                    # Pydantic schemas (ScannerSignal, DecisionOutput, etc.)
 │   ├── migrations/                 # Alembic migration scripts
-│   ├── tests/                      # pytest test suite (150 tests)
+│   ├── tests/                      # pytest test suite
 │   ├── main.py                     # FastAPI app + lifespan startup
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── frontend/
 │   └── src/app/features/
 │       ├── dashboard/
+│       ├── decision-feed/          # Rolling LLM decision log (EXECUTE/REDUCE/REJECT)
+│       ├── groww-auth/             # In-browser TOTP authentication page
 │       ├── open-positions/
 │       ├── pnl-chart/
 │       ├── system-alerts/
@@ -280,7 +284,7 @@ Verify: `GET http://localhost:8000/api/auth/groww/status` should return `{"authe
 
 | URL | What it is |
 |---|---|
-| http://localhost:4200 | Angular dashboard (live P&L, positions, alerts) |
+| http://localhost:4201 | Angular dashboard (live P&L, positions, alerts, decision feed) |
 | http://localhost:8000/docs | FastAPI interactive API explorer |
 | http://localhost:8000/api/health | Health check (broker status, agent status) |
 
@@ -329,6 +333,7 @@ All configuration lives in `trading-system/.env`. Key variables:
 | `MAX_OPEN_POSITIONS` | Maximum simultaneous open positions | `3` |
 | `MAX_TRADES_PER_DAY` | Hard daily trade count ceiling | `6` |
 | `DAILY_DRAWDOWN_LIMIT_PCT` | % loss that triggers a trading halt | `0.03` |
+| `PAPER_EXTENDED_HOURS` | `true` = bypass market-hours gate for 24/7 pipeline testing | `false` |
 | `GROWW_CLIENT_ID` | Groww account client ID | — |
 | `GROWW_PASSWORD` | Groww account password | — |
 | `GROWW_TOTP_SECRET` | Base32 TOTP secret for 2FA | — |
