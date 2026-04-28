@@ -25,7 +25,7 @@ from core.redis_keys import DAILY_TRADE_COUNT_KEY, DECISION_FEED_KEY, HALT_KEY
 from integrations.anthropic_client import get_anthropic_client
 from models.trade import Trade
 from schemas.decision import Decision, DecisionOutput, SignalAudit
-from schemas.market_brief import MarketBias, MarketBriefLLMOutput, RecommendedStance
+from schemas.market_brief import MarketBias, MarketBriefLLMOutput, NewsUrgency, RecommendedStance
 from schemas.trade import ScannerSignal
 
 logger = logging.getLogger(__name__)
@@ -269,6 +269,20 @@ class DecisionEngine:
         now_ist = datetime.now(IST)
         day_name = now_ist.strftime("%A")
 
+        # ── Market-hours gate (never bypassed, even by paper_extended_hours) ──
+        # The mock tick generator runs 24/7 to keep candle data warm, so signals
+        # arrive at all hours when paper_extended_hours=True.  But there is no
+        # value in paying for LLM calls on signals that will be paper-executed
+        # against stale mock prices at 2 AM.  Gate the LLM strictly to the NSE
+        # cash session: Mon-Fri 09:15–15:30 IST.
+        weekday = now_ist.weekday()  # 0=Mon … 6=Sun
+        if weekday >= 5:  # Saturday or Sunday
+            return False, "Outside market hours (weekend)", signal
+        market_open  = now_ist.replace(hour=9,  minute=15, second=0, microsecond=0)
+        market_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+        if not (market_open <= now_ist <= market_close):
+            return False, "Outside NSE market hours (09:15–15:30 IST)", signal
+
         # Check trading halt
         halt = await get_value(HALT_KEY)
         if halt == "TRUE":
@@ -361,6 +375,26 @@ class DecisionEngine:
         if day_name == "Friday" and now_ist.hour >= 14 and not self._settings.paper_extended_hours:
             return False, "Friday after 2:00 PM — no new entries", signal
 
+        # ── Signal-quality hard rejects (deterministic — no LLM needed) ──────
+        # VWAP check: scanner fires when price > VWAP but doesn't check the *degree*
+        # of deviation.  Hard reject extreme overextension / below-VWAP signals here
+        # so we never pay for an LLM call that _validate_decision() would reject anyway.
+        if signal.vwap and signal.vwap > 0:
+            vwap_dev = (signal.ltp - signal.vwap) / signal.vwap * 100
+            if vwap_dev > VWAP_DEV_HARD_REJECT_PCT:
+                return (
+                    False,
+                    f"{signal.stock} overextended {vwap_dev:.2f}% above VWAP "
+                    f"(hard limit {VWAP_DEV_HARD_REJECT_PCT}%)",
+                    signal,
+                )
+            if vwap_dev < VWAP_DEV_BELOW_HARD_PCT:
+                return (
+                    False,
+                    f"{signal.stock} price {vwap_dev:.2f}% below VWAP — bearish intraday structure",
+                    signal,
+                )
+
         return True, "Pre-checks passed", signal
 
     async def _call_llm(self, signal: ScannerSignal) -> Optional[DecisionOutput]:
@@ -375,7 +409,25 @@ class DecisionEngine:
         # ── Live mode: call Claude ──
         brief_summary = "No market brief available."
         if self._market_brief:
-            brief_summary = json.dumps(self._market_brief.model_dump(), default=str)
+            brief = self._market_brief
+            # Only send decision-relevant fields — sgx_nifty / fii_dii / dxy / us_markets
+            # are already distilled into market_bias by the Research Agent; sending them
+            # again just pads input tokens without adding signal.
+            brief_for_llm: dict = {
+                "market_bias":              brief.market_bias.value,
+                "bias_confidence":          brief.bias_confidence,
+                "recommended_stance":       brief.recommended_stance.value,
+                "earnings_drift_candidates": [
+                    c.model_dump() for c in brief.earnings_drift_candidates
+                ],
+                "high_urgency_news": [
+                    {"type": f.type, "sentiment": f.sentiment.value,
+                     "stock": f.stock, "headline": f.headline}
+                    for f in brief.news_flags
+                    if f.urgency.value == "HIGH"
+                ],
+            }
+            brief_summary = json.dumps(brief_for_llm, default=str)
 
         sl_rule = (
             f"ATR-based: entry − ATR({signal.atr:.2f}) × {self._settings.atr_sl_multiplier}"
@@ -431,11 +483,16 @@ class DecisionEngine:
         )
 
         client = get_anthropic_client()
+        # max_tokens=400: the DecisionOutput JSON schema worst-case is ~275 tokens
+        # (500-char rationale ≈ 125 tokens + full signal_audit ≈ 150 tokens).
+        # The default 4096 was causing Haiku to pad responses with verbose CoT
+        # reasoning before the JSON, which is stripped but still billed.
         return await client.generate_structured(
             system_prompt=DECISION_SYSTEM_PROMPT,
             user_content=user_content,
             response_model=DecisionOutput,
             model=self._settings.anthropic_decision_model,
+            max_tokens=400,
         )
 
     def _validate_decision(
@@ -628,9 +685,11 @@ class DecisionEngine:
         if not passed:
             logger.debug("Signal rejected by pre-check: %s — %s", signal.stock, reason)
             # Only publish to system_alerts when the rejection reason carries actionable
-            # information (risk rules, pauses, avoid-list).  Watchlist-filter misses are
-            # expected and normal — publishing them fills the alerts feed with noise.
-            if "not in today's watchlist" not in reason:
+            # information (risk rules, pauses, avoid-list).  Watchlist-filter misses and
+            # outside-hours rejections are expected and normal — suppress them to avoid
+            # flooding the alerts feed with 24/7 noise during extended-hours testing.
+            _silent_reasons = ("not in today's watchlist", "Outside")
+            if not any(s in reason for s in _silent_reasons):
                 await publish("system_alerts", {
                     "type": "warning",
                     "message": f"Signal skipped ({signal.stock}): {reason}",

@@ -673,6 +673,10 @@ class RiskManager:
                 eod.losing_trades = lost
                 eod.return_pct = return_pct
                 eod.trading_halted = (halt == "TRUE")
+                eod.profit_factor = profit_factor
+                eod.sharpe_ratio = sharpe
+                eod.avg_trade_duration_min = avg_duration
+                eod.max_consecutive_losses = max_consec_losses
                 session.add(eod)
             else:
                 eod = DailyPnl(
@@ -686,6 +690,10 @@ class RiskManager:
                     losing_trades=lost,
                     return_pct=return_pct,
                     trading_halted=(halt == "TRUE"),
+                    profit_factor=profit_factor,
+                    sharpe_ratio=sharpe,
+                    avg_trade_duration_min=avg_duration,
+                    max_consecutive_losses=max_consec_losses,
                 )
                 session.add(eod)
 
