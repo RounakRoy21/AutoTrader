@@ -1,0 +1,73 @@
+<mat-card class="feed-card">
+  <mat-card-header>
+    <mat-card-title>
+      <mat-icon class="title-icon">psychology</mat-icon>
+      Decision Engine Feed
+    </mat-card-title>
+    <mat-card-subtitle *ngIf="lastUpdated">
+      Last updated: {{ lastUpdated | date:'HH:mm:ss' }}
+    </mat-card-subtitle>
+  </mat-card-header>
+
+  <mat-card-content>
+    <div *ngIf="loading" class="loading-state">
+      <mat-spinner diameter="32"></mat-spinner>
+      <span>Loading decisions…</span>
+    </div>
+
+    <div *ngIf="!loading && decisions.length === 0" class="empty-state">
+      <mat-icon>hourglass_empty</mat-icon>
+      <p>No decisions yet today.</p>
+      <p class="hint">Signals are evaluated between 09:15 and 15:15 IST on trading days.</p>
+    </div>
+
+    <div *ngIf="!loading && decisions.length > 0" class="feed-list">
+      <div
+        *ngFor="let d of decisions"
+        class="feed-row"
+        [class]="decisionClass(d)"
+      >
+        <!-- Decision badge -->
+        <div class="badge-col">
+          <span class="decision-badge" [class]="decisionClass(d)">
+            <mat-icon class="badge-icon">{{ decisionIcon(d) }}</mat-icon>
+            {{ d.decision }}
+          </span>
+          <span class="stage-pill" [class.stage-llm]="d.stage === 'LLM'">
+            {{ stageLabel(d) }}
+          </span>
+        </div>
+
+        <!-- Stock + time -->
+        <div class="stock-col">
+          <span class="stock-name">{{ d.stock }}</span>
+          <span class="trade-time">{{ d.ts }}</span>
+        </div>
+
+        <!-- Signal values -->
+        <div class="signal-col">
+          <span class="sig-item" matTooltip="Last Traded Price">₹{{ d.ltp | number:'1.2-2' }}</span>
+          <span class="sig-item" matTooltip="RSI(14)">RSI {{ d.rsi }}</span>
+          <span class="sig-item" matTooltip="Volume ratio vs 20-day avg">Vol {{ d.volume_ratio }}×</span>
+          <span *ngIf="d.confidence != null" class="sig-item conf-score"
+                [matTooltip]="'LLM confidence score (0–100)'">
+            Conf {{ d.confidence }}
+          </span>
+        </div>
+
+        <!-- Trade parameters (EXECUTE/REDUCE only) -->
+        <div class="trade-col" *ngIf="d.qty != null">
+          <span class="param">Qty <strong>{{ d.qty }}</strong></span>
+          <span class="param">SL <strong>₹{{ d.sl | number:'1.2-2' }}</strong></span>
+          <span class="param">TGT <strong>₹{{ d.target | number:'1.2-2' }}</strong></span>
+          <span class="param" *ngIf="rrRatio(d)">R:R <strong>{{ rrRatio(d) }}</strong></span>
+        </div>
+
+        <!-- Rationale -->
+        <div class="rationale-col" [matTooltip]="d.rationale">
+          {{ d.rationale | slice:0:100 }}{{ d.rationale.length > 100 ? '…' : '' }}
+        </div>
+      </div>
+    </div>
+  </mat-card-content>
+</mat-card>

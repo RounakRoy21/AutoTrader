@@ -8,6 +8,7 @@ import { Observable } from 'rxjs';
 import { map } from 'rxjs/operators';
 import {
   ApiResponse,
+  DecisionEntry,
   MarketBrief,
   Trade,
   DailyPnl,
@@ -92,6 +93,15 @@ export class ApiService {
       `${this.baseUrl}/agent/trading/stop`,
       {},
     );
+  }
+
+  getDecisionFeed(limit = 50): Observable<DecisionEntry[]> {
+    return this.http
+      .get<ApiResponse<{ decisions: DecisionEntry[]; count: number }>>(
+        `${this.baseUrl}/agent/decisions`,
+        { params: { limit: limit.toString() } },
+      )
+      .pipe(map((r) => r.data.decisions));
   }
 
   healthCheck(): Observable<HealthCheck> {

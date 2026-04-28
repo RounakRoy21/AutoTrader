@@ -21,10 +21,10 @@ import asyncio
 
 from core.config import get_settings
 from core.redis_client import get_value, set_value
+from core.redis_keys import INSTRUMENT_MAP_KEY, TODAY_WATCHLIST_KEY
 
 logger = logging.getLogger(__name__)
 
-INSTRUMENT_MAP_KEY = "groww_instrument_map"
 INSTRUMENT_MAP_TTL = 24 * 60 * 60  # 24 hours
 
 # NIFTY 50 index exchange_token — Groww value for NSE:NIFTY 50.
@@ -92,8 +92,13 @@ FALLBACK_TOKEN_MAP: Dict[str, int] = {
 
 async def load_instrument_map() -> Dict[str, int]:
     """
-    Load symbol→token map from Redis or Kite API.
-    Returns the map and also writes it to the module-level cache.
+    Load symbol→token map from Redis or Groww API.
+
+    Stock list priority:
+      1. Redis cache (instrument map previously built today) — fastest path.
+      2. TODAY_WATCHLIST_KEY — LLM-chosen stocks from this morning’s Market Brief.
+      3. settings.focus_stocks — static fallback defined in .env / config.
+      4. Hardcoded FALLBACK_TOKEN_MAP — paper/offline mode (all Nifty 50).
     """
     # 1. Try Redis cache
     cached = await get_value(INSTRUMENT_MAP_KEY)
@@ -108,12 +113,28 @@ async def load_instrument_map() -> Dict[str, int]:
         except (json.JSONDecodeError, ValueError) as exc:
             logger.warning("Invalid cached instrument map: %s", exc)
 
-    # 2. Try Groww API
+    # 2. Determine the stock list to subscribe to:
+    #    prefer today’s dynamic watchlist written by the Research Agent.
     settings = get_settings()
+    stock_list = settings.focus_stocks  # static default
+    dynamic_raw = await get_value(TODAY_WATCHLIST_KEY)
+    if dynamic_raw:
+        try:
+            dynamic_list = json.loads(dynamic_raw)
+            if isinstance(dynamic_list, list) and dynamic_list:
+                stock_list = dynamic_list
+                logger.info(
+                    "Using today’s dynamic watchlist for instrument map (%d stocks): %s",
+                    len(stock_list), stock_list,
+                )
+        except Exception as exc:
+            logger.warning("Could not parse TODAY_WATCHLIST_KEY: %s", exc)
+
+    # 3. Try Groww API
     try:
         from integrations.groww_client import get_groww_client  # lazy import
         groww_client = get_groww_client()
-        token_map = await _fetch_from_groww(groww_client, settings.focus_stocks)
+        token_map = await _fetch_from_groww(groww_client, stock_list)
         if token_map:
             await set_value(
                 INSTRUMENT_MAP_KEY,
@@ -128,7 +149,7 @@ async def load_instrument_map() -> Dict[str, int]:
     except Exception as exc:
         logger.warning("Could not fetch instrument map from Groww: %s", exc)
 
-    # 3. Fall back to hardcoded map
+    # 4. Fall back to hardcoded map
     logger.warning(
         "Using hardcoded NIFTY 50 token map (paper/offline mode) — %d symbols",
         len(FALLBACK_TOKEN_MAP),

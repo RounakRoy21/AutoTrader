@@ -197,9 +197,11 @@ class TradingAgent:
             now_ist = datetime.now(IST)
 
             # Market hours guard: belt-and-suspenders (Scanner already filters at 3:15 PM)
-            if (now_ist.hour, now_ist.minute) >= (15, 15):
-                logger.debug("Past 3:15 PM IST — discarding late signal for %s", signal.stock)
-                continue
+            # Bypassed when paper_extended_hours=True so testing can run at any hour.
+            if not self._settings.paper_extended_hours:
+                if (now_ist.hour, now_ist.minute) >= (15, 15):
+                    logger.debug("Past 3:15 PM IST — discarding late signal for %s", signal.stock)
+                    continue
 
             # Track last signal for dashboard visibility
             await set_value("agent:trading:last_signal_stock", signal.stock)
@@ -225,13 +227,13 @@ class TradingAgent:
     async def _execute_trade(self, signal: ScannerSignal, decision: DecisionOutput) -> None:
         """Place the order and record the trade.
 
-        In live mode, verifies the actual fill price from Kite and
+        In live mode, verifies the actual fill price from Groww and
         recalculates SL/target from it so that slippage doesn't skew the
         risk-reward profile.
         """
         settings = self._settings
         now_ist = datetime.now(IST)
-        kite = get_kite_client()
+        groww = get_groww_client()
         fill_price = signal.ltp  # default; overridden by actual fill in live mode
 
         try:
@@ -244,8 +246,8 @@ class TradingAgent:
                 # order anyway, but without this check there is no user notification
                 # and the signal is silently abandoned with no DB record or Telegram alert.
                 try:
-                    kite_quote = await kite.get_quote([f"NSE:{signal.stock}"])
-                    stock_quote = kite_quote.get(f"NSE:{signal.stock}", {})
+                    groww_quote = await groww.get_quote([f"NSE:{signal.stock}"])
+                    stock_quote = groww_quote.get(f"NSE:{signal.stock}", {})
                     upper_circuit = float(stock_quote.get("upper_circuit_limit") or 0)
                     if upper_circuit > 0 and signal.ltp >= upper_circuit * 0.995:
                         logger.warning(
@@ -263,14 +265,14 @@ class TradingAgent:
                         return
                 except Exception as circuit_exc:
                     # Non-fatal: if the quote call fails, log and proceed.
-                    # A real circuit breach will still be caught by Kite's rejection,
+                    # A real circuit breach will still be caught by Groww's rejection,
                     # but at least we attempted the check.
                     logger.warning(
                         "Circuit limit check failed for %s: %s — proceeding with order",
                         signal.stock, circuit_exc,
                     )
 
-                order_id = await kite.place_order(
+                order_id = await groww.place_order(
                     tradingsymbol=signal.stock,
                     transaction_type="BUY",
                     quantity=decision.adjusted_qty,
@@ -287,7 +289,7 @@ class TradingAgent:
                 try:
                     for _attempt in range(3):
                         await asyncio.sleep(0.5)
-                        history = await kite.get_order_history(order_id)
+                        history = await groww.get_order_history(order_id)
                         for entry in reversed(history):
                             if entry.get("status") == "COMPLETE" and entry.get("average_price"):
                                 fill_price = entry["average_price"]
@@ -320,10 +322,10 @@ class TradingAgent:
                         "target_price": new_tgt,
                     })
 
-                # Place GTT stop-loss (server-side at Zerodha)
+                # Place GTT stop-loss (server-side at Groww)
                 gtt_trigger_id = None
                 try:
-                    gtt_resp = await kite.place_gtt(
+                    gtt_resp = await groww.place_gtt(
                         tradingsymbol=signal.stock,
                         exchange="NSE",
                         trigger_type="single",

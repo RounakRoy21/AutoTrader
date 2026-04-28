@@ -17,7 +17,7 @@ import { map, shareReplay } from 'rxjs/operators';
 
 import { StateService } from './core/services/state.service';
 import { TradingWebSocketService, WsConnectionState } from './core/services/trading-websocket.service';
-import { GrowwAuthBannerComponent } from './shared/kite-auth-banner/kite-auth-banner.component';
+import { GrowwAuthBannerComponent } from './shared/groww-auth-banner/groww-auth-banner.component';
 
 @Component({
   selector: 'app-root',

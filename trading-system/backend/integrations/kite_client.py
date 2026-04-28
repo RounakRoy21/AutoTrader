@@ -1,5 +1,8 @@
 """
-Zerodha Kite Connect wrapper.
+DEPRECATED — this file is kept only for backward compatibility.
+All active code uses groww_client.py instead.
+
+Original Zerodha Kite Connect wrapper.
 Centralised interface for order placement, position fetch, and WebSocket ticks.
 All calls include retry logic with exponential backoff and a 60-second
 circuit-breaker that triggers a trading halt if Kite is unreachable.

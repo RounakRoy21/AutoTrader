@@ -10,8 +10,8 @@ Sources used here are all free, require no authentication, have no rate
 limits, and update within 1–3 minutes of publication:
 
     • 5 Indian financial media RSS feeds:
-        Economic Times Markets, Moneycontrol, Livemint,
-        Business Standard, CNBC TV18
+        Economic Times Markets, Hindu BusinessLine Markets,
+        Livemint, Business Standard, Hindu BusinessLine Economy
 
     • Google News RSS per-stock queries (one per watchlist symbol)
 
@@ -70,10 +70,10 @@ GOOGLE_NEWS_BASE = "https://news.google.com/rss/search"
 # Deduplication priority: earlier index wins when two headlines are near-identical.
 _SOURCE_PRIORITY = [
     "economic_times",
-    "moneycontrol",
+    "hindu_businessline",
     "livemint",
     "business_standard",
-    "cnbctv18",
+    "hindu_businessline_economy",
     "google_news",
 ]
 
@@ -95,11 +95,11 @@ class HybridNewsAggregator:
     """Fetches and merges real-time Indian financial news from multiple sources."""
 
     FEEDS: dict[str, str] = {
-        "economic_times":    "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
-        "moneycontrol":      "https://www.moneycontrol.com/rss/latestnews.xml",
-        "livemint":          "https://www.livemint.com/rss/markets",
-        "business_standard": "https://www.business-standard.com/rss/markets-106.rss",
-        "cnbctv18":          "https://www.cnbctv18.com/rss/market.xml",
+        "economic_times":          "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
+        "hindu_businessline":      "https://www.thehindubusinessline.com/markets/?service=rss",
+        "livemint":                "https://www.livemint.com/rss/markets",
+        "business_standard":       "https://www.business-standard.com/rss/markets-106.rss",
+        "hindu_businessline_economy": "https://www.thehindubusinessline.com/economy/?service=rss",
     }
 
     # NIFTY 50 symbol → human-readable Google News search term.

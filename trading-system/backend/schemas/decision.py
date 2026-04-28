@@ -34,37 +34,16 @@ class SignalAudit(BaseModel):
     """
 
     # ── RSI ──────────────────────────────────────────────────────────────────
-    rsi_cited: float = Field(
-        description="The 1-min RSI value from the signal (copied exactly — will be verified)."
-    )
-    rsi_in_range: bool = Field(
-        description=(
-            "True if RSI is inside the valid entry zone for this direction. "
-            "LONG: 40 ≤ RSI ≤ 72.  SHORT: 28 ≤ RSI ≤ 60."
-        )
-    )
+    rsi_cited: float = 0.0          # overwritten by _validate_decision()
+    rsi_in_range: bool = False      # overwritten by _validate_decision()
 
     # ── Volume ───────────────────────────────────────────────────────────────
-    volume_ratio_cited: float = Field(
-        description="Volume ratio from the signal (copied exactly — will be verified)."
-    )
-    volume_confirms: bool = Field(
-        description="True if volume_ratio ≥ 1.5 (minimum threshold for signal validity)."
-    )
+    volume_ratio_cited: float = 0.0  # overwritten by _validate_decision()
+    volume_confirms: bool = False    # overwritten by _validate_decision()
 
     # ── VWAP ─────────────────────────────────────────────────────────────────
-    vwap_deviation_pct: float = Field(
-        description=(
-            "Deviation of price from VWAP as a percentage: "
-            "(price − VWAP) / VWAP × 100.  Positive = price above VWAP."
-        )
-    )
-    price_vwap_valid: bool = Field(
-        description=(
-            "True if the VWAP relationship is correct for this direction. "
-            "LONG: 0 % < deviation ≤ 1.5 %.  SHORT: −1.5 % ≤ deviation < 0 %."
-        )
-    )
+    vwap_deviation_pct: float = 0.0  # overwritten by _validate_decision()
+    price_vwap_valid: bool = False   # overwritten by _validate_decision()
 
     # ── EMA ──────────────────────────────────────────────────────────────────
     ema_aligned: Optional[bool] = Field(
@@ -87,7 +66,8 @@ class SignalAudit(BaseModel):
     )
 
     # ── Risk / Reward ─────────────────────────────────────────────────────────
-    risk_reward_ratio: float = Field(
+    risk_reward_ratio: Optional[float] = Field(
+        None,
         description=(
             "|target − entry| / |entry − stop_loss|.  "
             "Must be ≥ 2.0 (hard minimum for NSE intraday MIS)."
@@ -95,7 +75,10 @@ class SignalAudit(BaseModel):
     )
 
     # ── Overall ───────────────────────────────────────────────────────────────
+    # confidence_score is the only field TRUSTED from the LLM verbatim.
+    # Default 70 (neutral) is used when the LLM omits the field.
     confidence_score: int = Field(
+        default=70,
         ge=0,
         le=100,
         description=(
@@ -118,16 +101,24 @@ class DecisionOutput(BaseModel):
     """
     Exact schema the Decision Engine LLM must return.
     Used for Pydantic validation of Claude's trade decision.
+
+    stop_loss_price / target_price default to 0.0 — _validate_decision() always
+    overwrites them from the raw signal, so omitting them from the LLM response
+    is acceptable.  product_type is always MIS for NSE intraday.
+    signal_audit sub-fields are mostly overwritten; only confidence_score and
+    rationale carry genuine LLM judgment.
     """
 
     decision: Decision
-    adjusted_qty: int = Field(ge=0)
-    stop_loss_price: float = Field(gt=0)
-    target_price: float = Field(gt=0)
-    product_type: ProductType
-    signal_audit: SignalAudit
+    adjusted_qty: int = Field(default=0, ge=0)
+    # Pre-computed in the prompt and overwritten in _validate_decision(); default
+    # allows the LLM to omit them without causing a validation failure.
+    stop_loss_price: float = 0.0
+    target_price: float = 0.0
+    product_type: ProductType = ProductType.MIS
+    signal_audit: SignalAudit = Field(default_factory=SignalAudit)
     rationale: str = Field(
-        max_length=300,
-        description="Brief reason citing the signal_audit values that drove this decision.",
+        max_length=500,
+        description="One-sentence reason citing which thresholds passed/failed.",
     )
 

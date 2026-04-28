@@ -45,6 +45,11 @@
         <mat-icon matListItemIcon>notifications</mat-icon>
         <span matListItemTitle>System Alerts</span>
       </a>
+      <a mat-list-item routerLink="/decisions" routerLinkActive="active"
+         (click)="closeOnMobile(sidenav)">
+        <mat-icon matListItemIcon>psychology</mat-icon>
+        <span matListItemTitle>Decision Feed</span>
+      </a>
     </mat-nav-list>
   </mat-sidenav>
 

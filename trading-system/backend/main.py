@@ -7,9 +7,13 @@ Manages scheduling, inter-agent communication, REST + WebSocket endpoints.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime, time as dt_time
+
+import pytz
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -77,12 +81,22 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("⚠️ Instrument map load failed: %s — using fallback", exc)
 
-    # 4. Schedule Research Agent at 6:00 AM IST (Mon-Fri)
+    # 4. Schedule Research Agent:
+    #    • 06:00 IST — pre-market run (overnight data, sets the day's brief)
+    #    • 12:30 IST — mid-session refresh (3+ hours of intraday news captured;
+    #      the running TradingAgent picks up the updated brief instantly via
+    #      the 'market_brief' Redis pub/sub channel without any restart)
     schedule_cron(
         func=run_research_agent,
-        job_id="research_agent",
+        job_id="research_agent_premarket",
         hour=6,
         minute=0,
+    )
+    schedule_cron(
+        func=run_research_agent,
+        job_id="research_agent_midsession",
+        hour=12,
+        minute=30,
     )
 
     # 5. (Groww TOTP tokens do not expire — no daily token refresh job needed)
@@ -105,7 +119,29 @@ async def lifespan(app: FastAPI):
     start_scheduler()
     logger.info("✅ Scheduler started")
 
-    # 7. Start WebSocket background tasks (Redis relay + LTP broadcaster)
+    # 7. Catch-up: if backend starts during market hours (09:15–15:29 IST on a
+    #    non-holiday weekday), the 09:15 APScheduler job was already missed.
+    #    Auto-start the trading session so paper trades can fire today.
+    #    When paper_extended_hours=True, also auto-start outside market hours
+    #    so the full pipeline can be tested at any time of day.
+    _IST = pytz.timezone("Asia/Kolkata")
+    _now_ist = datetime.now(_IST)
+    from core.nse_calendar import is_nse_holiday
+    _in_market_hours = dt_time(9, 15) <= _now_ist.time() <= dt_time(15, 29)
+    _should_autostart = (
+        not is_nse_holiday()
+        and _now_ist.weekday() < 5  # Mon–Fri
+        and (_in_market_hours or settings.paper_extended_hours)
+    )
+    if _should_autostart:
+        logger.info(
+            "Backend started during %s (%s IST) — auto-starting trading session",
+            "market hours" if _in_market_hours else "extended-hours (paper)",
+            _now_ist.strftime("%H:%M"),
+        )
+        asyncio.create_task(trading_manager.start_session())
+
+    # 8. Start WebSocket background tasks (Redis relay + LTP broadcaster)
     #    These must start after the event loop is running, hence here not at import time.
     start_ws_background_tasks()
 

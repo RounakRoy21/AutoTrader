@@ -162,12 +162,25 @@
 .stat-item {
   display: flex;
   justify-content: space-between;
+  align-items: baseline;
   padding: 8px 0;
   border-bottom: 1px solid #eee;
 }
 
 .stat-label { color: #666; }
 .stat-value { font-weight: 600; }
+.stat-muted { font-weight: 400; color: #999; }
+.stat-sub {
+  font-size: 0.72rem;
+  font-weight: 400;
+  color: #888;
+  margin-left: 4px;
+}
+
+.stat-divider {
+  border-top: 1px dashed #ddd;
+  margin: 4px 0;
+}
 
 // ── System Health ──────────────────────────────────────────────
 .health-row {

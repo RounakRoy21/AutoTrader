@@ -8,6 +8,7 @@ Max 2 attempts per call — if both fail, the result is discarded.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Optional, Type, TypeVar
@@ -22,6 +23,32 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
 MAX_LLM_RETRIES = 2
+
+
+async def _increment_call_counter(model: str) -> None:
+    """Atomically increment today's Anthropic API call counter in Redis.
+
+    Uses two separate keys — research (claude-sonnet) and decision (claude-haiku)
+    — so the dashboard can show both model's daily usage.  TTL is set to 24 h on
+    the first call of the day so the counters reset automatically at midnight + TTL.
+    Best-effort: any Redis error is silently ignored so the counter never blocks
+    the main LLM call path.
+    """
+    try:
+        from core.redis_client import get_redis
+        from core.redis_keys import ANTHROPIC_CALLS_DECISION_KEY, ANTHROPIC_CALLS_RESEARCH_KEY
+        settings = get_settings()
+        key = (
+            ANTHROPIC_CALLS_DECISION_KEY
+            if model == settings.anthropic_decision_model
+            else ANTHROPIC_CALLS_RESEARCH_KEY
+        )
+        r = await get_redis()
+        new_val = await r.incr(key)
+        if new_val == 1:
+            await r.expire(key, 86400)  # 24-hour TTL on first call of the day
+    except Exception:
+        pass  # Counter is informational — never raise
 
 
 class AnthropicClient:
@@ -75,6 +102,8 @@ class AnthropicClient:
                 logger.info(
                     "LLM response validated (model=%s, attempt=%d)", active_model, attempt
                 )
+                # Fire-and-forget daily call counter increment (non-blocking)
+                asyncio.ensure_future(_increment_call_counter(active_model))
                 return parsed
 
             except (json.JSONDecodeError, ValidationError) as exc:

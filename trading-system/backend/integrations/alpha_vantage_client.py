@@ -74,20 +74,46 @@ async def _query(function: str, symbol: str, **extra) -> Optional[Dict[str, Any]
 
 async def fetch_us_market_close() -> Dict[str, Any]:
     """
-    Fetch previous-day closing data for S&P 500 and NASDAQ composite.
-    Returns dict with sp500_close_pct and nasdaq_close_pct.
+    Fetch previous-session performance for S&P 500 and NASDAQ Composite.
+
+    Source: Yahoo Finance chart endpoint (^GSPC and ^IXIC).
+    Replaced the original Alpha Vantage GLOBAL_QUOTE (SPY/QQQ ETFs) to eliminate
+    the Alpha Vantage API key dependency for this endpoint.  Yahoo Finance returns
+    the actual index level rather than an ETF proxy, which is directionally
+    identical and removes one of only 2 Alpha Vantage calls per research-agent run.
+
+    Returns dict with sp500_close_pct and nasdaq_close_pct (percentage changes).
     """
     result: Dict[str, Any] = {"sp500_close_pct": 0.0, "nasdaq_close_pct": 0.0}
 
-    # S&P 500 via SPY ETF
-    spy = await _query("GLOBAL_QUOTE", "SPY")
-    if spy and "Global Quote" in spy:
-        result["sp500_close_pct"] = float(spy["Global Quote"].get("10. change percent", "0").rstrip("%"))
+    async def _fetch_index(ticker: str) -> float:
+        client = _get_http_client()
+        resp = await client.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
+            params={"interval": "1d", "range": "2d"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json",
+            },
+        )
+        resp.raise_for_status()
+        meta = resp.json()["chart"]["result"][0]["meta"]
+        price = float(meta.get("regularMarketPrice") or 0.0)
+        prev = float(meta.get("previousClose") or meta.get("chartPreviousClose") or 0.0)
+        if price > 0 and prev > 0:
+            return round((price - prev) / prev * 100, 3)
+        return 0.0
 
-    # NASDAQ via QQQ ETF
-    qqq = await _query("GLOBAL_QUOTE", "QQQ")
-    if qqq and "Global Quote" in qqq:
-        result["nasdaq_close_pct"] = float(qqq["Global Quote"].get("10. change percent", "0").rstrip("%"))
+    try:
+        sp500, nasdaq = await asyncio.gather(
+            _fetch_index("%5EGSPC"),   # S&P 500 index (actual, not ETF proxy)
+            _fetch_index("%5EIXIC"),   # NASDAQ Composite
+            return_exceptions=True,
+        )
+        result["sp500_close_pct"] = sp500 if not isinstance(sp500, Exception) else 0.0
+        result["nasdaq_close_pct"] = nasdaq if not isinstance(nasdaq, Exception) else 0.0
+    except Exception as exc:
+        logger.error("US market close fetch failed: %s", exc)
 
     logger.info("US market close: %s", result)
     return result

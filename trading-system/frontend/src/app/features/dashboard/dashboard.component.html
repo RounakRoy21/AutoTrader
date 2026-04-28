@@ -170,6 +170,16 @@
         <span class="stat-label">Win Rate (30d)</span>
         <span class="stat-value">{{ winRate | number:'1.1-1' }}%</span>
       </div>
+      <div class="stat-divider"></div>
+      <div class="stat-item"
+           [matTooltip]="'Research (Sonnet): ' + (agentStatus.anthropic?.calls_research_today ?? 0) + ' calls · Decision (Haiku): ' + (agentStatus.anthropic?.calls_decision_today ?? 0) + ' calls'">
+        <span class="stat-label">Anthropic API (today)</span>
+        <span class="stat-value"
+              [class.loss]="(agentStatus.anthropic?.calls_total_today ?? 0) >= 40">
+          {{ agentStatus.anthropic?.calls_total_today ?? 0 }}
+          <span class="stat-sub">/ {{ agentStatus.anthropic?.calls_research_today ?? 0 }}R&nbsp;+&nbsp;{{ agentStatus.anthropic?.calls_decision_today ?? 0 }}D</span>
+        </span>
+      </div>
     </mat-card-content>
   </mat-card>
 

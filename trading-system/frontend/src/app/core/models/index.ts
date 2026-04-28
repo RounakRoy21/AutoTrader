@@ -80,6 +80,11 @@ export interface AgentStatus {
     daily_loss: number;
     drawdown_pct: number;
   };
+  anthropic?: {
+    calls_research_today: number;
+    calls_decision_today: number;
+    calls_total_today: number;
+  };
   config?: {
     paper_trading: boolean;
     max_trades_per_day: number;
@@ -88,6 +93,23 @@ export interface AgentStatus {
 }
 
 export type LtpMap = Record<string, number>;
+
+export interface DecisionEntry {
+  ts: string;           // HH:MM:SS
+  date: string;         // YYYY-MM-DD
+  stock: string;
+  ltp: number;
+  rsi: number;
+  volume_ratio: number;
+  vwap: number | null;
+  stage: 'PRE_CHECK' | 'LLM';
+  decision: 'EXECUTE' | 'REDUCE' | 'REJECT';
+  confidence: number | null;
+  rationale: string;
+  qty: number | null;
+  sl: number | null;
+  target: number | null;
+}
 
 export interface HealthCheck {
   database: string;

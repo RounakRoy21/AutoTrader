@@ -1,6 +1,6 @@
 """
-Tests for integration-layer fixes introduced in Audit 6:
-  - KiteClient.delete_gtt() exists and is callable
+Tests for integration-layer fixes:
+  - GrowwClient.delete_gtt() exists and is callable
   - Circuit breaker sends Telegram alert when halt triggers
   - ltp_store is cleared at session start (TradingAgent.start)
 """
@@ -17,24 +17,23 @@ import pytest
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-class TestKiteClientDeleteGtt:
-    """KiteClient must expose delete_gtt() so the risk manager can cancel
+class TestGrowwClientDeleteGtt:
+    """GrowwClient must expose delete_gtt() so the risk manager can cancel
     server-side GTT orders before executing a manual SELL."""
 
     def test_delete_gtt_method_exists(self):
-        """KiteClient must have a delete_gtt coroutine method."""
+        """GrowwClient must have a delete_gtt coroutine method."""
         import inspect
-        from integrations.kite_client import KiteClient
-        assert hasattr(KiteClient, "delete_gtt")
-        assert inspect.iscoroutinefunction(KiteClient.delete_gtt)
+        from integrations.groww_client import GrowwClient
+        assert hasattr(GrowwClient, "delete_gtt")
+        assert inspect.iscoroutinefunction(GrowwClient.delete_gtt)
 
     @pytest.mark.asyncio
     async def test_delete_gtt_paper_mode_no_exception(self):
         """In paper mode, delete_gtt should succeed without calling real API."""
-        from integrations import kite_client as kc_module
-        from integrations.kite_client import KiteClient
+        from integrations.groww_client import GrowwClient
 
-        client = KiteClient()
+        client = GrowwClient()
         # Patch settings to paper_trading=True
         with patch.object(client, "_settings") as mock_settings:
             mock_settings.paper_trading = True
@@ -42,23 +41,23 @@ class TestKiteClientDeleteGtt:
             await client.delete_gtt(trigger_id=12345)
 
     @pytest.mark.asyncio
-    async def test_delete_gtt_live_mode_calls_kite(self):
-        """In live mode, delete_gtt should call kite.delete_gtt(trigger_id)."""
-        from integrations.kite_client import KiteClient
+    async def test_delete_gtt_live_mode_calls_api(self):
+        """In live mode, delete_gtt should call the broker's delete_gtt(trigger_id)."""
+        from integrations.groww_client import GrowwClient
 
-        client = KiteClient()
-        mock_kite = MagicMock()
-        mock_kite.delete_gtt = MagicMock(return_value=None)
+        client = GrowwClient()
+        mock_broker = MagicMock()
+        mock_broker.delete_gtt = MagicMock(return_value=None)
 
         with patch.object(client, "_settings") as mock_settings, \
-             patch.object(client, "get_kite", new=AsyncMock(return_value=mock_kite)):
+             patch.object(client, "get_kite", new=AsyncMock(return_value=mock_broker)):
             mock_settings.paper_trading = False
             with patch("asyncio.to_thread", new=AsyncMock(return_value=None)):
                 await client.delete_gtt(trigger_id=99999)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  KiteClient — Circuit Breaker Telegram Alert
+#  GrowwClient — Circuit Breaker Telegram Alert
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -69,18 +68,18 @@ class TestCircuitBreakerAlert:
     async def test_circuit_breaker_calls_send_halt_alert(self):
         """_handle_failure must call send_halt_alert() when circuit trips."""
         import time
-        from integrations.kite_client import KiteClient
+        from integrations.groww_client import GrowwClient
 
-        client = KiteClient()
+        client = GrowwClient()
         # Simulate the circuit breaker being in an already-tripped state
         # by setting _last_failure to 120s ago (> 60s threshold)
         client._last_failure = time.time() - 120.0
 
         mock_halt_alert = AsyncMock()
 
-        with patch("integrations.kite_client.set_value", new=AsyncMock()), \
+        with patch("integrations.groww_client.set_value", new=AsyncMock()), \
              patch(
-                 "integrations.kite_client.KiteClient._handle_failure",
+                 "integrations.groww_client.GrowwClient._handle_failure",
                  wraps=client._handle_failure,
              ), \
              patch(

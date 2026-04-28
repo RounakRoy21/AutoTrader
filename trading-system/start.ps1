@@ -43,14 +43,14 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
 # â”€â”€ --Stop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 if ($Stop) {
     Write-Banner "Stopping"
-    docker compose down
+    docker-compose down
     Write-Ok "All containers stopped (database volume preserved)."
     Pop-Location; exit 0
 }
 
 # â”€â”€ --Status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 if ($Status) {
-    docker compose ps
+    docker-compose ps
     Pop-Location; exit 0
 }
 
@@ -82,9 +82,9 @@ Write-Ok "Docker is running"
 # before the backend starts â€” no manual health-wait loops needed.
 Write-Info "Starting containers$(if ($Build) { ' (with image rebuild)' })..."
 if ($Build) {
-    docker compose up -d --build
+    docker-compose up -d --build
 } else {
-    docker compose up -d
+    docker-compose up -d
 }
 Write-Host ""
 
@@ -126,11 +126,11 @@ Write-Host "  Groww auth (one-time): POST http://localhost:8000/api/auth/groww/l
 Write-Host "  (only needed once - TOTP tokens do not expire)"         -ForegroundColor Yellow
 Write-Host ""
 Write-Host "  Useful commands:"                                        -ForegroundColor DarkGray
-Write-Host "    docker compose logs -f backend          # live backend logs"    -ForegroundColor DarkGray
-Write-Host "    docker compose logs -f backend | Select-String scanner"         -ForegroundColor DarkGray
+Write-Host "    docker-compose logs -f backend          # live backend logs"   -ForegroundColor DarkGray
+    Write-Host "    docker-compose logs -f backend | Select-String scanner"        -ForegroundColor DarkGray
 Write-Host "    .\start.ps1 -Stop                       # graceful shutdown"    -ForegroundColor DarkGray
 Write-Host ""
 
-docker compose ps
+docker-compose ps
 
 Pop-Location

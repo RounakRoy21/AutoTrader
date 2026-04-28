@@ -29,6 +29,9 @@ from core.redis_keys import (
     RISK_STATUS_KEY,
     RISK_DAILY_LOSS_KEY,
     RISK_DRAWDOWN_PCT_KEY,
+    ANTHROPIC_CALLS_RESEARCH_KEY,
+    ANTHROPIC_CALLS_DECISION_KEY,
+    DECISION_FEED_KEY,
 )
 from agents.trading_agent_manager import get_trading_agent_manager
 
@@ -78,6 +81,8 @@ async def get_agent_status():
         RISK_STATUS_KEY,                # 10
         RISK_DAILY_LOSS_KEY,            # 11
         RISK_DRAWDOWN_PCT_KEY,          # 12
+        ANTHROPIC_CALLS_RESEARCH_KEY,   # 13
+        ANTHROPIC_CALLS_DECISION_KEY,   # 14
     ]
     try:
         r = await get_redis()
@@ -86,6 +91,8 @@ async def get_agent_status():
         values = [None] * len(keys)
 
     settings = get_settings()
+    calls_research = int(values[13]) if values[13] else 0
+    calls_decision = int(values[14]) if values[14] else 0
     return _envelope(True, {
         "research_agent": {
             "status": values[0] or "INACTIVE",
@@ -105,6 +112,11 @@ async def get_agent_status():
             "status": values[10] or "INACTIVE",
             "daily_loss": float(values[11]) if values[11] else 0.0,
             "drawdown_pct": float(values[12]) if values[12] else 0.0,
+        },
+        "anthropic": {
+            "calls_research_today": calls_research,
+            "calls_decision_today": calls_decision,
+            "calls_total_today": calls_research + calls_decision,
         },
         "config": {
             "paper_trading": settings.paper_trading,
@@ -148,6 +160,59 @@ async def manual_stop_trading():
     manager = get_trading_agent_manager()
     result = await manager.stop_session()
     return _envelope(True, {"result": result})
+
+
+@router.get("/api/agent/decisions")
+async def get_decision_feed(limit: int = 50):
+    """Return the last N decision engine events (pre-check + LLM decisions)."""
+    import json as _json
+    try:
+        r = await get_redis()
+        raw_entries = await r.lrange(DECISION_FEED_KEY, 0, min(limit, 100) - 1)
+        decisions = []
+        for raw in raw_entries:
+            try:
+                decisions.append(_json.loads(raw))
+            except Exception:
+                pass
+        return _envelope(True, {"decisions": decisions, "count": len(decisions)})
+    except Exception as exc:
+        logger.error("Failed to read decision feed: %s", exc)
+        return _envelope(False, {"decisions": [], "count": 0}, error=str(exc))
+
+
+@router.get("/api/agent/scanner-debug")
+async def scanner_debug(request: Request):
+    """Dump live scanner indicator values for the first few symbols (dev/testing only)."""
+    manager = get_trading_agent_manager()
+    agent = getattr(manager, "_agent", None)
+    scanner = getattr(agent, "_scanner", None) if agent else None
+    if scanner is None or not scanner._stores:
+        return _envelope(True, {"message": "scanner not running or no stores yet", "stores": 0})
+    out = {}
+    for symbol, store in list(scanner._stores.items())[:6]:
+        ticks = len(store.ticks)
+        candles_df = store._candles_1m.completed_df
+        n_candles = len(candles_df) if candles_df is not None else 0
+        ltp = store.ltp
+        vwap = store.compute_vwap()
+        rsi = store.compute_rsi()
+        rsi_5m = store.compute_rsi_htf()
+        out[symbol] = {
+            "ticks": ticks,
+            "candles_1m": n_candles,
+            "ltp": round(ltp, 2),
+            "vwap": round(vwap, 2),
+            "ltp_gt_vwap": ltp > vwap,
+            "rsi": round(rsi, 2),
+            "rsi_ok": 45 <= rsi <= 65,
+            "rsi_5m": round(rsi_5m, 2) if rsi_5m is not None else None,
+            "rsi_5m_ok": (rsi_5m is None) or (45 <= rsi_5m <= 72),
+        }
+    agent = getattr(manager, "_agent", None)
+    signal_q = getattr(agent, "_signal_queue", None)
+    q_size = signal_q.qsize() if signal_q else -1
+    return _envelope(True, {"stores": len(scanner._stores), "signal_queue_depth": q_size, "sample": out})
 
 
 @router.get("/api/health")

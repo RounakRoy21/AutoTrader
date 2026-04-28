@@ -100,6 +100,7 @@ class NewsFlagSchema(BaseModel):
     urgency: NewsUrgency
     stock: Optional[str] = None
     beat_pct: Optional[float] = None
+    headline: Optional[str] = None  # the actual news title that drove this flag
 
 
 class EarningsDriftCandidate(BaseModel):

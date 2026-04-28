@@ -20,8 +20,8 @@ from sqlalchemy import func, select
 from core.config import get_settings
 from core.nse_calendar import ist_today
 from core.database import get_db_context
-from core.redis_client import get_value, increment, publish, set_value
-from core.redis_keys import DAILY_TRADE_COUNT_KEY, HALT_KEY
+from core.redis_client import get_redis, get_value, increment, publish, set_value
+from core.redis_keys import DAILY_TRADE_COUNT_KEY, DECISION_FEED_KEY, HALT_KEY
 from integrations.anthropic_client import get_anthropic_client
 from models.trade import Trade
 from schemas.decision import Decision, DecisionOutput, SignalAudit
@@ -198,7 +198,7 @@ class DecisionEngine:
     @staticmethod
     def _is_placeholder_key(key: str) -> bool:
         """Return True if the API key looks like a placeholder value."""
-        placeholders = {"", "placeholder", "your-key-here", "xxxx", "sk-ant-api03-placeholder"}
+        placeholders = {"placeholder", "your-key-here", "xxxx", "sk-ant-api03-placeholder"}
         return not key or any(p in key.lower() for p in placeholders)
 
     def _mock_decision(self, signal: ScannerSignal) -> DecisionOutput:
@@ -353,17 +353,19 @@ class DecisionEngine:
             logger.info("Monday rule: halved quantity to %d", signal.suggested_qty)
 
         # Friday after 2:00 PM: reject all new entries
-        if day_name == "Friday" and now_ist.hour >= 14:
+        # Bypassed in extended-hours testing mode.
+        if day_name == "Friday" and now_ist.hour >= 14 and not self._settings.paper_extended_hours:
             return False, "Friday after 2:00 PM — no new entries", signal
 
         return True, "Pre-checks passed", signal
 
     async def _call_llm(self, signal: ScannerSignal) -> Optional[DecisionOutput]:
         """Send signal + market brief to Claude for a trade decision.
-        Returns a mock decision immediately when in paper mode or key is a placeholder.
+        Returns a mock decision only when the Anthropic key is a placeholder.
+        Paper trading mode uses real LLM calls — only trade execution is mocked.
         """
-        # ── Paper trading / missing key → skip LLM ──
-        if self._settings.paper_trading or self._is_placeholder_key(self._settings.anthropic_api_key):
+        # ── Missing/placeholder key → skip LLM ──
+        if self._is_placeholder_key(self._settings.anthropic_api_key):
             return self._mock_decision(signal)
 
         # ── Live mode: call Claude ──
@@ -392,11 +394,23 @@ class DecisionEngine:
                     )
                     break
 
+        sl_price = round(
+            signal.ltp - signal.atr * self._settings.atr_sl_multiplier
+            if signal.atr and signal.atr > 0
+            else signal.ltp * (1 - self._settings.stop_loss_pct),
+            2,
+        )
+        tgt_price = round(
+            signal.ltp + signal.atr * self._settings.atr_target_multiplier
+            if signal.atr and signal.atr > 0
+            else signal.ltp * (1 + self._settings.min_target_pct),
+            2,
+        )
         user_content = (
             f"TRADE SIGNAL:\n{json.dumps(signal.model_dump(), default=str)}\n\n"
             f"MARKET BRIEF:\n{brief_summary}\n\n"
-            f"Stop-loss rule: {sl_rule}.\n"
-            f"Minimum target: {tgt_rule}.\n"
+            f"Pre-computed stop_loss_price: {sl_price} (include this exact value in your JSON).\n"
+            f"Pre-computed target_price: {tgt_price} (include this exact value in your JSON).\n"
             f"Today is {datetime.now(IST).strftime('%A')}.{earnings_alert}\n\n"
             "THRESHOLDS QUICK REFERENCE (apply to signal_audit fields):\n"
             f"  RSI valid zone (LONG): {RSI_LONG_MIN}–{RSI_LONG_MAX}  "
@@ -437,32 +451,28 @@ class DecisionEngine:
         settings = self._settings
         audit = decision.signal_audit
 
-        # ── Step 1: SL / target / qty clamping (identical to original logic) ──
+        # ── Step 1: SL / target / qty — always compute from signal ──────────
+        # stop_loss_price / target_price default to 0.0 when the LLM omits them;
+        # we always recompute from ATR (or % fallback) so the values are correct
+        # regardless of what the LLM returned.
         if signal.atr and signal.atr > 0:
             min_sl = round(signal.ltp - signal.atr * settings.atr_sl_multiplier, 2)
         else:
             min_sl = round(signal.ltp * (1 - settings.stop_loss_pct), 2)
-        if decision.stop_loss_price > min_sl:
-            logger.warning(
-                "LLM SL ₹%.2f too tight for %s (entry ₹%.2f) — clamping to ₹%.2f",
-                decision.stop_loss_price, signal.stock, signal.ltp, min_sl,
-            )
-            decision = decision.model_copy(update={"stop_loss_price": min_sl})
+        decision = decision.model_copy(update={"stop_loss_price": min_sl})
 
         if signal.atr and signal.atr > 0:
             min_target = round(signal.ltp + signal.atr * settings.atr_target_multiplier, 2)
         else:
             min_target = round(signal.ltp * (1 + settings.min_target_pct), 2)
-        if decision.target_price < min_target:
-            logger.warning(
-                "LLM target ₹%.2f too close for %s (entry ₹%.2f) — clamping to ₹%.2f",
-                decision.target_price, signal.stock, signal.ltp, min_target,
-            )
-            decision = decision.model_copy(update={"target_price": min_target})
+        decision = decision.model_copy(update={"target_price": min_target})
 
         if decision.decision != Decision.REJECT and decision.adjusted_qty < 1:
-            logger.warning("LLM returned qty=0 for %s — clamping to 1", signal.stock)
-            decision = decision.model_copy(update={"adjusted_qty": 1})
+            logger.warning(
+                "LLM returned qty=0 for %s — using scanner suggestion %d",
+                signal.stock, signal.suggested_qty,
+            )
+            decision = decision.model_copy(update={"adjusted_qty": signal.suggested_qty})
 
         if decision.adjusted_qty > signal.suggested_qty:
             logger.warning(
@@ -612,12 +622,18 @@ class DecisionEngine:
         """Process a single scanner signal through pre-checks and LLM decision."""
         passed, reason, signal = await self._pre_check(signal)
         if not passed:
-            logger.info("Signal rejected by pre-check: %s — %s", signal.stock, reason)
-            await publish("system_alerts", {
-                "type": "warning",
-                "message": f"Signal skipped ({signal.stock}): {reason}",
-                "timestamp": datetime.now(IST).isoformat(),
-            })
+            logger.debug("Signal rejected by pre-check: %s — %s", signal.stock, reason)
+            # Only publish to system_alerts when the rejection reason carries actionable
+            # information (risk rules, pauses, avoid-list).  Watchlist-filter misses are
+            # expected and normal — publishing them fills the alerts feed with noise.
+            if "not in today's watchlist" not in reason:
+                await publish("system_alerts", {
+                    "type": "warning",
+                    "message": f"Signal skipped ({signal.stock}): {reason}",
+                    "timestamp": datetime.now(IST).isoformat(),
+                })
+                await self._push_feed_entry(signal, stage="PRE_CHECK", decision="REJECT",
+                                            rationale=reason)
             return None
 
         decision = await self._call_llm(signal)
@@ -628,6 +644,8 @@ class DecisionEngine:
                 "message": f"Decision Engine LLM failed for {signal.stock} — signal discarded",
                 "timestamp": datetime.now(IST).isoformat(),
             })
+            await self._push_feed_entry(signal, stage="LLM", decision="REJECT",
+                                        rationale="LLM validation failed after 2 attempts")
             return None
 
         # Post-validate LLM output: clamp SL/target/qty to hard risk rules
@@ -637,9 +655,15 @@ class DecisionEngine:
             logger.info("LLM rejected trade: %s — %s", signal.stock, decision.rationale)
             await publish("system_alerts", {
                 "type": "info",
-                "message": f"LLM rejected {signal.stock}: {decision.rationale}",
+                "message": (
+                    f"Signal reviewed — {signal.stock} REJECTED: {decision.rationale} "
+                    f"| RSI={signal.rsi:.1f} VolumeRatio={signal.volume_ratio:.2f}× "
+                    f"Price=₹{signal.ltp:.2f} VWAP=₹{signal.vwap:.2f}"
+                ),
                 "timestamp": datetime.now(IST).isoformat(),
             })
+            await self._push_feed_entry(signal, stage="LLM", decision="REJECT",
+                                        rationale=decision.rationale, dec=decision)
             return None
 
         logger.info(
@@ -656,7 +680,43 @@ class DecisionEngine:
             ),
             "timestamp": datetime.now(IST).isoformat(),
         })
+        await self._push_feed_entry(signal, stage="LLM", decision=decision.decision.value,
+                                    rationale=decision.rationale, dec=decision)
         return decision
+
+    async def _push_feed_entry(
+        self,
+        signal: ScannerSignal,
+        stage: str,
+        decision: str,
+        rationale: str,
+        dec: Optional[DecisionOutput] = None,
+    ) -> None:
+        """Push a compact decision event to the rolling Redis feed (best-effort)."""
+        try:
+            import json as _json
+            now_ist = datetime.now(IST)
+            entry = {
+                "ts": now_ist.strftime("%H:%M:%S"),
+                "date": now_ist.strftime("%Y-%m-%d"),
+                "stock": signal.stock,
+                "ltp": signal.ltp,
+                "rsi": round(signal.rsi, 1),
+                "volume_ratio": round(signal.volume_ratio, 2),
+                "vwap": signal.vwap,
+                "stage": stage,
+                "decision": decision,
+                "confidence": dec.signal_audit.confidence_score if dec else None,
+                "rationale": rationale,
+                "qty": dec.adjusted_qty if dec and dec.decision.value != "REJECT" else None,
+                "sl": dec.stop_loss_price if dec and dec.decision.value != "REJECT" else None,
+                "target": dec.target_price if dec and dec.decision.value != "REJECT" else None,
+            }
+            r = await get_redis()
+            await r.lpush(DECISION_FEED_KEY, _json.dumps(entry))
+            await r.ltrim(DECISION_FEED_KEY, 0, 99)  # keep last 100
+        except Exception:
+            pass  # non-blocking — never raise
 
     def stop(self) -> None:
         """Stop the decision engine."""

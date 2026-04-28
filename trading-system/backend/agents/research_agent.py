@@ -18,8 +18,8 @@ from sqlalchemy import select
 
 from core.config import get_settings
 from core.database import get_db_context
-from core.redis_client import get_value, publish, set_value
-from core.redis_keys import LATEST_MARKET_BRIEF_KEY
+from core.redis_client import get_value, publish, set_value, delete_value
+from core.redis_keys import LATEST_MARKET_BRIEF_KEY, TODAY_WATCHLIST_KEY, INSTRUMENT_MAP_KEY
 from core.nse_calendar import is_nse_holiday
 from integrations.alpha_vantage_client import (
     fetch_crude_oil,
@@ -79,7 +79,8 @@ RESEARCH_SYSTEM_PROMPT = (
     "Nifty 50 opening gap derived from overnight futures, not GIFT Nifty.\n"
     "news_flags is a list of objects with keys: type, sentiment (POSITIVE/NEGATIVE/NEUTRAL), "
     "urgency (HIGH/MEDIUM/LOW), stock (nullable), beat_pct (nullable — only non-null when a "
-    "reported beat percentage is cited in the headline, e.g. 'beats estimates by 8%'). "
+    "reported beat percentage is cited in the headline, e.g. 'beats estimates by 8%'), "
+    "headline (the exact article title from the input that drove this flag — always populate this). "
     "earnings_drift_candidates is a list of objects with keys: stock, beat_pct (nullable). "
     "For stocks sourced from the earnings_calendar (upcoming results, not yet reported), "
     "beat_pct must be null. Only set beat_pct to a non-null float when a confirmed EPS beat "
@@ -439,6 +440,7 @@ def _parse_news_flags(headlines: list) -> list[NewsFlagSchema]:
             sentiment=sentiment,
             urgency=urgency,
             stock=matched_stock,
+            headline=article.get("title"),
         ))
 
         if len(flags) >= 15:  # cap output so the brief stays concise
@@ -447,7 +449,38 @@ def _parse_news_flags(headlines: list) -> list[NewsFlagSchema]:
     return flags
 
 
-def _generate_mock_brief(raw_data: dict | None = None) -> MarketBriefLLMOutput:
+_FALLBACK_WATCHLIST = ["RELIANCE", "HDFCBANK", "INFY", "TCS", "ICICIBANK", "AXISBANK", "WIPRO"]
+
+
+def _load_prior_watchlist() -> list[str]:
+    """Synchronous shim — always returns the fallback list.
+
+    The real async version is _async_load_prior_watchlist(), called from
+    generate_market_brief() before _generate_mock_brief() is invoked.
+    This stub is kept so any external import (e.g. the Docker import check)
+    doesn't break.
+    """
+    return _FALLBACK_WATCHLIST
+
+
+async def _async_load_prior_watchlist() -> list[str]:
+    """Async-safe: reads TODAY_WATCHLIST_KEY from Redis, falls back to FALLBACK."""
+    try:
+        raw = await get_value(TODAY_WATCHLIST_KEY)
+        if raw:
+            wl = json.loads(raw)
+            if isinstance(wl, list) and wl:
+                logger.debug("Mock brief using prior watchlist from Redis: %s", wl)
+                return wl
+    except Exception as exc:
+        logger.debug("Could not load prior watchlist for mock brief: %s", exc)
+    return _FALLBACK_WATCHLIST
+
+
+def _generate_mock_brief(
+    raw_data: dict | None = None,
+    prior_watchlist: list[str] | None = None,
+) -> MarketBriefLLMOutput:
     """
     Return a synthetic market brief for paper trading / testing without LLM.
     Incorporates any real data already collected (FII/DII, US markets, etc.).
@@ -555,13 +588,67 @@ def _generate_mock_brief(raw_data: dict | None = None) -> MarketBriefLLMOutput:
             stance = RecommendedStance.HALF_SIZE_POSITIONS
         confidence = round(confidence * 0.8, 2)
 
+    # Paper mode: never block all signals with AVOID_TRADING.
+    # The mock brief derives stance from real macro data (actual FII, actual VIX,
+    # actual S&P 500) — on a genuinely bearish day this legitimately produces
+    # AVOID_TRADING, but that blocks every signal via _pre_check and leaves paper
+    # sessions with zero trades, making it impossible to verify the execution pipeline.
+    # Cap at HALF_SIZE_POSITIONS so risk management still applies (half qty, signal
+    # audit still runs) without completely silencing all paper signals.
+    if get_settings().paper_trading and stance == RecommendedStance.AVOID_TRADING:
+        logger.info(
+            "[MOCK] Paper mode: macro analysis produced AVOID_TRADING "
+            "— demoted to HALF_SIZE_POSITIONS so paper trades can fire"
+        )
+        stance = RecommendedStance.HALF_SIZE_POSITIONS
+
     # Parse real news headlines into structured flags (paper mode still sees real news)
     news_headlines = (raw_data.get("news_headlines") or []) if raw_data else []
     news_flags = _parse_news_flags(news_headlines)
 
+    # Build a dynamic watchlist from today's real news signals so the list
+    # actually changes day-to-day instead of cycling the same fallback forever.
+    #
+    # Priority: positive-news stocks → earnings calendar → prior/fallback fill-in.
+    # Stocks with high/medium urgency negative news are excluded from the watchlist
+    # and moved to avoid_today.
+    _positive_from_news: list[str] = []
+    _avoid_from_news: set[str] = set()
+    for _flag in news_flags:
+        if _flag.stock:
+            if (
+                _flag.sentiment == NewsSentiment.NEGATIVE
+                and _flag.urgency in (NewsUrgency.HIGH, NewsUrgency.MEDIUM)
+            ):
+                _avoid_from_news.add(_flag.stock)
+            elif (
+                _flag.sentiment == NewsSentiment.POSITIVE
+                and _flag.stock not in _positive_from_news
+                and _flag.stock not in _avoid_from_news
+            ):
+                _positive_from_news.append(_flag.stock)
+
+    # Earnings calendar stocks → potential drift candidates (skip on bearish days)
+    _earnings_stocks: list[str] = []
+    if raw_data and bias != MarketBias.BEARISH:
+        for _e in (raw_data.get("earnings_calendar") or []):
+            _s = _e.get("stock")
+            if _s and _s not in _positive_from_news and _s not in _avoid_from_news:
+                _earnings_stocks.append(_s)
+
+    # Fill remaining slots from prior/fallback, skipping anything flagged negatively
+    _base_list = prior_watchlist if prior_watchlist else _FALLBACK_WATCHLIST
+    _fill = [s for s in _base_list if s not in _positive_from_news and s not in _avoid_from_news]
+
+    _combined = _positive_from_news + _earnings_stocks + _fill
+    watchlist_today = _combined[:10] if _combined else _FALLBACK_WATCHLIST
+    avoid_today = sorted(_avoid_from_news)
+
     logger.info(
-        "[MOCK] Generated mock brief: bias=%s confidence=%.2f vix_regime=%s stance=%s",
+        "[MOCK] Generated mock brief: bias=%s confidence=%.2f vix_regime=%s stance=%s "
+        "watchlist=%s (+%d from news, +%d earnings) avoid=%s",
         bias, confidence, vix_regime, stance.value,
+        watchlist_today, len(_positive_from_news), len(_earnings_stocks), avoid_today,
     )
     return MarketBriefLLMOutput(
         date=now_ist.strftime("%Y-%m-%d"),
@@ -573,8 +660,8 @@ def _generate_mock_brief(raw_data: dict | None = None) -> MarketBriefLLMOutput:
         dxy=DxySchema(value=dxy_value, trend=dxy_trend, signal=dxy_sig),
         us_markets=UsMarketsSchema(sp500_close_pct=sp500_pct, nasdaq_close_pct=nasdaq_pct, signal=us_sig),
         news_flags=news_flags,
-        watchlist_today=["RELIANCE", "HDFCBANK", "INFY", "TCS", "ICICIBANK", "AXISBANK", "WIPRO"],
-        avoid_today=[],
+        watchlist_today=watchlist_today,
+        avoid_today=avoid_today,
         earnings_drift_candidates=[
             EarningsDriftCandidate(stock=e["stock"], beat_pct=None)
             for e in (raw_data.get("earnings_calendar") or []) if raw_data
@@ -586,7 +673,7 @@ def _generate_mock_brief(raw_data: dict | None = None) -> MarketBriefLLMOutput:
 
 def _is_placeholder_key(key: str) -> bool:
     """Return True if the API key looks like a placeholder value."""
-    placeholders = {"", "placeholder", "your-key-here", "xxxx", "sk-ant-api03-placeholder"}
+    placeholders = {"placeholder", "your-key-here", "xxxx", "sk-ant-api03-placeholder"}
     return not key or any(p in key.lower() for p in placeholders)
 
 
@@ -598,14 +685,12 @@ async def generate_market_brief(raw_data: dict) -> MarketBriefLLMOutput | None:
     """
     settings = get_settings()
 
-    # ── Paper trading / missing key → skip LLM, use mock brief ──
-    if settings.paper_trading or _is_placeholder_key(settings.anthropic_api_key):
-        logger.info(
-            "Skipping LLM call (paper_trading=%s, placeholder_key=%s) — returning mock brief",
-            settings.paper_trading,
-            _is_placeholder_key(settings.anthropic_api_key),
-        )
-        return _generate_mock_brief(raw_data)
+    # ── Missing/placeholder key → skip LLM, use mock brief ──
+    # Paper trading mode still makes real LLM calls — only trade *execution* is mocked.
+    if _is_placeholder_key(settings.anthropic_api_key):
+        logger.info("Skipping LLM call (placeholder anthropic key) — returning mock brief")
+        prior_wl = await _async_load_prior_watchlist()
+        return _generate_mock_brief(raw_data, prior_watchlist=prior_wl)
 
     # ── Live mode: call Claude ──
     now_ist = datetime.now(IST)
@@ -624,7 +709,8 @@ async def generate_market_brief(raw_data: dict) -> MarketBriefLLMOutput | None:
     )
     if brief is None:
         logger.warning("LLM failed — falling back to mock brief")
-        return _generate_mock_brief(raw_data)
+        prior_wl = await _async_load_prior_watchlist()
+        return _generate_mock_brief(raw_data, prior_watchlist=prior_wl)
     return brief
 
 
@@ -683,6 +769,24 @@ async def persist_and_publish(brief: MarketBriefLLMOutput) -> None:
 
     # Store the latest brief in a Redis key for easy access
     await set_value(LATEST_MARKET_BRIEF_KEY, json.dumps(brief_dict))
+
+    # Persist today's watchlist so load_instrument_map() picks it up when
+    # the trading session starts at 09:15 — the scanner then subscribes to
+    # exactly the stocks the LLM flagged rather than the static focus_stocks.
+    await set_value(TODAY_WATCHLIST_KEY, json.dumps(brief.watchlist_today), ttl=86400)
+    # Invalidate the cached token map so the next load_instrument_map() call
+    # re-fetches from Groww using the new watchlist.
+    await delete_value(INSTRUMENT_MAP_KEY)
+    # Eagerly refresh the in-memory map now (before 09:15) so a mid-day
+    # manual restart also gets the correct stocks.
+    try:
+        from integrations.instrument_service import load_instrument_map  # lazy import
+        await load_instrument_map()
+        logger.info(
+            "Instrument map refreshed with today's watchlist: %s", brief.watchlist_today
+        )
+    except Exception as _exc:
+        logger.warning("Could not refresh instrument map after brief: %s", _exc)
 
 
 async def run_research_agent() -> None:

@@ -50,7 +50,7 @@ EOD_REPORT_TIME = dt_time(15, 30)  # 3:30 PM IST
 def _transaction_costs(entry_price: float, exit_price: float, qty: int, product_type: str) -> float:
     """Estimate round-trip NSE transaction costs for a single trade.
 
-    Applies Zerodha's published fee schedule (rates as of 2025):
+    Applies NSE broker fee schedule (Zerodha/Groww rates as of 2025):
     - Brokerage:           ₹20/order (capped at 0.03% per leg) — both entry and exit
     - STT:                 0.025% of sell-side turnover (intraday MIS/NRML)
                            0.1%   of both sides (CNC delivery)

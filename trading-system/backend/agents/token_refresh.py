@@ -3,10 +3,10 @@ Token refresh — stub module (Groww TOTP tokens do not expire).
 
 Groww session tokens are long-lived and persist until the user revokes them
 via the Groww app or explicitly logs out via POST /api/auth/groww/logout.
-There is no daily re-authentication requirement (unlike Zerodha Kite OAuth).
+There is no daily re-authentication requirement (unlike legacy Zerodha Kite OAuth).
 
 This module is kept as a no-op stub to avoid breaking any external tooling
-that may import from it. The APScheduler job that called check_kite_token
+that may import from it. The APScheduler job that called check_groww_token
 has been removed from main.py.
 """
 

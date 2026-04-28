@@ -1,0 +1,215 @@
+:host {
+  display: block;
+}
+
+.feed-card {
+  margin: 16px;
+
+  mat-card-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 1.1rem;
+
+    .title-icon {
+      color: var(--mat-sys-primary);
+    }
+  }
+}
+
+.loading-state,
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 40px 0;
+  color: rgba(0, 0, 0, 0.45);
+
+  mat-icon {
+    font-size: 40px;
+    width: 40px;
+    height: 40px;
+  }
+
+  p {
+    margin: 0;
+    font-size: 0.95rem;
+  }
+
+  .hint {
+    font-size: 0.8rem;
+    color: rgba(0, 0, 0, 0.35);
+  }
+}
+
+.feed-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 680px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.feed-row {
+  display: grid;
+  grid-template-columns: 140px 100px 1fr auto;
+  align-items: start;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  border-left: 4px solid transparent;
+  background: rgba(0, 0, 0, 0.03);
+  font-size: 0.82rem;
+  transition: background 0.15s;
+
+  &:hover {
+    background: rgba(0, 0, 0, 0.06);
+  }
+
+  &.decision-execute {
+    border-left-color: #2e7d32;
+    background: rgba(46, 125, 50, 0.05);
+  }
+
+  &.decision-reduce {
+    border-left-color: #f57c00;
+    background: rgba(245, 124, 0, 0.05);
+  }
+
+  &.decision-reject {
+    border-left-color: #c62828;
+    background: rgba(198, 40, 40, 0.04);
+  }
+}
+
+// Badge + stage pill column
+.badge-col {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: flex-start;
+}
+
+.decision-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 8px 2px 4px;
+  border-radius: 12px;
+  font-weight: 600;
+  font-size: 0.78rem;
+  letter-spacing: 0.02em;
+
+  .badge-icon {
+    font-size: 14px;
+    width: 14px;
+    height: 14px;
+  }
+
+  &.decision-execute {
+    background: #e8f5e9;
+    color: #2e7d32;
+  }
+
+  &.decision-reduce {
+    background: #fff3e0;
+    color: #e65100;
+  }
+
+  &.decision-reject {
+    background: #ffebee;
+    color: #c62828;
+  }
+}
+
+.stage-pill {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-size: 0.7rem;
+  font-weight: 500;
+  background: rgba(0, 0, 0, 0.1);
+  color: rgba(0, 0, 0, 0.5);
+
+  &.stage-llm {
+    background: rgba(103, 58, 183, 0.12);
+    color: #4527a0;
+  }
+}
+
+// Stock name + time
+.stock-col {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+
+  .stock-name {
+    font-weight: 600;
+    font-size: 0.88rem;
+  }
+
+  .trade-time {
+    font-size: 0.75rem;
+    color: rgba(0, 0, 0, 0.5);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+// Signal values row
+.signal-col {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.sig-item {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.07);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.78rem;
+  cursor: default;
+
+  &.conf-score {
+    background: rgba(103, 58, 183, 0.1);
+    color: #4527a0;
+    font-weight: 500;
+  }
+}
+
+// SL / TGT / qty params
+.trade-col {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  white-space: nowrap;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+
+  .param {
+    font-size: 0.78rem;
+    color: rgba(0, 0, 0, 0.6);
+
+    strong {
+      color: rgba(0, 0, 0, 0.85);
+    }
+  }
+}
+
+// Full-width rationale (spans all columns on a second row)
+.rationale-col {
+  grid-column: 1 / -1;
+  font-size: 0.78rem;
+  color: rgba(0, 0, 0, 0.55);
+  padding-top: 2px;
+  padding-left: 2px;
+  cursor: default;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

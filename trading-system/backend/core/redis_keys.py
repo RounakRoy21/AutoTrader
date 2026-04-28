@@ -11,7 +11,6 @@ HALT_KEY = "trading_halt"               # "TRUE" | "FALSE"
 
 # ── Groww authentication ──────────────────────────────────────────────────────
 GROWW_TOKEN_KEY = "groww_session_token"  # Groww access token (no expiry, persists until revoked)
-KITE_TOKEN_KEY = GROWW_TOKEN_KEY          # backward-compat alias (kite_client.py)
 
 # ── Agent status ───────────────────────────────────────────────────────────────
 RESEARCH_STATUS_KEY = "agent:research:status"   # "ACTIVE" | "INACTIVE" | "ERROR"
@@ -32,3 +31,26 @@ RISK_DRAWDOWN_PCT_KEY = "agent:risk:drawdown_pct"
 
 # ── Market data ────────────────────────────────────────────────────────────────
 LATEST_MARKET_BRIEF_KEY = "latest_market_brief"
+
+# Today's LLM-chosen watchlist — written by the Research Agent after each
+# successful run, read by load_instrument_map() so the scanner subscribes
+# to exactly the stocks the agent flagged.  TTL = 24 h (one trading day).
+TODAY_WATCHLIST_KEY = "today_watchlist"
+
+# ── Decision feed ─────────────────────────────────────────────────────────────
+# Rolling list of the last 100 decision engine events (pre-check rejections +
+# LLM decisions).  Stored as a Redis list (LPUSH / LTRIM); each entry is JSON.
+DECISION_FEED_KEY = "decision_feed"
+
+# ── Instrument map ─────────────────────────────────────────────────────────────
+# Cached symbol→token map built from Groww NSE instrument list.  TTL = 24 h.
+# Invalidated by the Research Agent after each brief so load_instrument_map()
+# re-fetches with the new watchlist before the 09:15 trading session starts.
+INSTRUMENT_MAP_KEY = "groww_instrument_map"
+
+# ── Anthropic API call counters (daily, auto-reset via TTL) ────────────────────
+# research = claude-sonnet calls (market brief generation, ~2/day)
+# decision = claude-haiku calls (trade decision engine, ~0–20/day in live mode)
+# TTL is set to 24 h on first increment so they reset automatically each day.
+ANTHROPIC_CALLS_RESEARCH_KEY = "anthropic_calls:today:research"
+ANTHROPIC_CALLS_DECISION_KEY = "anthropic_calls:today:decision"

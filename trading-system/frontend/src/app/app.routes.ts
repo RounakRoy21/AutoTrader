@@ -28,8 +28,13 @@ export const routes: Routes = [
       import('./features/system-alerts/system-alerts.component').then(m => m.SystemAlertsComponent),
   },
   {
+    path: 'decisions',
+    loadComponent: () =>
+      import('./features/decision-feed/decision-feed.component').then(m => m.DecisionFeedComponent),
+  },
+  {
     path: 'auth/groww',
     loadComponent: () =>
-      import('./features/kite-auth/kite-auth-callback.component').then(m => m.GrowwAuthCallbackComponent),
+      import('./features/groww-auth/groww-auth-callback.component').then(m => m.GrowwAuthCallbackComponent),
   },
 ];
