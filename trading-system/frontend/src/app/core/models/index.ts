@@ -85,6 +85,11 @@ export interface AgentStatus {
     calls_decision_today: number;
     calls_total_today: number;
   };
+  market_status?: {
+    status: 'OPEN' | 'PRE_OPEN' | 'CLOSED' | 'HOLIDAY' | 'WEEKEND';
+    is_open: boolean;
+    label: string;
+  };
   config?: {
     paper_trading: boolean;
     max_trades_per_day: number;

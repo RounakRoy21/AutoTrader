@@ -13,7 +13,7 @@ Update this file each December with the official holiday list for the next year.
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
 
 _IST = ZoneInfo("Asia/Kolkata")
@@ -69,3 +69,50 @@ def is_nse_holiday(d: date | None = None) -> bool:
         d = ist_today()
     year_holidays = _CALENDAR.get(d.year, frozenset())
     return d in year_holidays
+
+
+# ── Market Session Status ─────────────────────────────────────────────────────
+_MARKET_OPEN  = time(9, 15)
+_MARKET_CLOSE = time(15, 30)
+_PRE_OPEN_START = time(9, 0)
+
+# Status literals
+_STATUS_OPEN     = "OPEN"
+_STATUS_PRE_OPEN = "PRE_OPEN"
+_STATUS_CLOSED   = "CLOSED"
+_STATUS_HOLIDAY  = "HOLIDAY"
+_STATUS_WEEKEND  = "WEEKEND"
+
+
+def get_market_status() -> dict:
+    """Return the current NSE market session status based on IST clock + holiday calendar.
+
+    Returns a dict:
+        {
+            "status":  "OPEN" | "PRE_OPEN" | "CLOSED" | "HOLIDAY" | "WEEKEND",
+            "is_open": bool,   # True only during the continuous trading session
+            "label":   str,    # Human-readable label for the dashboard
+        }
+
+    Session times (IST):
+        09:00 – 09:15  Pre-Open (call auction)
+        09:15 – 15:30  Continuous trading (OPEN)
+        otherwise      Closed
+    """
+    now_ist = datetime.now(tz=_IST)
+    today = now_ist.date()
+    t = now_ist.time()
+
+    if today.weekday() >= 5:  # Saturday=5, Sunday=6
+        return {"status": _STATUS_WEEKEND, "is_open": False, "label": "Weekend"}
+
+    if is_nse_holiday(today):
+        return {"status": _STATUS_HOLIDAY, "is_open": False, "label": "NSE Holiday"}
+
+    if _PRE_OPEN_START <= t < _MARKET_OPEN:
+        return {"status": _STATUS_PRE_OPEN, "is_open": False, "label": "Pre-Open"}
+
+    if _MARKET_OPEN <= t <= _MARKET_CLOSE:
+        return {"status": _STATUS_OPEN, "is_open": True, "label": "Market Live"}
+
+    return {"status": _STATUS_CLOSED, "is_open": False, "label": "Market Closed"}

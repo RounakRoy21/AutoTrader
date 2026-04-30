@@ -58,6 +58,49 @@
   }
 }
 
+// ── Market status badge (System Status card header) ────────────────────────
+.status-header-spacer {
+  flex: 1 1 auto;
+}
+
+.market-status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  align-self: center;
+
+  .market-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  &.market-open {
+    background: rgba(76, 175, 80, 0.15);
+    color: #4caf50;
+    .market-dot { background: #4caf50; animation: pulse 1.8s infinite; }
+  }
+
+  &.market-pre-open {
+    background: rgba(255, 193, 7, 0.15);
+    color: #e6ac00;
+    .market-dot { background: #ffc107; }
+  }
+
+  &.market-closed {
+    background: rgba(150, 150, 150, 0.12);
+    color: #888;
+    .market-dot { background: #999; }
+  }
+}
+
 .halt-controls {
   display: flex;
   gap: 12px;

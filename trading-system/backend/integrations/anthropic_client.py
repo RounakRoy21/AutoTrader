@@ -9,7 +9,6 @@ Max 2 attempts per call — if both fail, the result is discarded.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from typing import Optional, Type, TypeVar
 
@@ -56,14 +55,14 @@ class AnthropicClient:
 
     def __init__(self) -> None:
         settings = get_settings()
-        # timeout=30.0: Claude Sonnet can take 15-25 s on complex prompts.
-        # Without an explicit timeout the SDK uses httpx's default (5 s connect
-        # + unlimited read), which causes silent hangs that block the scanner
-        # queue indefinitely.  30 s gives enough headroom while still bounding
-        # the worst-case delay to a predictable window.
+        # timeout=90.0: Claude Sonnet on the market-brief prompt (~8 k input tokens)
+        # regularly takes 25–50 s.  The previous 30 s limit caused the client to
+        # disconnect mid-response (HTTP 499) before Anthropic finished, which was
+        # then silently retried — producing 6 identical calls that all failed.
+        # Haiku is fast (<5 s) so 90 s gives both models ample headroom.
         self._client = anthropic.AsyncAnthropic(
             api_key=settings.anthropic_api_key,
-            timeout=30.0,
+            timeout=90.0,
         )
         self._model = settings.anthropic_model
 
@@ -89,6 +88,11 @@ class AnthropicClient:
                     system=system_prompt,
                     messages=[{"role": "user", "content": user_content}],
                 )
+                # Increment daily call counter immediately after a successful HTTP
+                # response — before validation — so we count every billed API call
+                # regardless of whether Pydantic parsing succeeds.
+                await _increment_call_counter(active_model)
+
                 raw_text = message.content[0].text.strip()
 
                 # Strip markdown code fences if present
@@ -102,8 +106,6 @@ class AnthropicClient:
                 logger.info(
                     "LLM response validated (model=%s, attempt=%d)", active_model, attempt
                 )
-                # Fire-and-forget daily call counter increment (non-blocking)
-                asyncio.ensure_future(_increment_call_counter(active_model))
                 return parsed
 
             except (json.JSONDecodeError, ValidationError) as exc:
@@ -111,8 +113,18 @@ class AnthropicClient:
                     "LLM output validation failed (attempt %d/%d): %s",
                     attempt, MAX_LLM_RETRIES, exc,
                 )
+            except anthropic.APITimeoutError as exc:
+                logger.error(
+                    "Anthropic request timed out (attempt %d/%d) — "
+                    "consider raising timeout or reducing prompt size: %s",
+                    attempt, MAX_LLM_RETRIES, exc,
+                )
+                if attempt < MAX_LLM_RETRIES:
+                    await asyncio.sleep(5)
             except anthropic.APIError as exc:
                 logger.error("Anthropic API error (attempt %d/%d): %s", attempt, MAX_LLM_RETRIES, exc)
+                if attempt < MAX_LLM_RETRIES:
+                    await asyncio.sleep(2)
 
         logger.error("LLM call failed after %d attempts — discarding signal", MAX_LLM_RETRIES)
         return None
@@ -128,3 +140,4 @@ def get_anthropic_client() -> AnthropicClient:
     if _client is None:
         _client = AnthropicClient()
     return _client
+

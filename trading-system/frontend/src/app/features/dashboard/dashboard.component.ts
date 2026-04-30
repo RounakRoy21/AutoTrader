@@ -165,6 +165,18 @@ export class DashboardComponent implements OnInit, OnDestroy {
     return 'primary';
   }
 
+  get marketStatusLabel(): string {
+    return this.agentStatus.market_status?.label ?? '—';
+  }
+
+  get marketStatusClass(): string {
+    switch (this.agentStatus.market_status?.status) {
+      case 'OPEN':     return 'market-open';
+      case 'PRE_OPEN': return 'market-pre-open';
+      default:         return 'market-closed';
+    }
+  }
+
   get totalPnl(): number {
     return this.todayPnl + this.unrealizedPnl;
   }
@@ -175,6 +187,12 @@ export class DashboardComponent implements OnInit, OnDestroy {
 
   get maxPositions(): number {
     return this.agentStatus.config?.max_open_positions ?? 3;
+  }
+
+  buildAnthropicTooltip(a: AgentStatus['anthropic']): string {
+    const r = a?.calls_research_today ?? 0;
+    const d = a?.calls_decision_today ?? 0;
+    return `Research (Sonnet): ${r} calls · Decision (Haiku): ${d} calls`;
   }
 
   get vixValue(): number | null {

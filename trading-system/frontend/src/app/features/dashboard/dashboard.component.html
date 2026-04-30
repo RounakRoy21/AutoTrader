@@ -3,6 +3,10 @@
   <mat-card class="status-card">
     <mat-card-header>
       <mat-card-title>System Status</mat-card-title>
+      <span class="status-header-spacer"></span>
+      <span class="market-status-badge" [ngClass]="marketStatusClass">
+        <span class="market-dot"></span>{{ marketStatusLabel }}
+      </span>
     </mat-card-header>
     <mat-card-content>
       <div class="status-row">
@@ -172,7 +176,7 @@
       </div>
       <div class="stat-divider"></div>
       <div class="stat-item"
-           [matTooltip]="'Research (Sonnet): ' + (agentStatus.anthropic?.calls_research_today ?? 0) + ' calls · Decision (Haiku): ' + (agentStatus.anthropic?.calls_decision_today ?? 0) + ' calls'">
+           [matTooltip]="buildAnthropicTooltip(agentStatus.anthropic)">
         <span class="stat-label">Anthropic API (today)</span>
         <span class="stat-value"
               [class.loss]="(agentStatus.anthropic?.calls_total_today ?? 0) >= 40">

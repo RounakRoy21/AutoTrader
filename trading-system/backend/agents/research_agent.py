@@ -178,7 +178,14 @@ RESEARCH_SYSTEM_PROMPT = (
     "percentages are unknown. Do not fabricate beat_pct values.\n"
     "  • If earnings_calendar is empty, return earnings_drift_candidates as [].\n"
     "  • earnings_calendar stocks with upcoming results near a VIX STRESS or ELEVATED regime "
-    "should be treated as doubly uncertain — lean towards avoid_today."
+    "should be treated as doubly uncertain — lean towards avoid_today.\n\n"
+    "OUTPUT SIZE RULES:\n"
+    "  • news_flags: return at most 15 items. Include only HIGH and MEDIUM urgency flags. "
+    "Discard LOW urgency items entirely — they add no trading value.\n"
+    "  • headline: truncate to 120 characters maximum. Do not pad or paraphrase — "
+    "use the start of the actual title.\n"
+    "  • type: use a short snake_case label, max 4 words (e.g. EARNINGS_BEAT, FII_SELLING, "
+    "REGULATORY_ACTION, MACRO_DATA, SECTOR_NEWS). Never write a sentence."
 )
 
 
@@ -706,6 +713,8 @@ async def generate_market_brief(raw_data: dict) -> MarketBriefLLMOutput | None:
         system_prompt=RESEARCH_SYSTEM_PROMPT,
         user_content=user_content,
         response_model=MarketBriefLLMOutput,
+        max_tokens=6000,   # Sonnet on the research prompt needs ~3000–5000 tokens;
+                           # 4096 (the default) causes truncation → retry → double call.
     )
     if brief is None:
         logger.warning("LLM failed — falling back to mock brief")

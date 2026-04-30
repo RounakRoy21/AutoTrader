@@ -11,7 +11,7 @@ An automated NSE intraday equity trading system. Streams live tick data from Gro
                      │                 FastAPI Backend                     │
 09:15–15:30 IST      │                                                     │
                      │  ┌────────────┐    ┌─────────────────────────────┐  │
-  GrowwFeed WS ───►│  │  Scanner   │───►│     Decision Engine         │  │
+  GrowwFeed WS ───►  │  │  Scanner   │───►│     Decision Engine         │  │
   (live ticks)       │  │            │    │  (Claude Haiku 4.5)         │  │
                      │  │  VWAP      │    │  SignalAudit thresholds:    │  │
                      │  │  RSI 14    │    │  • RSI 40–72                │  │

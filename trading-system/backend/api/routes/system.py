@@ -33,6 +33,7 @@ from core.redis_keys import (
     ANTHROPIC_CALLS_DECISION_KEY,
     DECISION_FEED_KEY,
 )
+from core.nse_calendar import get_market_status
 from agents.trading_agent_manager import get_trading_agent_manager
 
 logger = logging.getLogger(__name__)
@@ -93,6 +94,7 @@ async def get_agent_status():
     settings = get_settings()
     calls_research = int(values[13]) if values[13] else 0
     calls_decision = int(values[14]) if values[14] else 0
+
     return _envelope(True, {
         "research_agent": {
             "status": values[0] or "INACTIVE",
@@ -118,6 +120,7 @@ async def get_agent_status():
             "calls_decision_today": calls_decision,
             "calls_total_today": calls_research + calls_decision,
         },
+        "market_status": get_market_status(),
         "config": {
             "paper_trading": settings.paper_trading,
             "max_trades_per_day": settings.max_trades_per_day,
