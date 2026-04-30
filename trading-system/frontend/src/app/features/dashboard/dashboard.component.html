@@ -29,8 +29,12 @@
 
       <!-- Drawdown bar -->
       <div class="drawdown-section" *ngIf="agentStatus.risk_manager">
-        <div class="drawdown-label">
+        <div class="drawdown-label"
+             [matTooltip]="drawdownTooltip"
+             matTooltipClass="multiline-tooltip"
+             matTooltipPosition="above">
           Daily Drawdown: {{ drawdownPct | number:'1.1-1' }}%
+          <mat-icon class="info-icon" inline>info_outline</mat-icon>
           <span class="drawdown-loss"
                 *ngIf="agentStatus.risk_manager.daily_loss > 0">
             (₹{{ agentStatus.risk_manager.daily_loss | number:'1.0-0' }} lost)

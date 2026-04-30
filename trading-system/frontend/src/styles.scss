@@ -27,3 +27,8 @@ html, body {
   background: #b71c1c !important;
   color: #fff !important;
 }
+
+// Multi-line tooltips (used with matTooltipClass="multiline-tooltip")
+.multiline-tooltip {
+  white-space: pre-line !important;
+}

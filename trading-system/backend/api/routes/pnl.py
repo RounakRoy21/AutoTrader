@@ -9,7 +9,7 @@ from typing import List, Optional, Union
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
-from sqlalchemy import and_, select
+from sqlalchemy import and_, distinct, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database import get_db
@@ -47,8 +47,12 @@ async def get_daily_pnl(
 ):
     """Return daily P&L summaries for the last *days* days.
 
-    If today has no EOD row yet (intraday), a synthetic live row is prepended
-    computed from today's CLOSED trades, so the dashboard shows real-time P&L.
+    Handles two gap cases automatically:
+    1. TODAY — no EOD row yet: prepends a live intraday row computed from
+       today's CLOSED trades so the dashboard shows real-time P&L.
+    2. PAST DAYS — EOD row missing (system was down at 15:30 IST): synthesises
+       a summary row from closed trades so days are never silently absent from
+       the P&L chart even when the risk manager didn't complete an EOD run.
     """
     today = date.today()
 
@@ -57,7 +61,7 @@ async def get_daily_pnl(
     )
     rows: list[Union[DailyPnl, DailyPnlResponse]] = list(result.scalars().all())
 
-    # Prepend a live intraday row if no EOD row exists for today
+    # ── Case 1: live intraday row for today ─────────────────────────────────
     if not rows or rows[0].date != today:  # type: ignore[union-attr]
         closed_result = await db.execute(
             select(Trade).where(
@@ -87,4 +91,52 @@ async def get_daily_pnl(
         )
         rows.insert(0, intraday)
 
-    return rows
+    # ── Case 2: backfill past days that have trades but no DailyPnl row ─────
+    # Find which past trade dates already have a DailyPnl row.
+    existing_dates = {r.date for r in rows}  # type: ignore[union-attr]
+
+    # Query all distinct past trade dates that are NOT in the DailyPnl table.
+    orphan_result = await db.execute(
+        select(distinct(Trade.trade_date)).where(
+            and_(Trade.trade_date < today, Trade.status == "CLOSED")
+        )
+    )
+    orphan_dates = [d for (d,) in orphan_result.all() if d not in existing_dates]
+
+    if orphan_dates:
+        # Fetch all trades for those dates in one query.
+        trades_result = await db.execute(
+            select(Trade).where(
+                and_(Trade.trade_date.in_(orphan_dates), Trade.status == "CLOSED")
+            )
+        )
+        all_orphan_trades = trades_result.scalars().all()
+
+        # Group by date and synthesise a summary row for each.
+        from collections import defaultdict
+        by_date: dict[date, list] = defaultdict(list)
+        for t in all_orphan_trades:
+            by_date[t.trade_date].append(t)
+
+        for d, trades in by_date.items():
+            realized = sum(t.realized_pnl or 0.0 for t in trades)
+            total = len(trades)
+            wins = sum(1 for t in trades if (t.realized_pnl or 0.0) > 0)
+            rows.append(DailyPnlResponse(
+                id=0,
+                date=d,
+                starting_capital=0.0,
+                ending_capital=0.0,
+                realized_pnl=realized,
+                unrealized_pnl=0.0,
+                total_trades=total,
+                winning_trades=wins,
+                losing_trades=total - wins,
+                return_pct=0.0,
+                trading_halted=False,
+            ))
+
+    # Re-sort descending after any backfill insertions.
+    rows.sort(key=lambda r: r.date, reverse=True)  # type: ignore[union-attr]
+
+    return rows[:days]

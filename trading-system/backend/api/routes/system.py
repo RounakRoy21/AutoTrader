@@ -125,6 +125,8 @@ async def get_agent_status():
             "paper_trading": settings.paper_trading,
             "max_trades_per_day": settings.max_trades_per_day,
             "max_open_positions": settings.max_open_positions,
+            "daily_drawdown_limit_pct": settings.daily_drawdown_limit_pct,
+            "daily_drawdown_limit": settings.daily_drawdown_limit,
         },
     })
 
@@ -152,7 +154,7 @@ async def manual_start_trading():
     Useful for testing, catch-up after a restart, or weekend ops.
     """
     manager = get_trading_agent_manager()
-    result = await manager.start_session()
+    result = await manager.start_session(source="manual")
     success = result in ("started", "already_running")
     return _envelope(success, {"result": result})
 
@@ -161,7 +163,7 @@ async def manual_start_trading():
 async def manual_stop_trading():
     """Manually stop the Trading Agent (overrides the 15:30 scheduler)."""
     manager = get_trading_agent_manager()
-    result = await manager.stop_session()
+    result = await manager.stop_session(source="manual")
     return _envelope(True, {"result": result})
 
 

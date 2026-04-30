@@ -93,6 +93,15 @@ class AnthropicClient:
                 # regardless of whether Pydantic parsing succeeds.
                 await _increment_call_counter(active_model)
 
+                # Log token usage from the response — no extra API call needed;
+                # message.usage is always populated by the Anthropic SDK.
+                logger.info(
+                    "LLM usage: model=%s input_tokens=%d output_tokens=%d",
+                    active_model,
+                    message.usage.input_tokens,
+                    message.usage.output_tokens,
+                )
+
                 raw_text = message.content[0].text.strip()
 
                 # Strip markdown code fences if present

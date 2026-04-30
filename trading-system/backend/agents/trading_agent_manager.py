@@ -54,11 +54,16 @@ class TradingAgentManager:
         """Expose the inner TradingAgent (for status queries, etc.)."""
         return self._agent
 
-    async def start_session(self) -> str:
+    async def start_session(self, source: str = "scheduler") -> str:
         """
         Start a new trading session.
         Idempotent — returns 'already_running' if a session is active.
         NSE holiday guard: returns 'nse_holiday' without starting if today is a non-trading day.
+
+        *source* describes what triggered the start and is included in the system alert:
+          - 'scheduler'  — 09:15 IST APScheduler cron job (normal market open)
+          - 'startup'    — backend restarted during market hours (catch-up auto-start)
+          - 'manual'     — user pressed Start Agent in the dashboard / called the API
         """
         if is_nse_holiday():
             logger.info("[Manager] Today is an NSE holiday — trading session will not start")
@@ -81,18 +86,27 @@ class TradingAgentManager:
         )
         self._task.add_done_callback(self._on_session_ended)
 
+        _start_messages = {
+            "scheduler": "Trading session started (09:15 auto-scheduler)",
+            "startup":   "Trading session started (backend restarted during market hours)",
+            "manual":    "Trading session started manually via dashboard",
+        }
         await publish("system_alerts", {
             "type": "info",
-            "message": "Trading session started (09:15 scheduler)",
+            "message": _start_messages.get(source, f"Trading session started ({source})"),
             "timestamp": _now_iso(),
         })
-        logger.info("[Manager] Trading session started ✅")
+        logger.info("[Manager] Trading session started ✅ (source=%s)", source)
         return "started"
 
-    async def stop_session(self) -> str:
+    async def stop_session(self, source: str = "scheduler") -> str:
         """
         Stop the current trading session gracefully.
         Returns 'stopped' or 'not_running'.
+
+        *source* describes what triggered the stop and is included in the system alert:
+          - 'scheduler'  — 15:30 IST APScheduler cron job (normal market close)
+          - 'manual'     — user pressed Stop Agent in the dashboard / called the API
         """
         if not self.is_running or self._agent is None:
             logger.info("[Manager] No active trading session — ignoring stop request")
@@ -110,12 +124,16 @@ class TradingAgentManager:
         self._agent = None
         self._task = None
 
+        _stop_messages = {
+            "scheduler": "Trading session stopped (15:30 auto-scheduler)",
+            "manual":    "Trading session stopped manually via dashboard",
+        }
         await publish("system_alerts", {
             "type": "info",
-            "message": "Trading session stopped (15:30 scheduler)",
+            "message": _stop_messages.get(source, f"Trading session stopped ({source})"),
             "timestamp": _now_iso(),
         })
-        logger.info("[Manager] Trading session stopped ✅")
+        logger.info("[Manager] Trading session stopped ✅ (source=%s)", source)
         return "stopped"
 
     # ── Internal helpers ──────────────────────────────────────────────

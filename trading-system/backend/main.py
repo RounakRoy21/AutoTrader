@@ -108,12 +108,14 @@ async def lifespan(app: FastAPI):
         job_id="trading_agent_start",
         hour=9,
         minute=15,
+        kwargs={"source": "scheduler"},
     )
     schedule_cron(
         func=trading_manager.stop_session,
         job_id="trading_agent_stop",
         hour=15,
         minute=30,
+        kwargs={"source": "scheduler"},
     )
 
     start_scheduler()
@@ -139,7 +141,7 @@ async def lifespan(app: FastAPI):
             "market hours" if _in_market_hours else "extended-hours (paper)",
             _now_ist.strftime("%H:%M"),
         )
-        asyncio.create_task(trading_manager.start_session())
+        asyncio.create_task(trading_manager.start_session(source="startup"))
 
     # 8. Start WebSocket background tasks (Redis relay + LTP broadcaster)
     #    These must start after the event loop is running, hence here not at import time.

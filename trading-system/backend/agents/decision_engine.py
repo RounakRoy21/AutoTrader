@@ -490,23 +490,15 @@ class DecisionEngine:
             else signal.ltp * (1 + self._settings.min_target_pct),
             2,
         )
+        # Strip None-valued indicator fields (ema_9/21, macd_histogram, atr, rsi_5m)
+        # when they aren't available yet — they add ~50 tokens of null noise per call.
+        signal_dict = {k: v for k, v in signal.model_dump().items() if v is not None}
         user_content = (
-            f"TRADE SIGNAL:\n{json.dumps(signal.model_dump(), default=str)}\n\n"
+            f"TRADE SIGNAL:\n{json.dumps(signal_dict, default=str)}\n\n"
             f"MARKET BRIEF:\n{brief_summary}\n\n"
             f"Pre-computed stop_loss_price: {sl_price} (include this exact value in your JSON).\n"
             f"Pre-computed target_price: {tgt_price} (include this exact value in your JSON).\n"
             f"Today is {datetime.now(IST).strftime('%A')}.{earnings_alert}\n\n"
-            "THRESHOLDS QUICK REFERENCE (apply to signal_audit fields):\n"
-            f"  RSI valid zone (LONG): {RSI_LONG_MIN}–{RSI_LONG_MAX}  "
-            f"| hard reject < {RSI_HARD_REJECT_LOW} or > {RSI_HARD_REJECT_HIGH}\n"
-            f"  Volume ratio minimum: {VOLUME_RATIO_MIN}×  "
-            f"| hard reject < {VOLUME_RATIO_HARD_REJECT}×\n"
-            f"  VWAP deviation (LONG): 0 %–{VWAP_DEV_MAX_PCT} %  "
-            f"| hard reject > {VWAP_DEV_HARD_REJECT_PCT} % above or < {VWAP_DEV_BELOW_HARD_PCT} % (below VWAP)  "
-            f"| reduce > {VWAP_DEV_REDUCE_PCT} % above or any below VWAP\n"
-            f"  R:R minimum: {RR_MIN}  "
-            f"| Confidence → EXECUTE ≥ {CONFIDENCE_REDUCE_THRESHOLD}, "
-            f"REDUCE ≥ {CONFIDENCE_HARD_REJECT}, else REJECT\n\n"
             "Return your decision as a JSON object."
         )
 

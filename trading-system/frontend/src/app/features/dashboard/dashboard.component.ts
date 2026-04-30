@@ -189,6 +189,19 @@ export class DashboardComponent implements OnInit, OnDestroy {
     return this.agentStatus.config?.max_open_positions ?? 3;
   }
 
+  get drawdownTooltip(): string {
+    const loss = this.agentStatus.risk_manager?.daily_loss ?? 0;
+    const limit = this.agentStatus.config?.daily_drawdown_limit;
+    const pct = this.agentStatus.config?.daily_drawdown_limit_pct;
+    const pctLabel = pct != null ? `${(pct * 100).toFixed(0)}%` : '3%';
+    const limitLabel = limit != null ? `₹${limit.toLocaleString('en-IN', { maximumFractionDigits: 0 })}` : 'your daily limit';
+    return [
+      `How close today's losses are to the auto-halt threshold.`,
+      `₹${loss.toLocaleString('en-IN', { maximumFractionDigits: 0 })} lost · Limit = ${pctLabel} of capital = ${limitLabel}`,
+      `Trading halts automatically at 100%.`,
+    ].join('\n');
+  }
+
   buildAnthropicTooltip(a: AgentStatus['anthropic']): string {
     const r = a?.calls_research_today ?? 0;
     const d = a?.calls_decision_today ?? 0;

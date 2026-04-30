@@ -150,7 +150,26 @@ RESEARCH_SYSTEM_PROMPT = (
     "signal; recommend HALF_SIZE_POSITIONS.\n"
     "    - change_pct < -0.5%: risk-on signal, mildly supportive for equities.\n"
     "    - Jewellery stocks (TITAN): gold rally > +1% is modestly BULLISH for TITAN as "
-    "investor interest in gold/silver jewellery rises; add to watchlist if no other negatives.\n\n"
+    "investor interest in gold/senior jewellery rises; add to watchlist if no other negatives.\n\n"
+    "NSE SECTOR INDICES INTERPRETATION RULES:\n"
+    "  • nse_sector_indices contains live NSE index values: NIFTY BANK, NIFTY IT, NIFTY PHARMA, "
+    "NIFTY AUTO, NIFTY FMCG, NIFTY METAL, NIFTY ENERGY, NIFTY REALTY, etc. "
+    "Each entry has current, previous_close, and percent_change.\n"
+    "  • Use this to distinguish broad market weakness from defensive rotation — two patterns "
+    "that look identical at the Nifty 50 index level but require different trading responses:\n"
+    "    - BROAD SELLOFF: 7+ sectors negative with cyclicals (BANK, IT, AUTO, METAL) leading "
+    "the decline → high-conviction BEARISH, all sectors confirming weakness. "
+    "Increase bias_confidence by 0.05–0.10 on a BEARISH call.\n"
+    "    - DEFENSIVE ROTATION: cyclical sectors (BANK, IT, AUTO, METAL) down while defensive "
+    "sectors (PHARMA, FMCG) are flat or positive → money is rotating, not fleeing. "
+    "This is NEUTRAL, not BEARISH. Do NOT assign BEARISH bias solely on cyclical weakness "
+    "when defensives are holding. Recommend HALF_SIZE_POSITIONS, favour defensive-sector stocks.\n"
+    "    - BROAD RALLY: 7+ sectors positive → adds conviction to BULLISH bias.\n"
+    "  • NIFTY BANK weight note: Financials are ~35% of Nifty 50. NIFTY BANK movement "
+    "dominates the index. A 2%+ move in NIFTY BANK (either direction) is more significant "
+    "than a 2%+ move in any other sector index — weight it accordingly.\n"
+    "  • When nse_sector_indices is empty (NSE API unavailable or pre-open), ignore this section "
+    "and rely on the other signals.\n\n"
     "DXY AND USD/INR INTERPRETATION RULES:\n"
     "  • dxy.value is the ICE US Dollar Index level (typically 95–110). "
     "dxy.trend: STRENGTHENING = USD gaining vs basket; WEAKENING = USD losing vs basket.\n"
@@ -269,10 +288,21 @@ async def collect_pre_market_data() -> dict:
     # Handle any failures gracefully
     # mode='json' gives ISO-8601 datetimes; exclude 'link' because URLs
     # consume ~100 tokens each and Claude cannot act on them.
-    raw_news = (
-        [item.model_dump(mode="json", exclude={"link"}) for item in news_items]
-        if not isinstance(news_items, Exception) else []
-    )
+    if not isinstance(news_items, Exception):
+        _all_news = sorted(
+            [item.model_dump(mode="json", exclude={"link"}) for item in news_items],
+            key=lambda x: x.get("age_minutes", 9999),  # most recent first
+        )
+        # Drop old generic-RSS background items (no stock_tag, older than 12 h).
+        # Stock-tagged items (confirmed company-specific) are always kept.
+        # Cap at 35 items: LLM returns max 15 flags, so 35 gives enough variety
+        # without padding the prompt with low-signal noise.
+        raw_news = [
+            n for n in _all_news
+            if n.get("stock_tag") or n.get("age_minutes", 9999) <= 720
+        ][:35]
+    else:
+        raw_news = []
 
     # Detect total news blackout (network outage / IP block at 6 AM).
     # fetch_all() never raises — it returns [] on full failure — so we must
@@ -297,8 +327,9 @@ async def collect_pre_market_data() -> dict:
         # NSE allIndices (live Nifty50) when available, Yahoo Finance otherwise.
         "sgx_nifty": sgx_nifty if not isinstance(sgx_nifty, Exception) else {"error": str(sgx_nifty)},
         "india_vix": india_vix if not isinstance(india_vix, Exception) else {"value": 0.0, "regime": "UNKNOWN"},
-        # sector_indices: passed as supplementary context (not in LLM prompt today,
-        # available for future use or manual inspection via logs)
+        # sector_indices: included in raw_data so Claude receives live sector performance.
+        # Interpretation rules are in RESEARCH_SYSTEM_PROMPT under
+        # "NSE SECTOR INDICES INTERPRETATION RULES".
         "nse_sector_indices": (
             nse_indices.get("sector_indices", {})
             if not isinstance(nse_indices, Exception) and nse_indices.get("available")
@@ -704,7 +735,9 @@ async def generate_market_brief(raw_data: dict) -> MarketBriefLLMOutput | None:
     user_content = (
         f"Today is {now_ist.strftime('%Y-%m-%d')} ({now_ist.strftime('%A')}). "
         f"Current time: {now_ist.strftime('%H:%M:%S')} IST.\n\n"
-        f"RAW DATA:\n{json.dumps(raw_data, indent=2, default=str)}\n\n"
+        # separators=(',',':') produces compact JSON with no whitespace — saves ~25-30%
+        # of tokens vs indent=2 on a typical ~8 k-token data payload.
+        f"RAW DATA:\n{json.dumps(raw_data, separators=(',', ':'), default=str)}\n\n"
         "Generate the market brief JSON."
     )
 
