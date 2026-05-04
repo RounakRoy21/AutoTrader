@@ -67,36 +67,28 @@ proot-distro login ubuntu
 
 You're now inside Ubuntu. **All commands from here until Section 1.4 run inside this Ubuntu shell.**
 
-### 1.3 — Run the Install Script
-
-```bash
-# Install everything: packages, PostgreSQL, Redis, clone repo, build frontend, configure nginx
-bash <(curl -fsSL https://raw.githubusercontent.com/<your-org>/<your-repo>/main/trading-system/scripts/android/install.sh) \
-     <your-git-repo-url>
-```
-
-If you can't reach raw.githubusercontent.com, clone manually and run it:
+### 1.3 — Clone the Repo and Run the Install Script
 
 ```bash
 apt install git -y
-git clone <your-git-repo-url> /root/autotrader
-bash /root/autotrader/trading-system/scripts/android/install.sh <your-git-repo-url>
+git clone https://github.com/RounakRoy21/AutoTrader.git /root/autotrader
+bash /root/autotrader/trading-system/scripts/android/install.sh https://github.com/RounakRoy21/AutoTrader.git
 ```
 
-The script pauses mid-way to let you fill in your `.env` file. When it prompts:
+The script pauses mid-way and asks you to fill in your `.env` file:
 
 ```bash
 nano /root/autotrader/trading-system/.env
 ```
 
-Fill in:
+The file will already have the database and Redis URLs set correctly. Fill in your credentials:
 
 ```env
-# These already set correctly by install.sh — don't change them:
+# Already set correctly — do not change:
 DATABASE_URL=postgresql+asyncpg://autotrader:changeme_postgres_password@localhost/autotrader
 REDIS_URL=redis://localhost:6379
 
-# Fill these in:
+# Your credentials:
 GROWW_CLIENT_ID=your_groww_client_id
 GROWW_PASSWORD=your_groww_password
 GROWW_TOTP_SECRET=your_base32_totp_secret
@@ -104,7 +96,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 TELEGRAM_BOT_TOKEN=123456:ABC-...
 TELEGRAM_CHAT_ID=your_chat_id
 
-# Leave as true until you're confident:
+# Leave as true until you're confident in live trading:
 PAPER_TRADING=true
 ADMIN_API_KEY=change_me_to_something_random
 ```

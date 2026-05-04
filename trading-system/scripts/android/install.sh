@@ -34,7 +34,7 @@ info() { echo "  → $*"; }
 fail() { echo; echo "  ✗ ERROR: $*"; exit 1; }
 
 if [ -z "$REPO_URL" ]; then
-    fail "Usage: bash install.sh <git-repo-url>"
+    fail "Usage: bash install.sh <git-repo-url>\n  Example: bash install.sh https://github.com/RounakRoy21/AutoTrader.git"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────

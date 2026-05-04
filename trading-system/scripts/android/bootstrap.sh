@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/bash
+#!/usr/bin/env bash
 # bootstrap.sh — run in Termux (NOT inside Ubuntu) to set up or re-attach the
 # AutoTrader tmux session.
 #
