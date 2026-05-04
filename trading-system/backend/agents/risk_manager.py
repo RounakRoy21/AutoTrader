@@ -654,6 +654,29 @@ class RiskManager:
         else:
             sharpe = 0.0
 
+        # Average realised R:R = avg(winning P&L) / avg(abs(losing P&L))
+        if positive_pnls and negative_pnls:
+            avg_win = sum(positive_pnls) / len(positive_pnls)
+            avg_loss = abs(sum(negative_pnls) / len(negative_pnls))
+            avg_realised_rr = round(avg_win / avg_loss, 2) if avg_loss > 0 else 0.0
+        elif positive_pnls:
+            avg_realised_rr = 999.0
+        else:
+            avg_realised_rr = 0.0
+
+        # Loss time distribution — bucket SL exits by session phase
+        losses_before_1030 = 0
+        losses_1030_to_1330 = 0
+        losses_after_1330 = 0
+        for t in closed:
+            if (t.realized_pnl or 0) < 0 and t.exit_time:
+                if t.exit_time < dt_time(10, 30):
+                    losses_before_1030 += 1
+                elif t.exit_time < dt_time(13, 30):
+                    losses_1030_to_1330 += 1
+                else:
+                    losses_after_1330 += 1
+
         halt = await get_value(HALT_KEY)
 
         # Persist to DB — upsert to survive process restarts
@@ -677,6 +700,10 @@ class RiskManager:
                 eod.sharpe_ratio = sharpe
                 eod.avg_trade_duration_min = avg_duration
                 eod.max_consecutive_losses = max_consec_losses
+                eod.avg_realised_rr = avg_realised_rr
+                eod.losses_before_1030 = losses_before_1030
+                eod.losses_1030_to_1330 = losses_1030_to_1330
+                eod.losses_after_1330 = losses_after_1330
                 session.add(eod)
             else:
                 eod = DailyPnl(
@@ -694,6 +721,10 @@ class RiskManager:
                     sharpe_ratio=sharpe,
                     avg_trade_duration_min=avg_duration,
                     max_consecutive_losses=max_consec_losses,
+                    avg_realised_rr=avg_realised_rr,
+                    losses_before_1030=losses_before_1030,
+                    losses_1030_to_1330=losses_1030_to_1330,
+                    losses_after_1330=losses_after_1330,
                 )
                 session.add(eod)
 
@@ -708,8 +739,12 @@ class RiskManager:
             "return_pct": return_pct,
             "profit_factor": profit_factor,
             "sharpe_ratio": sharpe,
+            "avg_realised_rr": avg_realised_rr,
             "avg_duration_min": avg_duration,
             "max_consecutive_losses": max_consec_losses,
+            "losses_before_1030": losses_before_1030,
+            "losses_1030_to_1330": losses_1030_to_1330,
+            "losses_after_1330": losses_after_1330,
         }
         await publish("eod_report", eod_data)
         await publish("system_alerts", {
@@ -717,17 +752,22 @@ class RiskManager:
             "message": (
                 f"EOD Report: {total} trades | W{won}/L{lost} | "
                 f"P&L ₹{net_pnl:.2f} ({return_pct:.2f}%) | "
-                f"PF={profit_factor} Sharpe={sharpe} AvgDur={avg_duration}m"
+                f"PF={profit_factor} R:R={avg_realised_rr} Sharpe={sharpe} AvgDur={avg_duration}m"
             ),
             "timestamp": datetime.now(IST).isoformat(),
         })
 
         # Telegram
-        await send_eod_report(total, won, lost, net_pnl, return_pct)
+        await send_eod_report(
+            total, won, lost, net_pnl, return_pct,
+            losses_before_1030, losses_1030_to_1330, losses_after_1330,
+        )
 
         logger.info(
             "═══ EOD: trades=%d W%d/L%d pnl=₹%.2f (%.2f%%) | "
-            "PF=%.2f Sharpe=%.2f AvgDur=%.1fm MaxConsecL=%d ═══",
+            "PF=%.2f R:R=%.2f Sharpe=%.2f AvgDur=%.1fm MaxConsecL=%d | "
+            "Losses: pre-10:30=%d mid=%d late=%d ═══",
             total, won, lost, net_pnl, return_pct,
-            profit_factor, sharpe, avg_duration, max_consec_losses,
+            profit_factor, avg_realised_rr, sharpe, avg_duration, max_consec_losses,
+            losses_before_1030, losses_1030_to_1330, losses_after_1330,
         )

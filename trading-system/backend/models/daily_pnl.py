@@ -35,6 +35,11 @@ class DailyPnl(Base):
     sharpe_ratio: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     avg_trade_duration_min: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     max_consecutive_losses: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    avg_realised_rr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # ── Loss time distribution (Finding 4 — session phase diagnostics) ───────
+    losses_before_1030: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    losses_1030_to_1330: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    losses_after_1330: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

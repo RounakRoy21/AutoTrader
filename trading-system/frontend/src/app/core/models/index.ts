@@ -58,6 +58,14 @@ export interface DailyPnl {
   losing_trades: number;
   return_pct: number;
   trading_halted: boolean;
+  profit_factor: number | null;
+  sharpe_ratio: number | null;
+  avg_trade_duration_min: number | null;
+  max_consecutive_losses: number | null;
+  avg_realised_rr: number | null;
+  losses_before_1030: number | null;
+  losses_1030_to_1330: number | null;
+  losses_after_1330: number | null;
 }
 
 export interface AgentStatus {

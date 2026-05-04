@@ -4,12 +4,18 @@ Anthropic API wrapper.
   Decision Engine → claude-haiku-4-5-20251001  (configured via ANTHROPIC_DECISION_MODEL)
 Validates every LLM response against the provided Pydantic model.
 Max 2 attempts per call — if both fail, the result is discarded.
+
+Structured output strategy: tool use with forced tool_choice.
+  Instead of asking the model to "return JSON" in the prompt (which it can ignore),
+  we pass the Pydantic model's JSON schema as a tool and set tool_choice to force
+  the model to call it.  The model physically cannot return prose — the API
+  enforces the schema.  tool_block.input arrives as a pre-parsed dict, so
+  json.loads() and markdown-fence stripping are gone entirely.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from typing import Optional, Type, TypeVar
 
@@ -77,16 +83,33 @@ class AnthropicClient:
     ) -> Optional[T]:
         """
         Send a prompt to Claude and validate the response against *response_model*.
-        Pass *model* to override the default (e.g. use Haiku for the Decision Engine).
+
+        Uses Anthropic tool use with a forced tool_choice so the model cannot
+        return prose, preamble, or markdown — it must fill the schema.
+        tool_block.input arrives as a pre-parsed dict; json.loads() is gone.
+
+        Pass *model* to override the default (e.g. Haiku for the Decision Engine).
         Returns the parsed Pydantic object or None if validation fails after retries.
         """
         active_model = model or self._model
+
+        # Build a single tool from the Pydantic model's JSON schema.
+        # tool_choice forces the model to always call this tool — no free-text path.
+        _TOOL_NAME = "submit_response"
+        tools = [{
+            "name": _TOOL_NAME,
+            "description": "Submit your structured response matching the required schema exactly.",
+            "input_schema": response_model.model_json_schema(),
+        }]
+
         for attempt in range(1, MAX_LLM_RETRIES + 1):
             try:
                 message = await self._client.messages.create(
                     model=active_model,
                     max_tokens=max_tokens,
                     system=system_prompt,
+                    tools=tools,
+                    tool_choice={"type": "tool", "name": _TOOL_NAME},
                     messages=[{"role": "user", "content": user_content}],
                 )
                 # Increment daily call counter immediately after a successful HTTP
@@ -97,28 +120,34 @@ class AnthropicClient:
                 # Log token usage from the response — no extra API call needed;
                 # message.usage is always populated by the Anthropic SDK.
                 logger.info(
-                    "LLM usage: model=%s input_tokens=%d output_tokens=%d",
+                    "LLM usage: model=%s input_tokens=%d output_tokens=%d stop_reason=%s",
                     active_model,
                     message.usage.input_tokens,
                     message.usage.output_tokens,
+                    message.stop_reason,
                 )
 
-                raw_text = message.content[0].text.strip()
+                # Extract the tool_use block — guaranteed present when tool_choice forces it.
+                # If stop_reason is "max_tokens" the input dict may be partial; log and retry.
+                tool_block = next(
+                    (b for b in message.content if b.type == "tool_use"),
+                    None,
+                )
+                if tool_block is None:
+                    logger.warning(
+                        "No tool_use block in response (attempt %d/%d) stop_reason=%s",
+                        attempt, MAX_LLM_RETRIES, message.stop_reason,
+                    )
+                    continue
 
-                # Strip markdown code fences if present
-                if raw_text.startswith("```"):
-                    raw_text = raw_text.split("\n", 1)[1]
-                    if raw_text.endswith("```"):
-                        raw_text = raw_text[:-3].strip()
-
-                data = json.loads(raw_text)
-                parsed = response_model.model_validate(data)
+                # tool_block.input is already a dict — no json.loads() needed
+                parsed = response_model.model_validate(tool_block.input)
                 logger.info(
                     "LLM response validated (model=%s, attempt=%d)", active_model, attempt
                 )
                 return parsed
 
-            except (json.JSONDecodeError, ValidationError) as exc:
+            except ValidationError as exc:
                 logger.warning(
                     "LLM output validation failed (attempt %d/%d): %s",
                     attempt, MAX_LLM_RETRIES, exc,

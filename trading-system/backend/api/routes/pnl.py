@@ -35,6 +35,10 @@ class DailyPnlResponse(BaseModel):
     sharpe_ratio: Optional[float] = None
     avg_trade_duration_min: Optional[float] = None
     max_consecutive_losses: Optional[int] = None
+    avg_realised_rr: Optional[float] = None
+    losses_before_1030: Optional[int] = None
+    losses_1030_to_1330: Optional[int] = None
+    losses_after_1330: Optional[int] = None
 
     class Config:
         from_attributes = True

@@ -117,7 +117,15 @@ DECISION_SYSTEM_PROMPT = (
     "  • NEUTRAL market_bias with bias_confidence < 0.50: treat as mildly bearish — "
     "reduce confidence_score by 10 before applying the EXECUTE/REDUCE/REJECT mapping.\n"
     "  • If the signal stock appears in earnings_drift_candidates (results within 7 days), "
-    "apply the earnings confidence penalties above before deciding."
+    "apply the earnings confidence penalties above before deciding.\n\n"
+    "SESSION PHASE RULES (current IST time and minutes to close are provided in each signal):\n"
+    "  • OPENING (09:15–09:45): High noise, gap fills common. "
+    "Reduce confidence_score by 10 for signals in the first 15 minutes.\n"
+    "  • DEAD ZONE (11:30–13:00): Low volume / rangebound. "
+    "Reduce confidence_score by 10; require volume_ratio ≥ 2.0× to override.\n"
+    "  • LATE WINDOW (after 14:30, <60 min to close): "
+    "Reduced time for target achievement. Reduce confidence_score by 10.\n"
+    "  • LAST 30 MIN (after 15:00): Hard reject — insufficient time for MIS exit."
 )
 
 
@@ -403,6 +411,27 @@ class DecisionEngine:
         if day_name == "Friday" and now_ist.hour >= 14 and not self._settings.paper_extended_hours:
             return False, "Friday after 2:00 PM — no new entries", signal
 
+        # Last 30 minutes (15:00+): insufficient time for MIS target achievement.
+        # Hard gate saves an LLM call; the SESSION PHASE RULES in the prompt
+        # are a soft backup for edge cases.
+        if now_ist.hour >= 15 and not self._settings.paper_extended_hours:
+            return False, "After 15:00 — insufficient time for MIS exit", signal
+
+        # Dead zone gate (11:30–13:00): skip LLM call unless volume surge ≥ 2.0×
+        # provides an override — mirrors the SESSION PHASE RULES soft penalty in
+        # the prompt.  Without this gate, every scanner restart causes a burst of
+        # ~10 LLM calls that all get REJECTED anyway, wasting API budget.
+        if not self._settings.paper_extended_hours:
+            dz_start = now_ist.replace(hour=11, minute=30, second=0, microsecond=0)
+            dz_end   = now_ist.replace(hour=13, minute=0,  second=0, microsecond=0)
+            if dz_start <= now_ist < dz_end and signal.volume_ratio < 2.0:
+                return (
+                    False,
+                    f"Dead zone (11:30–13:00) — vol_ratio={signal.volume_ratio:.1f}× "
+                    f"below 2.0× override threshold",
+                    signal,
+                )
+
         # ── Signal-quality hard rejects (deterministic — no LLM needed) ──────
         # VWAP check: scanner fires when price > VWAP but doesn't check the *degree*
         # of deviation.  Hard reject extreme overextension / below-VWAP signals here
@@ -493,26 +522,30 @@ class DecisionEngine:
         # Strip None-valued indicator fields (ema_9/21, macd_histogram, atr, rsi_5m)
         # when they aren't available yet — they add ~50 tokens of null noise per call.
         signal_dict = {k: v for k, v in signal.model_dump().items() if v is not None}
+        now_ist = datetime.now(IST)
+        market_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+        minutes_to_close = max(0, int((market_close - now_ist).total_seconds() / 60))
         user_content = (
             f"TRADE SIGNAL:\n{json.dumps(signal_dict, default=str)}\n\n"
             f"MARKET BRIEF:\n{brief_summary}\n\n"
             f"Pre-computed stop_loss_price: {sl_price} (include this exact value in your JSON).\n"
             f"Pre-computed target_price: {tgt_price} (include this exact value in your JSON).\n"
-            f"Today is {datetime.now(IST).strftime('%A')}.{earnings_alert}\n\n"
+            f"Today is {now_ist.strftime('%A')}. Current IST time: {now_ist.strftime('%H:%M')}. "
+            f"Minutes to session close (15:30): {minutes_to_close}.{earnings_alert}\n\n"
             "Return your decision as a JSON object."
         )
 
         client = get_anthropic_client()
-        # max_tokens=400: the DecisionOutput JSON schema worst-case is ~275 tokens
-        # (500-char rationale ≈ 125 tokens + full signal_audit ≈ 150 tokens).
-        # The default 4096 was causing Haiku to pad responses with verbose CoT
-        # reasoning before the JSON, which is stripped but still billed.
+        # No tight max_tokens cap needed — tool use forces schema-constrained JSON
+        # so the model cannot generate rogue prose.  1500 is a safety backstop:
+        # historical Haiku output on this schema peaks at ~500 tokens, so 1500 gives
+        # 3× headroom without risk of truncation.
         return await client.generate_structured(
             system_prompt=DECISION_SYSTEM_PROMPT,
             user_content=user_content,
             response_model=DecisionOutput,
             model=self._settings.anthropic_decision_model,
-            max_tokens=400,
+            max_tokens=1500,
         )
 
     def _validate_decision(

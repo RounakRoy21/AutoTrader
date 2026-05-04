@@ -92,7 +92,8 @@ async def send_intraday_close_alert() -> bool:
 
 
 async def send_eod_report(
-    total_trades: int, won: int, lost: int, net_pnl: float, return_pct: float
+    total_trades: int, won: int, lost: int, net_pnl: float, return_pct: float,
+    losses_before_1030: int = 0, losses_1030_to_1330: int = 0, losses_after_1330: int = 0,
 ) -> bool:
     """Send the End of Day summary report."""
     msg = (
@@ -100,4 +101,11 @@ async def send_eod_report(
         f"Won: {won} | Lost: {lost} | "
         f"Net P&L: ₹{net_pnl:.2f} | Return: {return_pct:.2f}%"
     )
+    total_losses = losses_before_1030 + losses_1030_to_1330 + losses_after_1330
+    if total_losses > 0:
+        msg += (
+            f"\n⏰ Losses: <10:30={losses_before_1030} "
+            f"10:30–13:30={losses_1030_to_1330} "
+            f">13:30={losses_after_1330}"
+        )
     return await send_telegram(msg)
