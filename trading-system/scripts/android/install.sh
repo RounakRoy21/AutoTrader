@@ -210,7 +210,20 @@ mkdir -p /root/autotrader/logs
 chmod +x "$SCRIPTS_DIR/startup.sh"
 chmod +x "$SCRIPTS_DIR/shutdown.sh"
 chmod +x "$SCRIPTS_DIR/scheduler.py"
+chmod +x "$SCRIPTS_DIR/bootstrap.sh"
 ok "Scripts made executable"
+
+# Copy the bootstrap launcher to Termux home so it's easily accessible after exiting Ubuntu.
+# proot-distro shares the Android filesystem, so /data/data/com.termux/files/home is reachable.
+TERMUX_HOME="/data/data/com.termux/files/home"
+if [ -d "$TERMUX_HOME" ]; then
+    cp "$SCRIPTS_DIR/bootstrap.sh" "$TERMUX_HOME/start-autotrader.sh"
+    chmod +x "$TERMUX_HOME/start-autotrader.sh"
+    ok "Launcher installed to Termux home → ~/start-autotrader.sh"
+else
+    info "Could not locate Termux home at $TERMUX_HOME"
+    info "After exiting Ubuntu, run: proot-distro login ubuntu -- bash /root/autotrader/trading-system/scripts/android/bootstrap.sh"
+fi
 
 echo
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -219,14 +232,13 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo
 echo "  Next steps:"
 echo
-echo "  1. Verify your .env file:"
+echo "  1. Verify your .env file (optional double-check):"
 echo "       nano $ENV_FILE"
 echo
-echo "  2. Exit Ubuntu (type 'exit') and go back to Termux."
+echo "  2. Type 'exit' and press Enter to leave Ubuntu and return to Termux."
 echo
-echo "  3. Run the bootstrap script to start the scheduler:"
-echo "       bash $SCRIPTS_DIR/../../../scripts/android/bootstrap.sh"
-echo "     (or, inside the repo: bash trading-system/scripts/android/bootstrap.sh)"
+echo "  3. Start the scheduler by running:"
+echo "       bash ~/start-autotrader.sh"
 echo
 echo "  From now on: the scheduler wakes at 05:30 and 16:00 IST"
 echo "  on every trading day and manages everything automatically."

@@ -40,32 +40,54 @@ You only ever touch the phone to: run `install.sh` once, and run `bootstrap.sh` 
 | Termux | Install from **F-Droid** (not Play Store — that version is obsolete). https://f-droid.org |
 | Termux:API | Install from F-Droid alongside Termux |
 | Power | Keep the phone plugged into a charger throughout setup |
+| Storage | The setup downloads around 2–3 GB. Make sure the phone has at least 4 GB of free space. |
+
+> **Installing from F-Droid for the first time?** Because F-Droid isn't from the Play Store, Android will initially block it. When you open the downloaded F-Droid APK you'll get a warning like *"For your security, your phone is not allowed to install unknown apps."* To fix this: go to **Settings → Apps → Special App Access → Install unknown apps**, find your browser (e.g. Chrome), and switch it to **Allowed**. Then go back and open the APK again. This is a one-time step.
 
 ### 1.1 — Configure Termux
 
 Open Termux and run:
 
+> **Keyboard tip:** On most Android keyboards, there is no `Ctrl` key. In Termux, the **Volume Down** button acts as `Ctrl`. So to cancel a running command (`Ctrl+C`) press Volume Down + C. Some keyboards also show an `ESC` key in an extra row — Termux may offer this as an option in its settings.
+
 ```bash
-# Update Termux
+# Download the latest versions of Termux's own software tools
+# (It will ask "Do you want to continue? [Y/n]" — type Y and press Enter)
 pkg update && pkg upgrade -y
 
-# Install proot-distro, tmux, and the Termux API bridge
+# Install three tools:
+#   proot-distro — lets you run Ubuntu (a full Linux system) inside your Android phone
+#   tmux         — a terminal multiplexer: runs multiple windows in one session,
+#                  and keeps everything alive even when you detach or close the app
+#   termux-api   — a bridge between Termux and Android system features
 pkg install proot-distro tmux termux-api -y
 
-# Prevent Android from killing Termux in the background
+# Tell Android not to put Termux to sleep in the background
 termux-wake-lock
 ```
 
-Go to **Settings → Battery → Battery Optimisation** → find Termux → set to **Not optimised**. Do the same for Termux:API if it appears in the list.
+Go to **Settings → Battery → Battery Optimisation** → find Termux → set to **Not optimised**. Do the same for Termux:API if it appears. This tells Android "never kill this app to save battery."
 
 ### 1.2 — Install Ubuntu
 
 ```bash
+# Download and install Ubuntu inside your phone.
+# Ubuntu is a free Linux operating system — it gives us a proper environment
+# to run databases, a web server, and Python reliably.
+# This download is about 200 MB and may take a few minutes.
 proot-distro install ubuntu
+
+# Enter Ubuntu. Your prompt will change — that's expected.
 proot-distro login ubuntu
 ```
 
-You're now inside Ubuntu. **All commands from here until Section 1.4 run inside this Ubuntu shell.**
+After `proot-distro login ubuntu`, your prompt changes from `$` to something like:
+
+```
+root@localhost:~#
+```
+
+That means you are now **inside Ubuntu**. Think of it as stepping into a separate operating system running inside your phone. **All commands from here until Section 1.4 run inside this Ubuntu shell.** If at any point you need to get back to Termux, just type `exit` and press Enter.
 
 ### 1.3 — Clone the Repo and Run the Install Script
 
@@ -75,13 +97,24 @@ git clone https://github.com/RounakRoy21/AutoTrader.git /root/autotrader
 bash /root/autotrader/trading-system/scripts/android/install.sh https://github.com/RounakRoy21/AutoTrader.git
 ```
 
-The script pauses mid-way and asks you to fill in your `.env` file:
+> **This takes 10–20 minutes.** The script installs packages, sets up a database, installs Node.js, and builds the frontend. The phone will look busy for long stretches — that is completely normal. Do not close Termux.
+
+Mid-way through, the installer pauses and asks you to fill in your configuration file. It will print:
+
+```
+ACTION REQUIRED: edit /root/autotrader/trading-system/.env and fill in your credentials.
+Press Enter when done...
+```
+
+At that point, open the file with:
 
 ```bash
 nano /root/autotrader/trading-system/.env
 ```
 
-The file will already have the database and Redis URLs set correctly. Fill in your credentials:
+`nano` is a basic text editor built into the terminal. Use your arrow keys to move around. To save and exit: press **Ctrl+O** (Volume Down + O on Android), then **Enter** to confirm the filename, then **Ctrl+X** to close.
+
+The file already has the database and Redis URLs filled in correctly. Fill in the rest:
 
 ```env
 # Already set correctly — do not change:
@@ -101,7 +134,20 @@ PAPER_TRADING=true
 ADMIN_API_KEY=change_me_to_something_random
 ```
 
-Save (`Ctrl+O`, Enter, `Ctrl+X`), then press Enter in the installer to continue.
+**What each setting means and where to get it:**
+
+| Setting | What it is | Where to get it |
+|---------|-----------|----------------|
+| `GROWW_CLIENT_ID` | Your Groww login username or client ID | Your Groww account |
+| `GROWW_PASSWORD` | Your Groww account password | Your Groww account |
+| `GROWW_TOTP_SECRET` | The secret key behind Groww's two-factor authentication (2FA). This is **not** the 6-digit code you type — it's the underlying key that *generates* those codes. It looks like `JBSWY3DPEHPK3PXP`. | When you set up 2FA on Groww, you scanned a QR code with an app like Google Authenticator. The text version of that QR code is this secret. Check your authenticator app's export/backup option, or re-do the Groww 2FA setup and look for "show key" or "copy key" during the QR step. |
+| `ANTHROPIC_API_KEY` | API key for Claude AI, which the system uses to analyse stocks and make decisions | Go to https://console.anthropic.com → sign in → **API Keys** → **Create Key** |
+| `TELEGRAM_BOT_TOKEN` | Identifies your Telegram bot (it sends you trade alerts) | Open Telegram → search **@BotFather** → send `/newbot` → follow the prompts → copy the token it gives you (format: `123456789:ABC...`) |
+| `TELEGRAM_CHAT_ID` | Your personal Telegram user ID, so the bot knows who to message | Open Telegram → search **@userinfobot** → send any message → it replies with your ID (a plain number like `987654321`) |
+| `PAPER_TRADING` | `true` = no real orders are placed, safe for testing. `false` = live trading with real money. **Leave this as `true` until you have verified the system is working correctly.** | — |
+| `ADMIN_API_KEY` | A password to protect the web dashboard. Anyone who knows this can access the dashboard. | Make up any string (e.g. `mysecret123`) |
+
+Save the file (Ctrl+O → Enter → Ctrl+X), then press **Enter** in the terminal to let the installer continue.
 
 ### 1.4 — Exit Ubuntu and Run the Bootstrap
 
@@ -111,11 +157,16 @@ When install.sh completes, exit Ubuntu:
 exit
 ```
 
-You're back in Termux. Run:
+You're back in Termux. The installer has already placed a launcher script in your home folder. Run:
 
 ```bash
-bash /root/autotrader/trading-system/scripts/android/bootstrap.sh
+bash ~/start-autotrader.sh
 ```
+
+> **If you see "No such file or directory":** The automatic copy may have failed. Use this fallback instead:
+> ```bash
+> proot-distro login ubuntu -- bash /root/autotrader/trading-system/scripts/android/bootstrap.sh
+> ```
 
 This creates the tmux session with three windows and starts the scheduler. You'll see:
 
@@ -185,8 +236,8 @@ Both are accessible from any device on the same WiFi.
 
 ```bash
 # In Termux:
-bash /root/autotrader/trading-system/scripts/android/bootstrap.sh
-# If the session is already running, this just re-attaches.
+bash ~/start-autotrader.sh
+# If the session is already running, this just re-attaches to it.
 ```
 
 Or directly:
@@ -245,7 +296,7 @@ If Termux does get killed (check: open Termux and you see a fresh prompt instead
 
 ```bash
 termux-wake-lock
-bash /root/autotrader/trading-system/scripts/android/bootstrap.sh
+bash ~/start-autotrader.sh
 ```
 
 The scheduler will re-compute the next event from the current time and carry on.
@@ -309,5 +360,38 @@ The frontend files may not be in `/var/www/autotrader/`. Check: `ls /var/www/aut
 You're in Termux, not Ubuntu. Run `proot-distro login ubuntu` first.
 
 **Phone rebooted overnight**
-After reboot: open Termux, run `termux-wake-lock`, then `bash ~/autotrader/trading-system/scripts/android/bootstrap.sh`. The scheduler will resume from the correct next event.
+After reboot: open Termux, run `termux-wake-lock`, then `bash ~/start-autotrader.sh`. The scheduler will re-compute the next event from the current time and carry on.
+
+**The install script failed partway through**
+That's fine — `install.sh` is safe to re-run. It skips steps that are already done (it won't re-download packages that are installed, won't recreate the database if it exists, etc.). Just run the same `bash install.sh` command again from inside Ubuntu.
+
+**"E: Unable to fetch some archives" or "Failed to fetch" during install**
+This is a network error — your WiFi connection dropped or the package server was temporarily busy. Make sure the phone has a stable WiFi connection and re-run `install.sh`.
+
+**"`pkg` command not found" inside Ubuntu**
+`pkg` is a Termux command, not a Linux/Ubuntu command. If you see this error, you are inside Ubuntu (you ran `proot-distro login ubuntu` earlier). Type `exit` to go back to Termux first, then use `pkg`.
+
+**"`proot-distro` command not found"**
+You are still inside Ubuntu. Type `exit` first to return to Termux.
+
+**"start-autotrader.sh: No such file or directory"**
+The install script could not copy the launcher to your Termux home. Use the fallback command:
+```bash
+proot-distro login ubuntu -- bash /root/autotrader/trading-system/scripts/android/bootstrap.sh
+```
+
+**"I don't know what my TOTP secret is"**
+The TOTP secret is the key you originally scanned into your authenticator app when you set up 2FA on Groww. It looks like a random string of letters and numbers (e.g. `JBSWY3DPEHPK3PXP`). If you set 2FA up using Google Authenticator, try the app's built-in export/transfer feature — the secret may be visible there. Alternatively, log into Groww on a browser, go to Security settings, disable and re-enable 2FA, and when it shows the QR code look for a "can't scan? enter key manually" option — that text is your secret.
+
+**The Telegram bot sends nothing, even after setup**
+Before a bot can message you, you must send it at least one message first. Open Telegram, find your bot by its username (you chose this in @BotFather), and send it `/start`. After that, the bot can reach you.
+
+**Dashboard opens but shows "WebSocket disconnected" or data doesn't update**
+This usually means the backend started but WebSocket connections aren't reaching it. Check the `backend-log` tmux window (Ctrl-B 1) for errors. Also confirm you're accessing the dashboard from the same WiFi network as the phone.
+
+**"How do I know if the system is actually trading?"**
+Check the `backend-log` tmux window (Ctrl-B 1) — you'll see log lines for every scan, decision, and order. You'll also receive Telegram alerts for every trade entry, stop-loss hit, or target hit. If PAPER_TRADING=true in your .env, no real orders are placed — you'll still see all the same log activity but with `[PAPER]` noted.
+
+**The phone's screen is off and I can't see anything**
+That's fine — tmux keeps everything running with the screen off. Unlock the phone, open Termux, and run `tmux attach -t autotrader` (or `bash ~/start-autotrader.sh`) to re-attach. Do not swipe Termux out of Recents — that will kill it.
 
