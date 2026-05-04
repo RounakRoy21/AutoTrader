@@ -161,10 +161,12 @@ async def manual_start_trading():
 
 @router.post("/api/agent/trading/stop", dependencies=[Depends(_require_api_key)])
 async def manual_stop_trading():
-    """Manually stop the Trading Agent (overrides the 15:30 scheduler)."""
+    """Manually stop the Trading Agent (overrides the 15:30 scheduler).
+    Also clears stale ACTIVE Redis status left behind by a backend restart."""
     manager = get_trading_agent_manager()
     result = await manager.stop_session(source="manual")
-    return _envelope(True, {"result": result})
+    success = result in ("stopped", "stale_cleared")
+    return _envelope(success, {"result": result})
 
 
 @router.get("/api/agent/decisions")

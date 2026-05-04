@@ -20,7 +20,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from core.config import get_settings
 from core.database import check_db_health, dispose_engine, get_engine, Base
-from core.redis_client import check_redis_health, close_redis, get_redis
+from core.redis_client import check_redis_health, close_redis, get_redis, set_value
+from core.redis_keys import RESEARCH_STATUS_KEY, TRADING_STATUS_KEY, RISK_STATUS_KEY
 from core.scheduler import (
     schedule_cron,
     shutdown_scheduler,
@@ -71,6 +72,13 @@ async def lifespan(app: FastAPI):
     try:
         await get_redis()
         logger.info("✅ Redis connected")
+        # Reset all agent status keys to INACTIVE on every startup.
+        # The previous process may have left stale ACTIVE flags in Redis if it
+        # crashed or was killed — a fresh process has no running agents yet.
+        await set_value(RESEARCH_STATUS_KEY, "INACTIVE")
+        await set_value(TRADING_STATUS_KEY, "INACTIVE")
+        await set_value(RISK_STATUS_KEY, "INACTIVE")
+        logger.info("✅ Agent status keys reset to INACTIVE")
     except Exception:
         logger.warning("⚠️ Redis unreachable — running in fallback mode")
 
@@ -97,6 +105,7 @@ async def lifespan(app: FastAPI):
         job_id="research_agent_midsession",
         hour=12,
         minute=30,
+        kwargs={"skip_if_trades_exhausted": True},
     )
 
     # 5. (Groww TOTP tokens do not expire — no daily token refresh job needed)

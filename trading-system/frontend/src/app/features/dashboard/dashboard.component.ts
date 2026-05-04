@@ -6,8 +6,8 @@
 
 import { Component, OnInit, OnDestroy, ChangeDetectionStrategy, ChangeDetectorRef } from '@angular/core';
 import { CommonModule } from '@angular/common';
-import { Subject, interval } from 'rxjs';
-import { takeUntil } from 'rxjs/operators';
+import { Subject, race, timer, interval } from 'rxjs';
+import { takeUntil, take, map, filter } from 'rxjs/operators';
 
 import { MatCardModule } from '@angular/material/card';
 import { MatChipsModule } from '@angular/material/chips';
@@ -244,8 +244,67 @@ export class DashboardComponent implements OnInit, OnDestroy {
   runBrief(): void {
     this.briefRunInProgress = true;
     this.cdr.markForCheck();
+
+    // Snapshot identity of current brief and agent completion time so we can
+    // detect genuinely new data vs. no-op refreshes.
+    const prevDate = this.brief?.date ?? null;
+    const prevGeneratedAt = this.brief?.generated_at ?? null;
+    const prevLastCompleted = this.agentStatus.research_agent?.last_completed ?? null;
+
     this.api.runMarketBrief().subscribe({
-      next: () => this.pollForBrief(),
+      next: () => {
+        // Background task sets ACTIVE in Redis ~ms after the 202 response.
+        // Refresh status after 1s so the Research Agent card shows ACTIVE promptly.
+        timer(1000)
+          .pipe(takeUntil(this.destroy$))
+          .subscribe(() => { this.state.refreshAll(); this.cdr.markForCheck(); });
+
+        // Backup poll every 15s — catches WS misses and updates agentStatus$.
+        const pollSub = interval(15_000)
+          .pipe(takeUntil(this.destroy$))
+          .subscribe(() => this.state.refreshAll());
+
+        // Winning condition 1: new brief arrives directly in currentBrief$ (via WS or poll).
+        const briefArrived$ = this.state.currentBrief$.pipe(
+          filter((b) => b != null && (b.date !== prevDate || b.generated_at !== prevGeneratedAt)),
+          take(1),
+          map(() => true as const),
+        );
+
+        // Winning condition 2: research_agent.last_completed changes — the backend sets this
+        // right after persist_and_publish(), so the brief is already in the DB when this fires.
+        const agentFinished$ = this.state.agentStatus$.pipe(
+          filter((s) => {
+            const lc = s.research_agent?.last_completed ?? null;
+            return lc !== null && lc !== prevLastCompleted;
+          }),
+          take(1),
+          map(() => true as const),
+        );
+
+        // 5-minute hard timeout — only fires if agent hangs or crashes without updating Redis.
+        race(
+          briefArrived$,
+          agentFinished$,
+          timer(300_000).pipe(map(() => false as const)),
+        )
+          .pipe(take(1), takeUntil(this.destroy$))
+          .subscribe((arrived) => {
+            pollSub.unsubscribe();
+            this.briefRunInProgress = false;
+            if (arrived) {
+              this.snackBar.open('Market Brief generated', 'Dismiss', { duration: 4000 });
+              this.state.refreshAll();
+            } else {
+              this.snackBar.open(
+                'Research Agent is taking longer than expected — refresh manually.',
+                'Dismiss',
+                { duration: 6000 },
+              );
+            }
+            this.cdr.markForCheck();
+          });
+      },
       error: (err) => {
         this.briefRunInProgress = false;
         const msg = err?.error?.detail ?? 'Failed to trigger Research Agent';
@@ -253,37 +312,6 @@ export class DashboardComponent implements OnInit, OnDestroy {
         this.cdr.markForCheck();
       },
     });
-  }
-
-  private pollForBrief(): void {
-    const maxAttempts = 30; // 30 × 3s = 90s
-    let attempts = 0;
-    const poll = interval(3000)
-      .pipe(takeUntil(this.destroy$))
-      .subscribe(() => {
-        attempts++;
-        this.api.getTodayBrief().subscribe({
-          next: () => {
-            poll.unsubscribe();
-            this.briefRunInProgress = false;
-            this.snackBar.open('Market Brief generated', 'Dismiss', { duration: 4000 });
-            this.state.refreshAll();
-            this.cdr.markForCheck();
-          },
-          error: () => {
-            if (attempts >= maxAttempts) {
-              poll.unsubscribe();
-              this.briefRunInProgress = false;
-              this.snackBar.open(
-                'Research Agent is taking longer than expected — refresh manually.',
-                'Dismiss',
-                { duration: 6000 },
-              );
-              this.cdr.markForCheck();
-            }
-          },
-        });
-      });
   }
 
   ngOnDestroy(): void {

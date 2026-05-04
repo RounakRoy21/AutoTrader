@@ -9,6 +9,7 @@ Max 2 attempts per call — if both fail, the result is discarded.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Optional, Type, TypeVar
 

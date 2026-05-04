@@ -756,6 +756,21 @@ async def generate_market_brief(raw_data: dict) -> MarketBriefLLMOutput | None:
     return brief
 
 
+def _parse_generated_at(value: str) -> "time":
+    """Parse HH:MM:SS from the LLM-supplied generated_at string.
+
+    The LLM occasionally returns microseconds (``HH:MM:SS.ffffff``) or a
+    full ISO timestamp; slice to the first 8 characters so strptime never
+    raises on unexpected suffixes.
+    """
+    from datetime import time as _time
+    try:
+        return datetime.strptime(value[:8], "%H:%M:%S").time()
+    except (ValueError, TypeError):
+        logger.warning("Could not parse generated_at=%r — defaulting to now", value)
+        return datetime.now(IST).time().replace(microsecond=0)
+
+
 async def persist_and_publish(brief: MarketBriefLLMOutput) -> None:
     """Save the Market Brief to PostgreSQL and publish it to Redis.
 
@@ -765,6 +780,7 @@ async def persist_and_publish(brief: MarketBriefLLMOutput) -> None:
     """
     brief_dict = brief.model_dump()
     brief_date = datetime.strptime(brief.date, "%Y-%m-%d").date()
+    gen_time = _parse_generated_at(brief.generated_at)
 
     # Persist to PostgreSQL — upsert
     async with get_db_context() as session:
@@ -774,7 +790,7 @@ async def persist_and_publish(brief: MarketBriefLLMOutput) -> None:
         db_brief = existing.scalars().first()
         if db_brief is not None:
             # Update existing row
-            db_brief.generated_at = datetime.strptime(brief.generated_at, "%H:%M:%S").time()
+            db_brief.generated_at = gen_time
             db_brief.market_bias = brief.market_bias.value
             db_brief.bias_confidence = brief.bias_confidence
             db_brief.sgx_nifty_signal = brief.sgx_nifty.signal.value
@@ -790,7 +806,7 @@ async def persist_and_publish(brief: MarketBriefLLMOutput) -> None:
         else:
             db_brief = MarketBrief(
                 date=brief_date,
-                generated_at=datetime.strptime(brief.generated_at, "%H:%M:%S").time(),
+                generated_at=gen_time,
                 market_bias=brief.market_bias.value,
                 bias_confidence=brief.bias_confidence,
                 sgx_nifty_signal=brief.sgx_nifty.signal.value,
@@ -831,14 +847,32 @@ async def persist_and_publish(brief: MarketBriefLLMOutput) -> None:
         logger.warning("Could not refresh instrument map after brief: %s", _exc)
 
 
-async def run_research_agent() -> None:
+async def run_research_agent(skip_if_trades_exhausted: bool = False) -> None:
     """
     Main entry point for the Research Agent.
     Called by APScheduler at 6:00 AM IST, or triggered manually via the API.
+
+    skip_if_trades_exhausted: if True (midday run), skip entirely when the daily
+    trade limit is already reached — no point refreshing the brief if no further
+    trades can be placed today.
     """
     if is_nse_holiday():
         logger.info("Research Agent: today is an NSE holiday — skipping run")
         return
+
+    if skip_if_trades_exhausted:
+        from core.redis_client import get_value as _get_value  # avoid circular at module level
+        from core.redis_keys import DAILY_TRADE_COUNT_KEY
+        from core.config import get_settings as _get_settings
+        trade_count_str = await _get_value(DAILY_TRADE_COUNT_KEY)
+        trade_count = int(trade_count_str) if trade_count_str else 0
+        max_trades = _get_settings().max_trades_per_day
+        if trade_count >= max_trades:
+            logger.info(
+                "Research Agent (midday): skipping — daily trade limit already reached "
+                "(%d/%d trades used)", trade_count, max_trades
+            )
+            return
 
     logger.info("═══ Research Agent starting ═══")
     await set_value("agent:research:status", "ACTIVE")

@@ -24,13 +24,44 @@ from sqlalchemy import func, select
 
 from core.database import get_db_context
 from core.redis_client import publish, set_value
-from core.redis_keys import DAILY_TRADE_COUNT_KEY, HALT_KEY
+from core.redis_keys import DAILY_TRADE_COUNT_KEY, HALT_KEY, TRADING_STATUS_KEY
 from core.nse_calendar import is_nse_holiday
 from models.trade import Trade
 
 logger = logging.getLogger(__name__)
 
 TRADE_COUNT_KEY = DAILY_TRADE_COUNT_KEY
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def _get_redis_trading_status() -> str:
+    """Read the current trading status from Redis. Returns 'INACTIVE' on any error."""
+    try:
+        from core.redis_client import get_value
+        val = await get_value(TRADING_STATUS_KEY)
+        return val or "INACTIVE"
+    except Exception:
+        return "INACTIVE"
+
+
+async def _clear_trading_status_in_redis(exc: Optional[Exception]) -> None:
+    """Set agent:trading:status to INACTIVE in Redis. Called after task ends."""
+    try:
+        from datetime import datetime, timezone
+        await set_value(TRADING_STATUS_KEY, "INACTIVE")
+        if exc:
+            await publish("system_alerts", {
+                "type": "critical",
+                "message": f"Trading agent task ended unexpectedly: {exc}",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+        logger.info("[Manager] Redis trading status set to INACTIVE after task end")
+    except Exception as e:
+        logger.error("[Manager] Failed to clear Redis trading status: %s", e)
 
 class TradingAgentManager:
     """
@@ -102,13 +133,25 @@ class TradingAgentManager:
     async def stop_session(self, source: str = "scheduler") -> str:
         """
         Stop the current trading session gracefully.
-        Returns 'stopped' or 'not_running'.
+        Returns 'stopped', 'not_running', or 'stale_cleared'.
 
         *source* describes what triggered the stop and is included in the system alert:
           - 'scheduler'  — 15:30 IST APScheduler cron job (normal market close)
           - 'manual'     — user pressed Stop Agent in the dashboard / called the API
         """
         if not self.is_running or self._agent is None:
+            # No live task — but Redis may still say ACTIVE from a previous crash/restart.
+            # Always force-clear Redis status on a manual stop so the dashboard resets.
+            current = await _get_redis_trading_status()
+            if source == "manual" and current == "ACTIVE":
+                await set_value(TRADING_STATUS_KEY, "INACTIVE")
+                await publish("system_alerts", {
+                    "type": "warning",
+                    "message": "Stale ACTIVE status cleared — trading agent was not running (backend may have restarted)",
+                    "timestamp": _now_iso(),
+                })
+                logger.warning("[Manager] Cleared stale ACTIVE status from Redis (no live task)")
+                return "stale_cleared"
             logger.info("[Manager] No active trading session — ignoring stop request")
             return "not_running"
 
@@ -142,6 +185,8 @@ class TradingAgentManager:
         """
         Callback fired when the agent Task finishes — normally, via exception,
         or cancelled.  Clears internal state so the next day's start works.
+        Also schedules an async Redis cleanup so the dashboard status reflects
+        reality when the task ends without going through stop_session().
         """
         exc = task.exception() if not task.cancelled() else None
         self._agent = None
@@ -151,6 +196,17 @@ class TradingAgentManager:
             logger.error("[Manager] Trading session ended with error: %s", exc)
         else:
             logger.info("[Manager] Trading session ended cleanly")
+
+        # Ensure Redis status is set to INACTIVE regardless of how the task ended.
+        # TradingAgent.stop() normally handles this, but if the task crashed or was
+        # cancelled before reaching stop(), Redis is left stale at ACTIVE.
+        # asyncio.ensure_future schedules the coroutine on the running event loop
+        # from this sync callback.
+        try:
+            loop = asyncio.get_event_loop()
+            loop.create_task(_clear_trading_status_in_redis(exc))
+        except RuntimeError:
+            pass  # No event loop available at teardown — best effort only
 
     async def _restore_trade_count(self) -> None:
         """
@@ -197,11 +253,3 @@ def get_trading_agent_manager() -> TradingAgentManager:
     if _manager is None:
         _manager = TradingAgentManager()
     return _manager
-
-
-# ── Small helper ──────────────────────────────────────────────────────
-
-def _now_iso() -> str:
-    import pytz
-    from datetime import datetime
-    return datetime.now(pytz.timezone("Asia/Kolkata")).isoformat()
