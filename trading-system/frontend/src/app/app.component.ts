@@ -17,6 +17,7 @@ import { map, shareReplay } from 'rxjs/operators';
 
 import { StateService } from './core/services/state.service';
 import { TradingWebSocketService, WsConnectionState } from './core/services/trading-websocket.service';
+import { ThemeService } from './core/services/theme.service';
 import { GrowwAuthBannerComponent } from './shared/groww-auth-banner/groww-auth-banner.component';
 
 @Component({
@@ -57,6 +58,7 @@ export class AppComponent implements OnInit, OnDestroy {
     private ws: TradingWebSocketService,
     private router: Router,
     private breakpointObserver: BreakpointObserver,
+    public themeService: ThemeService,
   ) {
     this.isHandset$ = this.breakpointObserver
       .observe([Breakpoints.Handset, '(max-width: 768px)'])
@@ -116,6 +118,10 @@ export class AppComponent implements OnInit, OnDestroy {
 
   reloadPage(): void {
     window.location.reload();
+  }
+
+  toggleTheme(): void {
+    this.themeService.toggle();
   }
 
   /** Close the sidenav on mobile after navigation. */

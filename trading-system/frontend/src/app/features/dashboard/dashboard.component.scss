@@ -1,8 +1,8 @@
 .dashboard-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
-  gap: 20px;
-  padding: 20px;
+  gap: 16px;
+  padding: 16px;
 }
 
 // ── Market Brief card ──────────────────────────────────────────
@@ -288,4 +288,52 @@
       overflow-y: auto;
     }
   }
+}
+
+// ── Dark theme overrides ───────────────────────────────────────
+:host-context(.dark-theme) {
+  .pnl-breakdown, .pnl-detail,
+  .stat-label, .stat-muted, .stat-sub,
+  .health-label, .health-loading,
+  .drawdown-label, .stance-icon, .stance-label,
+  .brief-empty { color: var(--at-text-secondary); }
+
+  .stat-item     { border-bottom-color: var(--at-border); }
+  .stat-divider  { border-top-color: var(--at-border); }
+  .health-row    { border-bottom-color: var(--at-border); }
+  .drawdown-loss { color: var(--at-loss); }
+  .stance-avoid  { color: var(--at-loss); }
+  .stance-half   { color: var(--at-warn-color); }
+
+  .bias-badge {
+    &.bullish { background: rgba(46, 125, 50, 0.2);  color: #81c784; }
+    &.bearish { background: rgba(198, 40, 40, 0.2);  color: #ef9a9a; }
+    &.neutral  { background: rgba(245, 124, 0, 0.2); color: #ffb74d; }
+  }
+
+  .vix-badge {
+    &.regime-normal   { background: rgba(46, 125, 50, 0.2);  color: #81c784; }
+    &.regime-elevated { background: rgba(230, 81, 0, 0.2);   color: #ffb74d; }
+    &.regime-stress   { background: rgba(183, 28, 28, 0.2);  color: #ef9a9a; }
+  }
+
+  .market-status-badge {
+    &.market-open     { background: rgba(76, 175, 80, 0.2);  color: #81c784; }
+    &.market-pre-open { background: rgba(255, 193, 7, 0.2);  color: #ffd54f; }
+    &.market-closed   { background: rgba(150, 150, 150, 0.15); color: #aaa;  }
+  }
+}
+
+// ── Mobile ─────────────────────────────────────────────────────
+@media (max-width: 600px) {
+  .dashboard-grid {
+    grid-template-columns: 1fr;
+    gap: 12px;
+    padding: 12px;
+  }
+
+  .halt-controls,
+  .agent-controls { flex-wrap: wrap; gap: 8px; }
+
+  .pnl-value { font-size: 1.9rem; }
 }

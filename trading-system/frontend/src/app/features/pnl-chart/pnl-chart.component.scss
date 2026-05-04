@@ -18,3 +18,9 @@ canvas {
   width: 100% !important;
   max-height: 420px;
 }
+
+// ── Mobile ─────────────────────────────────────────────────────
+@media (max-width: 600px) {
+  .chart-card { margin: 8px; }
+  canvas { max-height: 260px; }
+}

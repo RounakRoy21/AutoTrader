@@ -16,6 +16,7 @@ import { ChartConfiguration, ChartType } from 'chart.js';
 
 import { StateService } from '../../core/services/state.service';
 import { ApiService } from '../../core/services/api.service';
+import { ThemeService } from '../../core/services/theme.service';
 import { DailyPnl } from '../../core/models';
 
 @Component({
@@ -87,9 +88,15 @@ export class PnlChartComponent implements OnInit, OnDestroy {
     private state: StateService,
     private api: ApiService,
     private cdr: ChangeDetectorRef,
+    private themeService: ThemeService,
   ) {}
 
   ngOnInit(): void {
+    this.themeService.dark$.pipe(takeUntil(this.destroy$)).subscribe(dark => {
+      this.chartOptions = this._buildChartOptions(dark);
+      this.cdr.markForCheck();
+    });
+
     this.state.dailyPnl$.pipe(takeUntil(this.destroy$)).subscribe((pnl) => {
       this.allPnl = pnl;
       this.loading = false;
@@ -141,5 +148,30 @@ export class PnlChartComponent implements OnInit, OnDestroy {
   ngOnDestroy(): void {
     this.destroy$.next();
     this.destroy$.complete();
+  }
+
+  private _buildChartOptions(dark: boolean): ChartConfiguration['options'] {
+    const gridColor  = dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)';
+    const labelColor = dark ? 'rgba(255,255,255,0.7)'  : 'rgba(0,0,0,0.6)';
+    return {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { position: 'top', labels: { color: labelColor } },
+        tooltip: { mode: 'index', intersect: false },
+      },
+      scales: {
+        y: {
+          title: { display: true, text: '₹', color: labelColor },
+          grid:  { color: gridColor },
+          ticks: { color: labelColor },
+        },
+        x: {
+          title: { display: true, text: 'Date', color: labelColor },
+          grid:  { display: false },
+          ticks: { color: labelColor },
+        },
+      },
+    };
   }
 }

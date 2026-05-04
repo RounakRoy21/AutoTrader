@@ -124,15 +124,37 @@ Settings → Windows Update → Advanced Options → set "Notify to schedule res
 
 ---
 
-## Step 6 — Access from Another Computer (Optional)
+## Step 6 — Remote Monitoring
 
-Install **Tailscale** (free, https://tailscale.com) on both machines. Once connected, access the dashboard from your main laptop at:
+The dashboard is only accessible on the **local network** — intentionally. When you're away from the laptop, **Telegram is your window into the system**.
 
+Every significant event sends you a message automatically:
+
+| Event | What you receive |
+|-------|-----------------|
+| Trade entered | Stock, price, SL, target, R:R ratio, risk ₹ |
+| Stop-loss hit | Stock, loss ₹, % drop, trade duration |
+| Target hit | Stock, profit ₹, % gain, trade duration |
+| Trading halted | Loss amount and % of capital that triggered the halt |
+| MIS square-off | Number of positions closing, running P&L at that moment |
+| EOD report | Full session summary: trades, win rate, P&L, profit factor, Sharpe, avg R:R |
+| Critical errors | GTT failures, component crashes |
+
+No action is needed — just read the messages.
+
+### Accessing the dashboard from another device on the same WiFi
+
+Find the laptop's local IP:
+
+```powershell
+ipconfig | findstr "IPv4"
 ```
-http://<spare-laptop-tailscale-ip>:4201
-```
 
-No port forwarding, no firewall rules needed. Telegram alerts will still reach you regardless.
+Then open `http://192.168.x.x:4201` on any device connected to the same router. This works for your phone when you're at home.
+
+### Optional: access from anywhere without a domain
+
+Install **Tailscale** (free, https://tailscale.com) on both the laptop and your phone. Once connected, the dashboard is available at the laptop's Tailscale IP from anywhere with an internet connection — no port forwarding, no domain needed.
 
 ---
 
@@ -141,7 +163,7 @@ No port forwarding, no firewall rules needed. Telegram alerts will still reach y
 | When | Action |
 |------|--------|
 | **Monday morning** | Power on the laptop. If Task Scheduler is configured, nothing else to do — app starts automatically. Verify on the dashboard. |
-| **Mon–Fri** | Monitor via Telegram alerts and the dashboard. The market-hours gate prevents any activity before 09:15 and after 15:30 IST automatically. |
+| **Mon–Fri** | Monitor via Telegram alerts. The market-hours gate prevents any activity before 09:15 and after 15:30 IST automatically. |
 | **Saturday** | Run `.\start.ps1 -Stop`, then shut down the laptop. |
 | **After any unexpected reboot** | Containers restart themselves via Docker's `restart: unless-stopped` policy. No manual action needed. |
 
@@ -163,3 +185,7 @@ The WebSocket connects to the backend. Refresh the page once the backend is full
 
 **Forgot to stop before shutdown?**
 Docker handles this gracefully. The containers will resume on next start via `restart: unless-stopped`.
+
+**No Telegram messages arriving?**
+Verify `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env`. Send `/start` to your bot in Telegram first — bots cannot message users who haven't initiated contact.
+

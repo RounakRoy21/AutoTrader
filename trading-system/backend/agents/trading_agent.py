@@ -416,6 +416,7 @@ class TradingAgent:
             target=decision.target_price,
             qty=decision.adjusted_qty,
             product_type=decision.product_type.value,
+            rationale=decision.rationale or "",
         )
 
         logger.info(

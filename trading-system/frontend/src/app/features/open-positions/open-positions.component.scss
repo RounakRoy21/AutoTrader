@@ -1,5 +1,5 @@
 .positions-card {
-  margin: 20px;
+  margin: 16px;
 }
 
 .full-width {
@@ -29,3 +29,16 @@
 
 .profit-row { background: rgba(76, 175, 80, 0.04); }
 .loss-row   { background: rgba(244, 67, 54, 0.04); }
+
+// ── Dark theme overrides ───────────────────────────────────────
+:host-context(.dark-theme) {
+  .empty-msg { color: var(--at-text-muted); }
+  .muted     { color: rgba(255, 255, 255, 0.5); }
+}
+
+// ── Mobile ─────────────────────────────────────────────────────
+@media (max-width: 600px) {
+  .positions-card { margin: 8px; }
+
+  ::ng-deep .mat-mdc-table-container { overflow-x: auto; }
+}

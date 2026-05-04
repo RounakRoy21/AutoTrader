@@ -1,5 +1,5 @@
 .alerts-card {
-  margin: 20px;
+  margin: 16px;
 }
 
 .alerts-scroll {
@@ -42,4 +42,16 @@
   text-align: center;
   padding: 24px;
   color: #888;
+}
+
+// ── Dark theme overrides ───────────────────────────────────────
+:host-context(.dark-theme) {
+  .alert-item  { border-bottom-color: var(--at-border); }
+  .alert-meta  { color: var(--at-text-secondary); }
+  .empty-msg   { color: var(--at-text-muted); }
+}
+
+// ── Mobile ─────────────────────────────────────────────────────
+@media (max-width: 600px) {
+  .alerts-card  { margin: 8px; }
 }

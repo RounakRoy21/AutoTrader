@@ -21,8 +21,9 @@
       <input matInput (keyup)="applyFilter($event)" placeholder="e.g. RELIANCE" />
     </mat-form-field>
 
-    <!-- Trades Table -->
-    <table mat-table [dataSource]="dataSource" matSort multiTemplateDataRows class="full-width">
+    <!-- Trades Table — horizontally scrollable container -->
+    <div class="table-scroll">
+      <table mat-table [dataSource]="dataSource" matSort multiTemplateDataRows class="full-width">
 
       <!-- Expand toggle -->
       <ng-container matColumnDef="expand">
@@ -91,6 +92,7 @@
       <tr mat-row *matRowDef="let row; columns: ['expandedDetail']"
           class="detail-row"></tr>
     </table>
+    </div><!-- /table-scroll -->
 
     <mat-paginator [pageSizeOptions]="[10, 25, 50]" showFirstLastButtons></mat-paginator>
   </mat-card-content>

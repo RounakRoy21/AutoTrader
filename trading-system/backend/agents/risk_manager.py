@@ -204,7 +204,12 @@ class RiskManager:
             if ltp <= trade.stop_loss_price:
                 await self._close_position(trade, ltp, "STOP_LOSS_HIT")
                 loss = (trade.entry_price - ltp) * trade.quantity
-                await send_stop_loss_alert(trade.stock, ltp, loss)
+                await send_stop_loss_alert(
+                    trade.stock, ltp, loss,
+                    entry_price=trade.entry_price,
+                    entry_time=trade.entry_time,
+                    quantity=trade.quantity,
+                )
                 await publish("system_alerts", {
                     "type": "danger",
                     "message": f"Stop-loss hit: {trade.stock} @ ₹{ltp:.2f} | Loss: ₹{loss:.2f}",
@@ -257,7 +262,12 @@ class RiskManager:
             if ltp >= trade.target_price:
                 await self._close_position(trade, ltp, "TARGET_HIT")
                 profit = (ltp - trade.entry_price) * trade.quantity
-                await send_target_hit_alert(trade.stock, ltp, profit)
+                await send_target_hit_alert(
+                    trade.stock, ltp, profit,
+                    entry_price=trade.entry_price,
+                    entry_time=trade.entry_time,
+                    quantity=trade.quantity,
+                )
                 await publish("system_alerts", {
                     "type": "success",
                     "message": f"Target hit: {trade.stock} @ ₹{ltp:.2f} | Profit: ₹{profit:.2f}",
@@ -283,7 +293,12 @@ class RiskManager:
             # ── MIS Intraday Close (3:00 PM) ──────
             if trade.product_type == "MIS" and current_time >= MIS_CLOSE_START:
                 if not self._intraday_close_initiated:
-                    await send_intraday_close_alert()
+                    mis_count = sum(1 for t in open_trades if t.product_type == "MIS")
+                    running_pnl = sum(
+                        (ltp_map.get(t.stock, t.entry_price) - t.entry_price) * t.quantity
+                        for t in open_trades
+                    )
+                    await send_intraday_close_alert(n_positions=mis_count, running_pnl=running_pnl)
                     await publish("system_alerts", {
                         "type": "warning",
                         "message": "MIS square-off initiated — all intraday positions closing",
@@ -546,7 +561,7 @@ class RiskManager:
                 "Daily drawdown limit breached: ₹%.2f >= ₹%.2f — HALTING",
                 total_loss, limit,
             )
-            await send_halt_alert()
+            await send_halt_alert(total_loss=total_loss, drawdown_pct=drawdown_pct)
             await publish("system_alerts", {
                 "type": "critical",
                 "message": (
@@ -761,6 +776,12 @@ class RiskManager:
         await send_eod_report(
             total, won, lost, net_pnl, return_pct,
             losses_before_1030, losses_1030_to_1330, losses_after_1330,
+            profit_factor=profit_factor,
+            sharpe=sharpe,
+            avg_realised_rr=avg_realised_rr,
+            avg_duration=avg_duration,
+            max_consec_losses=max_consec_losses,
+            halted=(halt == "TRUE"),
         )
 
         logger.info(

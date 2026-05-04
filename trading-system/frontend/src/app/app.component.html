@@ -53,14 +53,21 @@
       <button mat-icon-button (click)="sidenav.toggle()" aria-label="Toggle navigation">
         <mat-icon>menu</mat-icon>
       </button>
-      <span>AutoTrader Dashboard</span>
+      <span class="title-text">AutoTrader</span>
 
       <span class="toolbar-spacer"></span>
 
       <!-- Paper trading badge -->
       <span class="paper-badge" *ngIf="paperTrading" matTooltip="All orders are simulated — no real money at risk">
-        <mat-icon>science</mat-icon> PAPER
+        <mat-icon>science</mat-icon><span class="badge-text">PAPER</span>
       </span>
+
+      <!-- Theme toggle -->
+      <button mat-icon-button (click)="toggleTheme()"
+              [matTooltip]="themeService.isDark ? 'Light mode' : 'Dark mode'"
+              aria-label="Toggle theme">
+        <mat-icon>{{ themeService.isDark ? 'light_mode' : 'dark_mode' }}</mat-icon>
+      </button>
 
       <!-- WebSocket connection chip -->
       <span class="ws-chip" [class]="'ws-' + wsState"

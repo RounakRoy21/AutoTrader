@@ -1,9 +1,16 @@
 .trade-log-card {
-  margin: 20px;
+  margin: 16px;
 }
 
 .full-width {
   width: 100%;
+  min-width: 560px; // ensures table columns don't collapse; container scrolls
+}
+
+// Scroll wrapper — table scrolls, header & filter stay fixed above
+.table-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .summary-row {
@@ -65,4 +72,24 @@
   color: #7986cb;
   flex-shrink: 0;
   margin-top: 2px;
+}
+
+// ── Dark theme overrides ───────────────────────────────────────
+:host-context(.dark-theme) {
+  .data-row.expanded-row { background: rgba(255, 255, 255, 0.06); }
+  .data-row:hover        { background: rgba(255, 255, 255, 0.04); }
+
+  .rationale-content {
+    background: rgba(255, 255, 255, 0.05);
+    border-left-color: #9fa8da;
+
+    p { color: rgba(255, 255, 255, 0.75); }
+  }
+}
+
+// ── Mobile ─────────────────────────────────────────────────────
+@media (max-width: 600px) {
+  .trade-log-card { margin: 8px; }
+  .filter-field   { width: 100%; }
+  .summary-row    { gap: 12px; }
 }
