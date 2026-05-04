@@ -274,3 +274,18 @@
   }
 }
 .drawdown-loss  { color: #c62828; }
+
+// ── System Alerts panel — full-width at bottom of dashboard ───
+.alerts-panel {
+  grid-column: 1 / -1;
+
+  // Constrain the alerts card height when embedded in dashboard
+  ::ng-deep .alerts-card {
+    margin: 0;
+
+    .alerts-scroll {
+      max-height: 220px;
+      overflow-y: auto;
+    }
+  }
+}

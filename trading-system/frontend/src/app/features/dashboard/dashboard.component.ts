@@ -23,6 +23,7 @@ import { StateService } from '../../core/services/state.service';
 import { ApiService } from '../../core/services/api.service';
 import { MarketBrief, Trade, AgentStatus, HealthCheck } from '../../core/models';
 import { ConfirmDialogComponent } from '../../shared/confirm-dialog/confirm-dialog.component';
+import { SystemAlertsComponent } from '../system-alerts/system-alerts.component';
 
 @Component({
   selector: 'app-dashboard',
@@ -39,6 +40,7 @@ import { ConfirmDialogComponent } from '../../shared/confirm-dialog/confirm-dial
     MatDialogModule,
     MatTooltipModule,
     MatSnackBarModule,
+    SystemAlertsComponent,
   ],
   templateUrl: './dashboard.component.html',
   styleUrls: ['./dashboard.component.scss'],

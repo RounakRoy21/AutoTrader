@@ -213,3 +213,137 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+// ── Tab chrome ─────────────────────────────────────────────────
+.tab-icon {
+  font-size: 16px;
+  width: 16px;
+  height: 16px;
+  margin-right: 4px;
+  vertical-align: middle;
+
+  &.traded-icon   { color: #2e7d32; }
+  &.rejected-icon { color: #c62828; }
+}
+
+.tab-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 18px;
+  padding: 0 5px;
+  margin-left: 6px;
+  border-radius: 9px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  line-height: 1;
+
+  &.traded-badge   { background: #e8f5e9; color: #2e7d32; }
+  &.rejected-badge { background: #ffebee; color: #c62828; }
+}
+
+.tab-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 32px 0;
+  color: rgba(0, 0, 0, 0.35);
+  font-size: 0.9rem;
+
+  mat-icon {
+    font-size: 32px;
+    width: 32px;
+    height: 32px;
+  }
+
+  p { margin: 0; }
+}
+
+// ── Reject summary bar ─────────────────────────────────────────
+.reject-summary {
+  display: flex;
+  gap: 20px;
+  align-items: center;
+  padding: 8px 12px;
+  margin: 8px 0;
+  background: rgba(0, 0, 0, 0.03);
+  border-radius: 4px;
+  font-size: 0.8rem;
+  color: rgba(0, 0, 0, 0.55);
+
+  > span {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+}
+
+// ── Tab chrome ─────────────────────────────────────────────────
+.tab-icon {
+  font-size: 16px;
+  width: 16px;
+  height: 16px;
+  margin-right: 4px;
+  vertical-align: middle;
+
+  &.traded-icon   { color: #2e7d32; }
+  &.rejected-icon { color: #c62828; }
+}
+
+.tab-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 18px;
+  padding: 0 5px;
+  margin-left: 6px;
+  border-radius: 9px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  line-height: 1;
+
+  &.traded-badge   { background: #e8f5e9; color: #2e7d32; }
+  &.rejected-badge { background: #ffebee; color: #c62828; }
+}
+
+.tab-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 32px 0;
+  color: rgba(0, 0, 0, 0.35);
+  font-size: 0.9rem;
+
+  mat-icon {
+    font-size: 32px;
+    width: 32px;
+    height: 32px;
+  }
+
+  p { margin: 0; }
+}
+
+// ── Reject summary bar ─────────────────────────────────────────
+.reject-summary {
+  display: flex;
+  gap: 20px;
+  align-items: center;
+  padding: 8px 12px;
+  margin: 8px 0;
+  background: rgba(0, 0, 0, 0.03);
+  border-radius: 4px;
+  font-size: 0.8rem;
+  color: rgba(0, 0, 0, 0.55);
+
+  > span {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+}

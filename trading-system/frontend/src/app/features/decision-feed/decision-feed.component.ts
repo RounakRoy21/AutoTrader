@@ -14,6 +14,7 @@ import { MatIconModule } from '@angular/material/icon';
 import { MatTooltipModule } from '@angular/material/tooltip';
 import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
 import { MatChipsModule } from '@angular/material/chips';
+import { MatTabsModule } from '@angular/material/tabs';
 
 import { ApiService } from '../../core/services/api.service';
 import { DecisionEntry } from '../../core/models';
@@ -29,6 +30,7 @@ import { DecisionEntry } from '../../core/models';
     MatTooltipModule,
     MatProgressSpinnerModule,
     MatChipsModule,
+    MatTabsModule,
   ],
   templateUrl: './decision-feed.component.html',
   styleUrls: ['./decision-feed.component.scss'],
@@ -67,6 +69,19 @@ export class DecisionFeedComponent implements OnInit, OnDestroy {
   ngOnDestroy(): void {
     this.destroy$.next();
     this.destroy$.complete();
+  }
+
+  get traded(): DecisionEntry[] {
+    return this.decisions.filter(d => d.decision === 'EXECUTE' || d.decision === 'REDUCE');
+  }
+  get rejected(): DecisionEntry[] {
+    return this.decisions.filter(d => d.decision === 'REJECT');
+  }
+  get rejectedPreCheckCount(): number {
+    return this.decisions.filter(d => d.decision === 'REJECT' && d.stage === 'PRE_CHECK').length;
+  }
+  get rejectedLlmCount(): number {
+    return this.decisions.filter(d => d.decision === 'REJECT' && d.stage === 'LLM').length;
   }
 
   decisionClass(d: DecisionEntry): string {

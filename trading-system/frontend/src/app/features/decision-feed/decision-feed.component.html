@@ -21,53 +21,109 @@
       <p class="hint">Signals are evaluated between 09:15 and 15:15 IST on trading days.</p>
     </div>
 
-    <div *ngIf="!loading && decisions.length > 0" class="feed-list">
-      <div
-        *ngFor="let d of decisions"
-        class="feed-row"
-        [class]="decisionClass(d)"
-      >
-        <!-- Decision badge -->
-        <div class="badge-col">
-          <span class="decision-badge" [class]="decisionClass(d)">
-            <mat-icon class="badge-icon">{{ decisionIcon(d) }}</mat-icon>
-            {{ d.decision }}
-          </span>
-          <span class="stage-pill" [class.stage-llm]="d.stage === 'LLM'">
-            {{ stageLabel(d) }}
-          </span>
+    <mat-tab-group *ngIf="!loading && decisions.length > 0" animationDuration="150ms">
+
+      <!-- ── Traded tab (EXECUTE + REDUCE) ──────────────────── -->
+      <mat-tab>
+        <ng-template mat-tab-label>
+          <mat-icon class="tab-icon traded-icon">check_circle</mat-icon>
+          Traded
+          <span class="tab-badge traded-badge" *ngIf="traded.length">{{ traded.length }}</span>
+        </ng-template>
+
+        <div class="tab-empty" *ngIf="traded.length === 0">
+          <mat-icon>pending_actions</mat-icon>
+          <p>No executions yet today.</p>
         </div>
 
-        <!-- Stock + time -->
-        <div class="stock-col">
-          <span class="stock-name">{{ d.stock }}</span>
-          <span class="trade-time">{{ d.ts }}</span>
+        <div class="feed-list" *ngIf="traded.length > 0">
+          <ng-container *ngFor="let d of traded">
+            <ng-container *ngTemplateOutlet="feedRow; context: {$implicit: d}"></ng-container>
+          </ng-container>
+        </div>
+      </mat-tab>
+
+      <!-- ── Rejected tab ────────────────────────────────────── -->
+      <mat-tab>
+        <ng-template mat-tab-label>
+          <mat-icon class="tab-icon rejected-icon">cancel</mat-icon>
+          Rejected
+          <span class="tab-badge rejected-badge" *ngIf="rejected.length">{{ rejected.length }}</span>
+        </ng-template>
+
+        <div class="tab-empty" *ngIf="rejected.length === 0">
+          <mat-icon>check_circle_outline</mat-icon>
+          <p>No rejections today.</p>
         </div>
 
-        <!-- Signal values -->
-        <div class="signal-col">
-          <span class="sig-item" matTooltip="Last Traded Price">₹{{ d.ltp | number:'1.2-2' }}</span>
-          <span class="sig-item" matTooltip="RSI(14)">RSI {{ d.rsi }}</span>
-          <span class="sig-item" matTooltip="Volume ratio vs 20-day avg">Vol {{ d.volume_ratio }}×</span>
-          <span *ngIf="d.confidence != null" class="sig-item conf-score"
-                [matTooltip]="'LLM confidence score (0–100)'">
-            Conf {{ d.confidence }}
-          </span>
-        </div>
+        <ng-container *ngIf="rejected.length > 0">
+          <!-- Summary bar showing pre-check vs LLM split -->
+          <div class="reject-summary">
+            <span>
+              <span class="stage-pill">Pre-check</span>
+              {{ rejectedPreCheckCount }} filtered without LLM call
+            </span>
+            <span *ngIf="rejectedLlmCount > 0">
+              <span class="stage-pill stage-llm">LLM</span>
+              {{ rejectedLlmCount }} reviewed &amp; rejected
+            </span>
+          </div>
 
-        <!-- Trade parameters (EXECUTE/REDUCE only) -->
-        <div class="trade-col" *ngIf="d.qty != null">
-          <span class="param">Qty <strong>{{ d.qty }}</strong></span>
-          <span class="param">SL <strong>₹{{ d.sl | number:'1.2-2' }}</strong></span>
-          <span class="param">TGT <strong>₹{{ d.target | number:'1.2-2' }}</strong></span>
-          <span class="param" *ngIf="rrRatio(d)">R:R <strong>{{ rrRatio(d) }}</strong></span>
-        </div>
+          <div class="feed-list">
+            <ng-container *ngFor="let d of rejected">
+              <ng-container *ngTemplateOutlet="feedRow; context: {$implicit: d}"></ng-container>
+            </ng-container>
+          </div>
+        </ng-container>
+      </mat-tab>
 
-        <!-- Rationale -->
-        <div class="rationale-col" [matTooltip]="d.rationale">
-          {{ d.rationale | slice:0:100 }}{{ d.rationale.length > 100 ? '…' : '' }}
-        </div>
-      </div>
-    </div>
+    </mat-tab-group>
   </mat-card-content>
 </mat-card>
+
+<!-- ── Shared row template ──────────────────────────────────── -->
+<ng-template #feedRow let-d>
+  <div class="feed-row" [class]="decisionClass(d)">
+
+    <!-- Decision badge + stage pill -->
+    <div class="badge-col">
+      <span class="decision-badge" [class]="decisionClass(d)">
+        <mat-icon class="badge-icon">{{ decisionIcon(d) }}</mat-icon>
+        {{ d.decision }}
+      </span>
+      <span class="stage-pill" [class.stage-llm]="d.stage === 'LLM'">
+        {{ stageLabel(d) }}
+      </span>
+    </div>
+
+    <!-- Stock + time -->
+    <div class="stock-col">
+      <span class="stock-name">{{ d.stock }}</span>
+      <span class="trade-time">{{ d.ts }}</span>
+    </div>
+
+    <!-- Signal values -->
+    <div class="signal-col">
+      <span class="sig-item" matTooltip="Last Traded Price">₹{{ d.ltp | number:'1.2-2' }}</span>
+      <span class="sig-item" matTooltip="RSI(14)">RSI {{ d.rsi }}</span>
+      <span class="sig-item" matTooltip="Volume ratio vs 20-day avg">Vol {{ d.volume_ratio }}×</span>
+      <span *ngIf="d.confidence != null" class="sig-item conf-score"
+            [matTooltip]="'LLM confidence score (0–100)'">
+        Conf {{ d.confidence }}
+      </span>
+    </div>
+
+    <!-- Trade parameters (EXECUTE/REDUCE only) -->
+    <div class="trade-col" *ngIf="d.qty != null">
+      <span class="param">Qty <strong>{{ d.qty }}</strong></span>
+      <span class="param">SL <strong>₹{{ d.sl | number:'1.2-2' }}</strong></span>
+      <span class="param">TGT <strong>₹{{ d.target | number:'1.2-2' }}</strong></span>
+      <span class="param" *ngIf="rrRatio(d)">R:R <strong>{{ rrRatio(d) }}</strong></span>
+    </div>
+
+    <!-- Rationale -->
+    <div class="rationale-col" [matTooltip]="d.rationale">
+      {{ d.rationale | slice:0:100 }}{{ d.rationale.length > 100 ? '…' : '' }}
+    </div>
+  </div>
+</ng-template>

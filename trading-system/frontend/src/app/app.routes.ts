@@ -23,11 +23,6 @@ export const routes: Routes = [
       import('./features/pnl-chart/pnl-chart.component').then(m => m.PnlChartComponent),
   },
   {
-    path: 'alerts',
-    loadComponent: () =>
-      import('./features/system-alerts/system-alerts.component').then(m => m.SystemAlertsComponent),
-  },
-  {
     path: 'decisions',
     loadComponent: () =>
       import('./features/decision-feed/decision-feed.component').then(m => m.DecisionFeedComponent),
