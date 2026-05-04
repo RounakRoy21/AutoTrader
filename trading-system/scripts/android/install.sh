@@ -64,8 +64,18 @@ ok "Node.js $(node --version)"
 # ─────────────────────────────────────────────────────────────────────────────
 step "Step 2/8 — PostgreSQL"
 
+# In proot-distro Ubuntu, PostgreSQL installs but may not auto-create a cluster.
+# Detect the installed version from the filesystem and create the cluster if missing.
 PG_VER=$(pg_lsclusters --no-header 2>/dev/null | awk '{print $1; exit}')
-[ -z "$PG_VER" ] && fail "No PostgreSQL cluster found after install — something went wrong"
+if [ -z "$PG_VER" ]; then
+    PG_VER=$(ls /usr/lib/postgresql/ 2>/dev/null | sort -V | tail -1)
+    [ -z "$PG_VER" ] && fail "PostgreSQL does not appear to be installed — apt install may have failed"
+    info "No cluster found; creating one for PostgreSQL $PG_VER..."
+    pg_createcluster "$PG_VER" main --start
+    sleep 2
+    PG_VER=$(pg_lsclusters --no-header 2>/dev/null | awk '{print $1; exit}')
+    [ -z "$PG_VER" ] && fail "pg_createcluster ran but still no cluster found"
+fi
 
 # Start PostgreSQL
 PG_STATUS=$(pg_ctlcluster "$PG_VER" main status 2>&1 || true)
