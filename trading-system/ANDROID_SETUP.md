@@ -303,12 +303,104 @@ The scheduler will re-compute the next event from the current time and carry on.
 
 ---
 
-## Part 6 — Updating the App
+## Part 6 — Updating the App (After Tuning Parameters or Changing Code)
 
-When you push new code:
+When you observe something during paper trading — say the scanner is too aggressive, or a risk threshold needs changing — you edit the code on your Windows laptop, push it to GitHub, and then pull it down to the phone. Here's the full workflow.
+
+### Step 1 — Make your changes on the laptop
+
+Edit the relevant files in VS Code (e.g. `backend/agents/scanner.py`, `backend/agents/risk_manager.py`). Test locally if you can. Then push to GitHub:
 
 ```bash
-# In the tmux shell window (window 2, Ubuntu):
+# In VS Code's terminal on your laptop:
+git add .
+git commit -m "Tune scanner sensitivity and risk thresholds"
+git push
+```
+
+> **What `git push` does:** It uploads your local changes to GitHub (the central copy). The phone then downloads from GitHub using `git pull`.
+
+### Step 2 — Decide when to deploy
+
+**Best time to deploy:** After 16:00 IST on a trading day (after shutdown), or any time on a weekend/holiday. This avoids interrupting a live (or paper) session mid-day.
+
+If you need to deploy urgently mid-session, shut down the backend first (see Step 3b).
+
+### Step 3 — Pull the changes on the phone
+
+Go to the tmux `shell` window on the phone (Ctrl-B 2), which puts you into Ubuntu. Then:
+
+#### 3a — If the backend is not currently running (after 16:00 or on a weekend)
+
+```bash
+cd /root/autotrader
+git pull
+```
+
+Then decide which of the sections below applies to your change.
+
+#### 3b — If the backend is currently running and you need to deploy now
+
+```bash
+# Stop the backend first
+bash /root/autotrader/trading-system/scripts/android/shutdown.sh
+
+# Then pull the code
+cd /root/autotrader
+git pull
+```
+
+---
+
+### What type of change did you make?
+
+#### Backend-only change (most common — parameter tuning, logic changes, risk thresholds)
+
+No frontend rebuild needed. Just restart the backend:
+
+```bash
+bash /root/autotrader/trading-system/scripts/android/startup.sh
+```
+
+The backend reads your Python files fresh on every start — `git pull` + restart is all it takes.
+
+#### New Python packages added (someone added a line to `requirements.txt`)
+
+```bash
+cd /root/autotrader/trading-system/backend
+source .venv/bin/activate
+pip install -r requirements.txt --quiet
+
+# Then restart
+bash /root/autotrader/trading-system/scripts/android/startup.sh
+```
+
+#### Database schema change (a new migration was added to `migrations/versions/`)
+
+```bash
+cd /root/autotrader/trading-system/backend
+source .venv/bin/activate
+alembic upgrade head
+
+# Then restart
+bash /root/autotrader/trading-system/scripts/android/startup.sh
+```
+
+> **What is a migration?** If someone adds a new column to a database table (e.g. to track a new piece of data), a migration file is created to make that change on any existing database automatically. `alembic upgrade head` applies all pending migrations.
+
+#### Frontend change (dashboard layout, new chart, etc.)
+
+```bash
+cd /root/autotrader/trading-system/frontend
+npm install --quiet
+npx ng build --configuration production
+cp -r dist/autotrader-dashboard/browser/* /var/www/autotrader/
+# nginx picks up the new files immediately — no nginx restart needed
+```
+
+#### Full update (not sure what changed — do everything)
+
+```bash
 cd /root/autotrader
 git pull
 
@@ -317,16 +409,25 @@ source .venv/bin/activate
 pip install -r requirements.txt --quiet
 alembic upgrade head
 
-# Rebuild frontend if you changed frontend code
 cd ../frontend
 npm install --quiet
 npx ng build --configuration production
 cp -r dist/autotrader-dashboard/browser/* /var/www/autotrader/
 
-# Restart the backend to pick up code changes
-bash /root/autotrader/trading-system/scripts/android/shutdown.sh
 bash /root/autotrader/trading-system/scripts/android/startup.sh
 ```
+
+---
+
+### How to verify the update worked
+
+After restarting:
+
+1. Switch to the `backend-log` window (Ctrl-B 1) and watch the startup logs — you should see uvicorn start without errors.
+2. Open the dashboard in a browser on your laptop or phone: `http://<phone-ip>:4201`
+3. Check the logs for the parameter/behaviour you changed — e.g. if you raised the minimum volume threshold, you should see fewer stocks being picked up in the scanner log.
+
+If something broke (the backend crashes immediately after starting), check the log for the error, fix it on the laptop, push again, and repeat from Step 1.
 
 ---
 
