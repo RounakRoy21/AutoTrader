@@ -37,7 +37,10 @@ import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional
 
-from growwapi import GrowwAPI
+try:
+    from growwapi import GrowwAPI as _GrowwAPI
+except ImportError:  # SDK only available inside Docker image
+    _GrowwAPI = None  # type: ignore[assignment,misc]
 
 from core.config import get_settings
 from core.nse_calendar import ist_today
@@ -78,7 +81,7 @@ class GrowwClient:
 
     def __init__(self) -> None:
         self._settings = get_settings()
-        self._groww: Optional[GrowwAPI] = None
+        self._groww: Optional["_GrowwAPI"] = None  # type: ignore[type-arg]
         self._last_failure: float = 0.0
         self._cached_token: Optional[str] = None
 
@@ -100,11 +103,11 @@ class GrowwClient:
         self._cached_token = token
         return token
 
-    async def get_groww(self) -> GrowwAPI:
+    async def get_groww(self):
         """Return an authenticated GrowwAPI instance."""
         token = await self._get_access_token()
         if self._groww is None:
-            self._groww = GrowwAPI(access_token=token)
+            self._groww = _GrowwAPI(access_token=token)
         else:
             # Refresh the token on the existing instance in case it was rotated
             self._groww.access_token = token
@@ -428,6 +431,43 @@ class GrowwClient:
                 raise
 
         return result
+
+    async def get_ohlcv_snapshot(self, symbol: str) -> Dict[str, Any]:
+        """Return today's session OHLCV snapshot for *symbol*.
+
+        Called by Scanner._start_ohlcv_poll_loop() every ~60 seconds.
+        GrowwFeed delivers only LTP + timestamp; open, high, low, close,
+        and cumulative volume must be supplemented via REST.
+
+        In paper mode returns {} immediately — MockTickGenerator injects full
+        OHLC data into every tick via tick["ohlc"], so no REST supplement is needed.
+
+        Returns:
+            Dict with keys "open", "high", "low", "close", "volume", or {} on
+            paper mode.  Caller is responsible for treating 0-values as missing.
+        """
+        if self._settings.paper_trading:
+            return {}
+
+        groww = await self.get_groww()
+
+        @_retry_sync
+        def _fetch():
+            return groww.get_quote(trading_symbol=symbol, exchange="NSE")
+
+        try:
+            raw = await asyncio.to_thread(_fetch)
+        except Exception as exc:
+            logger.warning("get_ohlcv_snapshot failed for %s: %s", symbol, exc)
+            return {}
+
+        return {
+            "open":   float(raw.get("open")  or raw.get("open_price")  or 0),
+            "high":   float(raw.get("high")  or raw.get("high_price")  or raw.get("day_high")  or 0),
+            "low":    float(raw.get("low")   or raw.get("low_price")   or raw.get("day_low")   or 0),
+            "close":  float(raw.get("close") or raw.get("prev_close")  or raw.get("close_price") or 0),
+            "volume": int(  raw.get("volume") or raw.get("total_volume") or raw.get("volume_traded") or 0),
+        }
 
     async def get_historical_data(
         self,

@@ -38,6 +38,7 @@ aiohttp==3.*
 feedparser==6.*
 
 # Utilities
+orjson>=3.9
 python-dotenv==1.*
 pytz==2024.*
 

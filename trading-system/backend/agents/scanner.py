@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime
 from collections import deque
 from typing import Any, Callable, Dict, List, Optional
@@ -22,6 +23,11 @@ from typing import Any, Callable, Dict, List, Optional
 import numpy as np
 import pandas as pd
 import pytz
+
+# ── Performance logging ──────────────────────────────────────────────────────
+# Step 0: timing checkpoints log at DEBUG level with a [PERF] prefix so they
+# are invisible at INFO but trivially filterable when debugging latency.
+_PERF = logging.DEBUG
 
 from core.config import get_settings
 from integrations.groww_client import get_groww_client
@@ -36,11 +42,16 @@ IST = pytz.timezone("Asia/Kolkata")
 
 # ── GrowwFeed OHLCV supplement cache ─────────────────────────────────────────
 # GrowwFeed delivers only {ltp, tsInMillis} per tick.
-# A background polling thread (started in scanner.start()) populates this dict
-# every ~60 seconds via groww_client.get_ltp() / get_quote().
+# _start_ohlcv_poll_loop() (async task, started in Scanner.start() for live mode)
+# populates this dict every OHLCV_POLL_INTERVAL_SECS via get_ohlcv_snapshot().
 # Keys = trading symbol (e.g. "RELIANCE"); values = {"open", "high", "low",
 # "close", "volume"} from the latest REST snapshot.
 _ohlc_cache: Dict[str, Dict[str, Any]] = {}
+# Monotonic timestamp of last successful OHLCV poll per symbol (for freshness gate)
+_ohlc_last_ts: Dict[str, float] = {}
+
+OHLCV_POLL_INTERVAL_SECS: int = 60   # REST poll cadence (business logic — do not change)
+MAX_OHLCV_STALENESS_SECS: int = 90   # 1.5× poll interval; wider than poll to absorb one retry
 
 
 class CandleBuilder:
@@ -450,11 +461,27 @@ class Scanner:
             if elapsed < self.SIGNAL_COOLDOWN_SECS:
                 return None
 
-        # ── Tick-level indicators ──────────────────────
+        # ── BN1: OHLCV freshness gate ────────────────────────────────────────────
+        # When GrowwFeed is active (credentials present), skip signal generation
+        # when OHLCV data is stale.  A stale VWAP against a current LTP produces
+        # false readings which can trigger signals on outdated volumes.
+        # When MockTickGenerator is active (no credentials), OHLC is injected
+        # per tick via tick["ohlc"] so the cache is always fresh — skip gate.
+        if self._settings.groww_client_id:
+            ts = _ohlc_last_ts.get(store.symbol, 0.0)
+            if ts == 0.0 or (time.monotonic() - ts) > MAX_OHLCV_STALENESS_SECS:
+                logger.debug(
+                    "[Scanner] %s OHLCV stale (last=%.0fs ago) — skipping signal",
+                    store.symbol,
+                    time.monotonic() - ts if ts > 0.0 else -1,
+                )
+                return None
+        _t4_start = time.perf_counter_ns()
         ltp = store.ltp
         vwap = store.compute_vwap()
         rsi = store.compute_rsi()
         vol_ratio = store.compute_volume_ratio()
+
 
         # A2: Intraday NIFTY 50 macro trend filter.
         # Suppress all long signals when NIFTY has drifted below the configured
@@ -497,7 +524,9 @@ class Scanner:
         ema_21 = store.compute_ema(21)
         macd_hist = store.compute_macd_histogram()
         atr = store.compute_atr()
-
+        _t4_end = time.perf_counter_ns()
+        logger.log(_PERF, "[PERF T3→T4] all indicators %s: %.0f μs",
+                   store.symbol, (_t4_end - _t4_start) / 1_000)
         # Conditions 4 + 5: EMA trend and MACD momentum — both require ≥35 candles
         # so that MACD (which needs 26-period EMA) is always evaluated alongside
         # the EMA crossover check, rather than being silently skipped.  (SM2)
@@ -547,6 +576,9 @@ class Scanner:
     def _on_ticks(self, ws, ticks: List[Dict[str, Any]]) -> None:
         """Callback invoked by GrowwFeed or MockTickGenerator on each tick batch."""
         for tick in ticks:
+            # ── P1: tick entry ────────────────────────────────────────────────
+            _p1 = time.perf_counter_ns()
+
             token = tick.get("instrument_token") or tick.get("exchange_token")
 
             # A2: Intercept NIFTY 50 index ticks to maintain the macro trend state.
@@ -555,23 +587,27 @@ class Scanner:
                 price = tick.get("ltp") or tick.get("last_price", 0.0)
                 if price > 0:
                     self._nifty_ltp = price
-                    # Seed open price from the REST OHLC poll cache (GrowwFeed has no ohlc field)
                     cached = _ohlc_cache.get("NIFTY 50", {})
                     if self._nifty_open_price == 0.0 and cached.get("open", 0.0) > 0:
                         self._nifty_open_price = float(cached["open"])
                         logger.info(
                             "[Scanner] NIFTY 50 open price captured: ₹%.2f", self._nifty_open_price
                         )
-                continue  # Do not process as a stock signal
+                continue
 
             symbol = get_symbol(token) if token else None
             if symbol is None:
                 continue
 
+            # ── P2: LTP cache write — MUST be first, before any other processing.
+            # The Risk Manager's 5-second poll reads from this cache for stop-loss
+            # monitoring.  Any overhead before this write delays SL detection.
+            ltp = tick.get("ltp") or tick.get("last_price", 0.0)
+            set_ltp(symbol, ltp)
+            _p2 = time.perf_counter_ns()
+            logger.log(_PERF, "[PERF P1→P2] LTP cache write %s: %.0f ns", symbol, _p2 - _p1)
+
             if symbol not in self._stores:
-                # In live mode, all known symbols are pre-loaded by _load_avg_volumes()
-                # before the feed starts.  An unknown token here is an instrument
-                # outside the focus list.
                 if not self._settings.paper_trading:
                     logger.warning(
                         "[Scanner] Tick for unexpected symbol %s (token=%s) — "
@@ -580,14 +616,19 @@ class Scanner:
                     )
                 self._stores[symbol] = TickDataStore(symbol)
             store = self._stores[symbol]
+
+            _t3_start = time.perf_counter_ns()
             store.add_tick(tick)
+            _t3_end = time.perf_counter_ns()
+            logger.log(_PERF, "[PERF T3] candle construction %s: %.0f ns", symbol, _t3_end - _t3_start)
 
-            # Keep the shared LTP store current (thread-safe, sync-safe)
-            ltp = tick.get("ltp") or tick.get("last_price", 0.0)
-            set_ltp(symbol, ltp)
-
+            _t5_start = time.perf_counter_ns()
             signal = self._check_signal(store)
+            _t5_end = time.perf_counter_ns()
+            logger.log(_PERF, "[PERF T3→T5] signal check %s: %.0f μs", symbol, (_t5_end - _t5_start) / 1_000)
+
             if signal is not None:
+                _t6_start = time.perf_counter_ns()
                 try:
                     # asyncio.Queue is NOT thread-safe.  In live mode _on_ticks
                     # is called from GrowwFeed's WebSocket thread, so we must
@@ -600,8 +641,54 @@ class Scanner:
                         )
                     else:
                         self._signal_queue.put_nowait(signal)
+                    logger.log(_PERF, "[PERF T6] signal queued %s: %.0f ns",
+                               symbol, time.perf_counter_ns() - _t6_start)
                 except asyncio.QueueFull:
                     logger.warning("Signal queue full — dropping signal for %s", symbol)
+
+    async def _start_ohlcv_poll_loop(self) -> None:
+        """Periodic OHLCV supplementation task for live mode.
+
+        GrowwFeed delivers only {ltp, tsInMillis} per tick.  Volume, open, high,
+        low, close are only available via REST.  This loop fetches all tracked
+        symbols in parallel every OHLCV_POLL_INTERVAL_SECS and writes results
+        into module-level _ohlc_cache and _ohlc_last_ts.
+
+        _check_signal() gates on _ohlc_last_ts to avoid stale VWAP / volume
+        readings: if the last successful poll is older than MAX_OHLCV_STALENESS_SECS
+        the signal check is skipped entirely for that symbol.
+
+        Uses asyncio.gather() so all symbols are fetched in one concurrent batch
+        (O(1 RTT) instead of O(N RTTs) for N symbols).
+        """
+        groww = get_groww_client()
+        symbols = list(get_instrument_map().keys())
+        while self._running:
+            _t1 = time.perf_counter_ns()
+            try:
+                results = await asyncio.gather(
+                    *[groww.get_ohlcv_snapshot(sym) for sym in symbols],
+                    return_exceptions=True,
+                )
+                _t2 = time.perf_counter_ns()
+                fetched = 0
+                for sym, result in zip(symbols, results):
+                    if isinstance(result, Exception):
+                        logger.warning("[Scanner] OHLCV poll error for %s: %s", sym, result)
+                        continue
+                    if result:  # empty dict in paper mode — nothing to cache
+                        _ohlc_cache[sym] = result
+                        _ohlc_last_ts[sym] = time.monotonic()
+                        fetched += 1
+                logger.log(
+                    _PERF,
+                    "[PERF T1→T2] OHLCV REST poll: %d/%d symbols %.1f ms",
+                    fetched, len(symbols), (_t2 - _t1) / 1_000_000,
+                )
+                logger.debug("[Scanner] OHLCV poll: %d/%d symbols updated", fetched, len(symbols))
+            except Exception as exc:
+                logger.error("[Scanner] OHLCV poll loop exception: %s", exc, exc_info=True)
+            await asyncio.sleep(OHLCV_POLL_INTERVAL_SECS)
 
     async def _load_avg_volumes(self) -> None:
         """Fetch 20-day average daily volume for every focus stock before session start.
@@ -663,31 +750,65 @@ class Scanner:
         logger.error("GrowwFeed error: code=%s reason=%s", code, reason)
 
     async def start(self) -> None:
-        """Start the scanner: MockTickGenerator in paper mode, GrowwFeed in live mode."""
+        """Start the scanner.
+
+        Data feed selection is based on whether real Groww credentials are
+        configured, NOT on the paper_trading flag:
+
+          • Credentials absent  → MockTickGenerator (offline dev / CI with no
+                                   market access).  paper_trading may be True or
+                                   False; the mock is the only data source
+                                   available in this environment.
+          • Credentials present → GrowwFeed WebSocket (real market ticks).
+                                   This applies to BOTH paper trading and live
+                                   trading.  paper_trading only gates order
+                                   placement and GTT — never data collection.
+        """
         self._running = True
         self._loop = asyncio.get_running_loop()
 
-        if self._settings.paper_trading:
-            logger.info("[Scanner] Paper trading mode — starting MockTickGenerator")
+        # credentials_present = Groww client_id is a non-empty string in .env
+        credentials_present = bool(self._settings.groww_client_id)
+
+        if not credentials_present:
+            logger.info(
+                "[Scanner] No Groww credentials — starting MockTickGenerator "
+                "(offline dev mode; paper_trading=%s)",
+                self._settings.paper_trading,
+            )
             self._mock_generator = MockTickGenerator(on_ticks_callback=self._on_ticks)
-            # SC1 (paper): seed avg_volume_20d so the volume_ratio filter works in paper
-            # mode too.  MockTickGenerator drives _volume_base from uniform(80k–500k);
-            # we pre-populate TickDataStores with the same values so compute_volume_ratio()
-            # returns a real ratio rather than 0.0 (which otherwise hard-rejects every signal).
-            self._mock_generator._seed_prices()   # idempotent — guarded by `if symbol not in`
+            # Seed avg_volume_20d so the volume_ratio filter works in dev mode.
+            # MockTickGenerator drives _volume_base from uniform(80k–500k);
+            # we pre-populate TickDataStores with the same values so
+            # compute_volume_ratio() returns a real ratio rather than 0.0.
+            self._mock_generator._seed_prices()   # idempotent
             for symbol, base_vol in self._mock_generator._volume_base.items():
                 if symbol not in self._stores:
                     self._stores[symbol] = TickDataStore(symbol, avg_volume_20d=base_vol)
             logger.info(
-                "[Scanner] Paper mode volume bases seeded for %d symbols",
+                "[Scanner] Dev mode volume bases seeded for %d symbols",
                 len(self._mock_generator._volume_base),
             )
             await self._mock_generator.run()
         else:
-            logger.info("[Scanner] Live mode — loading historical volumes before GrowwFeed")
+            logger.info(
+                "[Scanner] Groww credentials present — loading historical volumes "
+                "before GrowwFeed (paper_trading=%s)",
+                self._settings.paper_trading,
+            )
             # SC1: Pre-populate TickDataStore instances with 20-day avg volumes so the
             # volume filter is active from the first tick, not silently bypassed.
             await self._load_avg_volumes()
+
+            # BN1: Start the OHLCV REST poll loop BEFORE connecting GrowwFeed so the
+            # first tick batch already has valid OHLCV data in _ohlc_cache.
+            # Runs in both paper and live mode whenever GrowwFeed is active —
+            # paper_trading only skips order placement, not data collection.
+            asyncio.create_task(
+                self._start_ohlcv_poll_loop(),
+                name="scanner_ohlcv_poll",
+            )
+            logger.info("[Scanner] OHLCV poll task started (interval=%ds)", OHLCV_POLL_INTERVAL_SECS)
 
             groww_client = get_groww_client()
             ticker = await groww_client.create_ticker()

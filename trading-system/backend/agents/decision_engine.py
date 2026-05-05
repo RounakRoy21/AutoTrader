@@ -11,10 +11,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from datetime import date, datetime
 from typing import Optional
 
 import pytz
+
+try:
+    import orjson as _orjson
+except ImportError:  # fallback until image rebuild includes orjson
+    _orjson = None  # type: ignore[assignment]
 from sqlalchemy import func, select
 
 from core.config import get_settings
@@ -33,6 +39,9 @@ logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 
 TRADE_COUNT_KEY = DAILY_TRADE_COUNT_KEY
+
+# Step 0: performance checkpoint log level (DEBUG so silent at INFO)
+_PERF = logging.DEBUG
 
 # ── Signal-quality thresholds ─────────────────────────────────────────────────
 # These values are stated verbatim in DECISION_SYSTEM_PROMPT so the LLM reasons
@@ -291,22 +300,46 @@ class DecisionEngine:
         if not (market_open <= now_ist <= market_close):
             return False, "Outside NSE market hours (09:15–15:30 IST)", signal
 
+        # ── BN4: pipeline all Redis reads before any conditional logic ──────────
+        # 4 sequential get_value() calls = 4 TCP round-trips to Redis (~1 ms each).
+        # One pipeline reduces this to 1 RTT regardless of watchlist size.
+        # The conditional `pause_until` read is left as a fallback-only sequential
+        # read because it is only triggered on the rare consecutive-loss threshold.
+        _t7_start = time.perf_counter_ns()
+        halt: Optional[str] = None
+        lock_val: Optional[str] = None
+        consec_str: Optional[str] = None
+        trade_count_str: Optional[str] = None
+        try:
+            _r = await get_redis()
+            async with _r.pipeline(transaction=False) as _pipe:
+                _pipe.get(HALT_KEY)
+                _pipe.get(f"stock_lock:{signal.stock}")
+                _pipe.get("consecutive_losses")
+                _pipe.get(TRADE_COUNT_KEY)
+                halt, lock_val, consec_str, trade_count_str = await _pipe.execute()
+        except Exception as _exc:
+            logger.warning("[DecisionEngine] Redis pipeline failed, using sequential reads: %s", _exc)
+            halt = await get_value(HALT_KEY)
+            lock_val = await get_value(f"stock_lock:{signal.stock}")
+            consec_str = await get_value("consecutive_losses")
+            trade_count_str = await get_value(TRADE_COUNT_KEY)
+        _t7_end = time.perf_counter_ns()
+        logger.log(_PERF, "[PERF T7] pre-check Redis pipeline: %.0f μs",
+                   (_t7_end - _t7_start) / 1_000)
+
         # Check trading halt
-        halt = await get_value(HALT_KEY)
         if halt == "TRUE":
             return False, "Trading is halted", signal
 
         # Check per-stock lock (stock stopped out today → locked for session)
-        if self._settings.stock_lock_after_sl:
-            lock = await get_value(f"stock_lock:{signal.stock}")
-            if lock == "TRUE":
-                return False, f"{signal.stock} locked after stop-loss today", signal
+        if self._settings.stock_lock_after_sl and lock_val == "TRUE":
+            return False, f"{signal.stock} locked after stop-loss today", signal
 
         # Check consecutive loss pause
-        consec_str = await get_value("consecutive_losses")
         consec_count = int(consec_str) if consec_str else 0
         if consec_count >= self._settings.consecutive_loss_pause_threshold:
-            pause_until_str = await get_value("consecutive_loss_pause_until")
+            pause_until_str = await get_value("consecutive_loss_pause_until")  # rare path
             if pause_until_str:
                 try:
                     pause_until = datetime.fromisoformat(pause_until_str)
@@ -393,8 +426,13 @@ class DecisionEngine:
         except Exception as exc:
             logger.error("Failed to check duplicate position for %s: %s", signal.stock, exc)
 
-        # Check daily trade count
-        trade_count_str = await get_value(TRADE_COUNT_KEY)
+        # Check daily trade count.
+        # Counter is incremented ONLY for EXECUTE decisions (not REDUCE) in
+        # trading_agent.py, so this gate accurately reflects full-size entries.
+        # REDUCE decisions are already penalised by halved quantity and must not
+        # consume a trade slot — otherwise 5 EXECUTEs + 1 REDUCE would lock out
+        # all further signals even though daily exposure is well under the limit.
+        # trade_count_str was pre-fetched in the pipeline above.
         trade_count = int(trade_count_str) if trade_count_str else 0
         if trade_count >= self._settings.max_trades_per_day:
             return False, f"Max daily trades ({self._settings.max_trades_per_day}) reached", signal
@@ -486,6 +524,13 @@ class DecisionEngine:
             }
             brief_summary = json.dumps(brief_for_llm, default=str)
 
+        # Use orjson for the LLM payload (3–5× faster than stdlib json).
+        # Falls back to stdlib if orjson is not yet installed (during image rebuild).
+        def _fast_dumps(obj: dict) -> str:
+            if _orjson is not None:
+                return _orjson.dumps(obj).decode()
+            return json.dumps(obj, default=str)
+
         sl_rule = (
             f"ATR-based: entry − ATR({signal.atr:.2f}) × {self._settings.atr_sl_multiplier}"
             if signal.atr and signal.atr > 0
@@ -525,8 +570,11 @@ class DecisionEngine:
         now_ist = datetime.now(IST)
         market_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
         minutes_to_close = max(0, int((market_close - now_ist).total_seconds() / 60))
+        # Rebuild brief_summary using orjson if available (saves ~0.2ms per call)
+        if self._market_brief:
+            brief_summary = _fast_dumps(brief_for_llm)  # type: ignore[possibly-undefined]
         user_content = (
-            f"TRADE SIGNAL:\n{json.dumps(signal_dict, default=str)}\n\n"
+            f"TRADE SIGNAL:\n{_fast_dumps(signal_dict)}\n\n"
             f"MARKET BRIEF:\n{brief_summary}\n\n"
             f"Pre-computed stop_loss_price: {sl_price} (include this exact value in your JSON).\n"
             f"Pre-computed target_price: {tgt_price} (include this exact value in your JSON).\n"
@@ -540,13 +588,17 @@ class DecisionEngine:
         # so the model cannot generate rogue prose.  1500 is a safety backstop:
         # historical Haiku output on this schema peaks at ~500 tokens, so 1500 gives
         # 3× headroom without risk of truncation.
-        return await client.generate_structured(
+        _t8 = time.perf_counter_ns()
+        result = await client.generate_structured(
             system_prompt=DECISION_SYSTEM_PROMPT,
             user_content=user_content,
             response_model=DecisionOutput,
             model=self._settings.anthropic_decision_model,
             max_tokens=1500,
         )
+        _t9 = time.perf_counter_ns()
+        logger.log(_PERF, "[PERF T8→T9] LLM call: %.0f ms", (_t9 - _t8) / 1_000_000)
+        return result
 
     def _validate_decision(
         self, signal: ScannerSignal, decision: DecisionOutput
@@ -828,7 +880,6 @@ class DecisionEngine:
     ) -> None:
         """Push a compact decision event to the rolling Redis feed (best-effort)."""
         try:
-            import json as _json
             now_ist = datetime.now(IST)
             entry = {
                 "ts": now_ist.strftime("%H:%M:%S"),
@@ -847,7 +898,10 @@ class DecisionEngine:
                 "target": dec.target_price if dec and dec.decision.value != "REJECT" else None,
             }
             r = await get_redis()
-            await r.lpush(DECISION_FEED_KEY, _json.dumps(entry))
+            # BN6: orjson.dumps is 3–5× faster than stdlib json and returns bytes,
+            # which aioredis accepts natively.  Falls back to stdlib if not installed.
+            payload = _orjson.dumps(entry) if _orjson is not None else json.dumps(entry).encode()
+            await r.lpush(DECISION_FEED_KEY, payload)
             await r.ltrim(DECISION_FEED_KEY, 0, 99)  # keep last 100
         except Exception:
             pass  # non-blocking — never raise

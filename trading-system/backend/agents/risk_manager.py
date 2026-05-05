@@ -209,6 +209,7 @@ class RiskManager:
                     entry_price=trade.entry_price,
                     entry_time=trade.entry_time,
                     quantity=trade.quantity,
+                    paper=settings.paper_trading,
                 )
                 await publish("system_alerts", {
                     "type": "danger",
@@ -267,6 +268,7 @@ class RiskManager:
                     entry_price=trade.entry_price,
                     entry_time=trade.entry_time,
                     quantity=trade.quantity,
+                    paper=settings.paper_trading,
                 )
                 await publish("system_alerts", {
                     "type": "success",
@@ -298,7 +300,7 @@ class RiskManager:
                         (ltp_map.get(t.stock, t.entry_price) - t.entry_price) * t.quantity
                         for t in open_trades
                     )
-                    await send_intraday_close_alert(n_positions=mis_count, running_pnl=running_pnl)
+                    await send_intraday_close_alert(n_positions=mis_count, running_pnl=running_pnl, paper=settings.paper_trading)
                     await publish("system_alerts", {
                         "type": "warning",
                         "message": "MIS square-off initiated — all intraday positions closing",

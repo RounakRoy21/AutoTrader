@@ -25,7 +25,7 @@ from integrations import ltp_store as ltp_store_module
 from integrations.groww_client import get_groww_client
 from integrations.telegram_client import send_telegram, send_trade_entry_alert
 from models.trade import Trade
-from schemas.decision import DecisionOutput
+from schemas.decision import Decision, DecisionOutput
 from schemas.market_brief import MarketBriefLLMOutput
 from schemas.trade import ScannerSignal
 
@@ -239,7 +239,13 @@ class TradingAgent:
         try:
             if settings.paper_trading:
                 order_id = f"PAPER-{now_ist.strftime('%H%M%S')}-{signal.stock}-{uuid4().hex[:6]}"
-                logger.info("📝 Paper trade: %s", order_id)
+                # Use current market LTP at execution time as the simulated fill price.
+                # signal.ltp was the price at scan time; ltp_store holds the latest
+                # tick from GrowwFeed (or MockTickGenerator in offline dev mode).
+                live_ltp = ltp_store_module.get_ltp(signal.stock)
+                if live_ltp and live_ltp > 0:
+                    fill_price = live_ltp
+                logger.info("📝 Paper trade: %s @ ₹%.2f", order_id, fill_price)
             else:
                 # A3: Circuit limit pre-check — reject orders when the stock is at
                 # or within 0.5% of its upper circuit limit.  NSE will reject the
@@ -393,8 +399,14 @@ class TradingAgent:
             )
             session.add(trade)
 
-        # Increment daily trade counter
-        await increment(TRADE_COUNT_KEY)
+        # Increment daily trade counter.
+        # Only EXECUTE decisions count toward max_trades_per_day.
+        # REDUCE decisions open a real (half-size) position but are already
+        # penalised by halved quantity; consuming a full trade slot on top of
+        # that would lock out future signals after e.g. 5 EXECUTEs + 1 REDUCE,
+        # even though daily exposure is well under the intended limit.
+        if decision.decision == Decision.EXECUTE:
+            await increment(TRADE_COUNT_KEY)
 
         # Publish trade event to Redis
         await publish("trade_events", {
@@ -417,6 +429,7 @@ class TradingAgent:
             qty=decision.adjusted_qty,
             product_type=decision.product_type.value,
             rationale=decision.rationale or "",
+            paper=settings.paper_trading,
         )
 
         logger.info(

@@ -14,6 +14,11 @@ import redis.asyncio as aioredis
 
 from core.config import get_settings
 
+try:
+    import orjson as _orjson
+except ImportError:  # orjson not yet installed (pre-image-rebuild)
+    _orjson = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 _redis: Optional[aioredis.Redis] = None
@@ -72,8 +77,15 @@ async def check_redis_health() -> bool:
 
 
 async def publish(channel: str, data: Any) -> None:
-    """Publish a JSON-serialised message to a Redis channel."""
-    payload = json.dumps(data) if not isinstance(data, str) else data
+    """Publish a JSON-serialised message to a Redis channel.
+    Uses orjson when available (3–5× faster than stdlib json).
+    """
+    if isinstance(data, str):
+        payload: str = data
+    elif _orjson is not None:
+        payload = _orjson.dumps(data).decode()
+    else:
+        payload = json.dumps(data)
     try:
         r = await get_redis()
         await r.publish(channel, payload)

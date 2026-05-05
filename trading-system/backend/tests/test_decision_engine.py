@@ -247,8 +247,9 @@ class TestPreCheck:
 
     @pytest.mark.asyncio
     @patch("agents.decision_engine.datetime")
+    @patch("agents.decision_engine.get_redis", side_effect=ConnectionError("Redis unavailable in unit tests"))
     @patch("agents.decision_engine.get_value")
-    async def test_halt_rejects(self, mock_get_value, mock_dt, engine, signal):
+    async def test_halt_rejects(self, mock_get_value, mock_get_redis, mock_dt, engine, signal):
         mock_dt.now.return_value = _MARKET_DT
         mock_get_value.return_value = "TRUE"
         passed, reason, _ = await engine._pre_check(signal)
@@ -335,8 +336,9 @@ class TestPreCheck:
 
     @pytest.mark.asyncio
     @patch("agents.decision_engine.datetime")
+    @patch("agents.decision_engine.get_redis", side_effect=ConnectionError("Redis unavailable in unit tests"))
     @patch("agents.decision_engine.get_value")
-    async def test_max_daily_trades_rejects(self, mock_get_value, mock_dt, engine, signal):
+    async def test_max_daily_trades_rejects(self, mock_get_value, mock_get_redis, mock_dt, engine, signal):
         mock_dt.now.return_value = _MARKET_DT
 
         async def side_effect(key):
@@ -468,8 +470,9 @@ class TestProtectionPreChecks:
 
     @pytest.mark.asyncio
     @patch("agents.decision_engine.datetime")
+    @patch("agents.decision_engine.get_redis", side_effect=ConnectionError("Redis unavailable in unit tests"))
     @patch("agents.decision_engine.get_value")
-    async def test_stock_lock_rejects(self, mock_get_value, mock_dt, engine, signal):
+    async def test_stock_lock_rejects(self, mock_get_value, mock_get_redis, mock_dt, engine, signal):
         mock_dt.now.return_value = _MARKET_DT
 
         async def side_effect(key):
@@ -487,9 +490,10 @@ class TestProtectionPreChecks:
     @pytest.mark.asyncio
     @patch("agents.decision_engine.datetime")
     @patch("agents.decision_engine.set_value", new_callable=AsyncMock)
+    @patch("agents.decision_engine.get_redis", side_effect=ConnectionError("Redis unavailable in unit tests"))
     @patch("agents.decision_engine.get_value")
     async def test_consecutive_loss_pause_rejects(
-        self, mock_get_value, mock_set_value, mock_dt, engine, signal
+        self, mock_get_value, mock_get_redis, mock_set_value, mock_dt, engine, signal
     ):
         mock_dt.now.return_value = _MARKET_DT
 

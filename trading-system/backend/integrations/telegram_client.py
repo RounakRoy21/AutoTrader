@@ -66,6 +66,7 @@ async def send_trade_entry_alert(
     qty: int,
     product_type: str,
     rationale: str = "",
+    paper: bool = False,
 ) -> bool:
     """Send a formatted trade entry alert with R:R and risk metrics."""
     risk_per_share = price - sl
@@ -74,9 +75,10 @@ async def send_trade_entry_alert(
     rr = reward_per_share / risk_per_share if risk_per_share > 0 else 0.0
     sl_pct = (risk_per_share / price) * 100 if price > 0 else 0.0
     tgt_pct = (reward_per_share / price) * 100 if price > 0 else 0.0
+    paper_tag = "📝 [PAPER] " if paper else ""
 
     lines = [
-        f"🟢 <b>BUY {stock}</b>  ·  {product_type}",
+        f"{paper_tag}🟢 <b>BUY {stock}</b>  ·  {product_type}",
         f"Entry ₹{price:.2f}  ·  Qty {qty}",
         f"SL ₹{sl:.2f} <i>(-{sl_pct:.1f}%)</i>  →  Target ₹{target:.2f} <i>(+{tgt_pct:.1f}%)</i>",
         f"Risk ₹{risk_total:.0f}  ·  R:R 1 : {rr:.1f}",
@@ -98,11 +100,13 @@ async def send_stop_loss_alert(
     entry_price: float = 0.0,
     entry_time: Optional[dt_time] = None,
     quantity: int = 0,
+    paper: bool = False,
 ) -> bool:
     """Send a stop-loss hit alert with entry context and hold duration."""
     drop_pct = ((ltp - entry_price) / entry_price * 100) if entry_price > 0 else 0.0
+    paper_tag = "[PAPER] " if paper else ""
 
-    lines = [f"🔴 <b>STOP LOSS HIT: {stock}</b>"]
+    lines = [f"🔴 {paper_tag}<b>STOP LOSS HIT: {stock}</b>"]
     if entry_price > 0:
         lines.append(f"Entry ₹{entry_price:.2f}  →  Exit ₹{ltp:.2f}  <i>({drop_pct:+.1f}%)</i>")
     else:
@@ -131,11 +135,13 @@ async def send_target_hit_alert(
     entry_price: float = 0.0,
     entry_time: Optional[dt_time] = None,
     quantity: int = 0,
+    paper: bool = False,
 ) -> bool:
     """Send a target hit alert with entry context and hold duration."""
     gain_pct = ((ltp - entry_price) / entry_price * 100) if entry_price > 0 else 0.0
+    paper_tag = "[PAPER] " if paper else ""
 
-    lines = [f"✅ <b>TARGET HIT: {stock}</b>"]
+    lines = [f"✅ {paper_tag}<b>TARGET HIT: {stock}</b>"]
     if entry_price > 0:
         lines.append(f"Entry ₹{entry_price:.2f}  →  Exit ₹{ltp:.2f}  <i>(+{gain_pct:.1f}%)</i>")
     else:
@@ -172,10 +178,12 @@ async def send_halt_alert(
 async def send_intraday_close_alert(
     n_positions: int = 0,
     running_pnl: Optional[float] = None,
+    paper: bool = False,
 ) -> bool:
     """Send an intraday square-off notification."""
     pos_str = f"{n_positions} position{'s' if n_positions != 1 else ''}" if n_positions > 0 else "all MIS positions"
-    lines = [f"🕒 <b>MIS Square-off</b>  ·  Closing {pos_str}"]
+    paper_tag = "[PAPER] " if paper else ""
+    lines = [f"🕒 {paper_tag}<b>MIS Square-off</b>  ·  Closing {pos_str}"]
     if running_pnl is not None:
         sign = "+" if running_pnl >= 0 else ""
         lines.append(f"Running P&L at close: ₹{sign}{running_pnl:.2f}")
