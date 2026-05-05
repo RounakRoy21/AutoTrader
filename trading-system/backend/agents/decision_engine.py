@@ -407,9 +407,16 @@ class DecisionEngine:
                     })
 
         # Check max open positions (authoritative DB query — not an in-memory counter)
+        # Bias-modulated: BULLISH→4, NEUTRAL→3, BEARISH→2
         open_count = await self._count_open_positions()
-        if open_count >= self._settings.max_open_positions:
-            return False, f"Max open positions ({self._settings.max_open_positions}) reached", signal
+        _bias = self._market_brief.market_bias.value if self._market_brief else "NEUTRAL"
+        _max_positions = {
+            "BULLISH": 4,
+            "NEUTRAL": self._settings.max_open_positions,
+            "BEARISH": 2,
+        }.get(_bias, self._settings.max_open_positions)
+        if open_count >= _max_positions:
+            return False, f"Max open positions ({_max_positions}) reached ({_bias} bias)", signal
 
         # Prevent duplicate position in the same stock
         try:
@@ -433,9 +440,15 @@ class DecisionEngine:
         # consume a trade slot — otherwise 5 EXECUTEs + 1 REDUCE would lock out
         # all further signals even though daily exposure is well under the limit.
         # trade_count_str was pre-fetched in the pipeline above.
+        # Bias-modulated: BULLISH→8, NEUTRAL→6, BEARISH→4
         trade_count = int(trade_count_str) if trade_count_str else 0
-        if trade_count >= self._settings.max_trades_per_day:
-            return False, f"Max daily trades ({self._settings.max_trades_per_day}) reached", signal
+        _max_trades = {
+            "BULLISH": 8,
+            "NEUTRAL": self._settings.max_trades_per_day,
+            "BEARISH": 4,
+        }.get(_bias, self._settings.max_trades_per_day)
+        if trade_count >= _max_trades:
+            return False, f"Max daily trades ({_max_trades}) reached ({_bias} bias)", signal
 
         # Monday: half-size positions (skip if already halved by stance above)
         if day_name == "Monday" and not size_reduced:
@@ -668,13 +681,24 @@ class DecisionEngine:
         if signal.macd_histogram is not None:
             macd_confirms = signal.macd_histogram > 0
 
+        # Bias-modulated volume and VWAP thresholds:
+        #   Volume ratio min — BULLISH: 1.3×  NEUTRAL: 1.5×  BEARISH: 2.0×
+        #   VWAP dev max     — BULLISH: 1.8%  NEUTRAL: 1.5%  BEARISH: 1.0%
+        _bias_val = self._market_brief.market_bias.value if self._market_brief else "NEUTRAL"
+        _vol_min_eff = {"BULLISH": 1.3, "NEUTRAL": VOLUME_RATIO_MIN, "BEARISH": 2.0}.get(
+            _bias_val, VOLUME_RATIO_MIN
+        )
+        _vwap_dev_max_eff = {"BULLISH": 1.8, "NEUTRAL": VWAP_DEV_MAX_PCT, "BEARISH": 1.0}.get(
+            _bias_val, VWAP_DEV_MAX_PCT
+        )
+
         audit = audit.model_copy(update={
             "rsi_cited":           signal.rsi,
             "rsi_in_range":        RSI_LONG_MIN <= signal.rsi <= RSI_LONG_MAX,
             "volume_ratio_cited":  signal.volume_ratio,
-            "volume_confirms":     signal.volume_ratio >= VOLUME_RATIO_MIN,
+            "volume_confirms":     signal.volume_ratio >= _vol_min_eff,
             "vwap_deviation_pct":  round(vwap_dev_pct, 3),
-            "price_vwap_valid":    (not vwap_unavailable) and (0.0 <= vwap_dev_pct <= VWAP_DEV_MAX_PCT),
+            "price_vwap_valid":    (not vwap_unavailable) and (0.0 <= vwap_dev_pct <= _vwap_dev_max_eff),
             "ema_aligned":         ema_aligned,
             "macd_confirms":       macd_confirms,
             "risk_reward_ratio":   actual_rr,

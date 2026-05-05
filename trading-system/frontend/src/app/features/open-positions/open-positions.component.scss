@@ -2,6 +2,11 @@
   margin: 16px;
 }
 
+.table-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
 .full-width {
   width: 100%;
 }
@@ -39,6 +44,4 @@
 // ── Mobile ─────────────────────────────────────────────────────
 @media (max-width: 600px) {
   .positions-card { margin: 8px; }
-
-  ::ng-deep .mat-mdc-table-container { overflow-x: auto; }
 }

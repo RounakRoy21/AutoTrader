@@ -21,6 +21,7 @@
   display: flex;
   flex-direction: column;
   height: 100%;
+  overflow-x: hidden; // prevent CDK overlay (dialog/snackbar) from causing horizontal scroll on mobile
   // No outer padding — components own their own margins
 }
 
@@ -37,6 +38,7 @@
 .page-content {
   flex: 1;
   overflow-y: auto;
+  overflow-x: hidden; // belt-and-suspenders: clip any child overflow before it reaches mat-sidenav-content
 }
 
 .toolbar-spacer {

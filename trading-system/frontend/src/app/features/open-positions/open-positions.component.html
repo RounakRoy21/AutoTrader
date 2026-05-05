@@ -4,6 +4,7 @@
   </mat-card-header>
   <mat-progress-bar *ngIf="loading" mode="query"></mat-progress-bar>
   <mat-card-content>
+    <div class="table-scroll">
     <table mat-table [dataSource]="positions" class="full-width" *ngIf="positions.length; else empty">
       <ng-container matColumnDef="stock">
         <th mat-header-cell *matHeaderCellDef>Stock</th>
@@ -75,6 +76,7 @@
           [class.profit-row]="row.unrealized_pnl !== null && row.unrealized_pnl >= 0"
           [class.loss-row]="row.unrealized_pnl !== null && row.unrealized_pnl < 0"></tr>
     </table>
+    </div>
 
     <ng-template #empty>
       <p class="empty-msg">No open positions.</p>

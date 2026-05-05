@@ -175,6 +175,7 @@ class TradingAgent:
             brief_data = json.loads(data)
             brief = MarketBriefLLMOutput.model_validate(brief_data)
             self._decision_engine.set_market_brief(brief)
+            self._scanner.set_market_bias(brief.market_bias.value)
         except Exception as exc:
             logger.error("Failed to parse market brief from Redis: %s", exc)
 
@@ -398,6 +399,11 @@ class TradingAgent:
                 gtt_trigger_id=gtt_trigger_id if not settings.paper_trading else None,
             )
             session.add(trade)
+
+        # Store ATR in Redis for the ROI decay floor in the risk manager.
+        # TTL = 86400 s (24 h) — always expires before the next session open.
+        if signal.atr and signal.atr > 0:
+            await set_value(f"trade_atr:{signal.stock}", str(round(signal.atr, 4)), ttl=86400)
 
         # Increment daily trade counter.
         # Only EXECUTE decisions count toward max_trades_per_day.

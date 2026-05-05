@@ -45,14 +45,15 @@ def settings() -> Settings:
     return Settings(
         paper_trading=True,
         total_capital=1_000_000.0,
-        stop_loss_pct=0.008,
-        min_target_pct=0.016,
+        stop_loss_pct=0.010,
+        min_target_pct=0.020,
         max_loss_per_trade_pct=0.015,
         max_open_positions=3,
         max_trades_per_day=6,
         daily_drawdown_limit_pct=0.03,
-        trailing_sl_activation_pct=0.005,
-        trailing_sl_trail_pct=0.005,
+        daily_drawdown_soft_alert_pct=0.02,
+        trailing_sl_activation_pct=0.008,
+        trailing_sl_trail_pct=0.007,
         atr_sl_multiplier=1.5,
         atr_target_multiplier=3.0,
         stock_lock_after_sl=True,
@@ -92,8 +93,8 @@ def valid_decision() -> DecisionOutput:
     return DecisionOutput(
         decision=Decision.EXECUTE,
         adjusted_qty=50,
-        stop_loss_price=2480.0,    # 0.8% below 2500
-        target_price=2540.0,      # 1.6% above 2500
+        stop_loss_price=2475.0,    # 1.0% below 2500
+        target_price=2550.0,      # 2.0% above 2500
         rationale="Good setup",
         product_type=ProductType.MIS,
         signal_audit=default_audit(),
@@ -110,8 +111,8 @@ def open_trade() -> MagicMock:
     trade.id = 1
     trade.stock = "RELIANCE"
     trade.entry_price = 2500.0
-    trade.stop_loss_price = 2480.0       # 0.8% below entry
-    trade.target_price = 2540.0          # 1.6% above entry
+    trade.stop_loss_price = 2475.0       # 1.0% below entry
+    trade.target_price = 2550.0          # 2.0% above entry
     trade.quantity = 100
     trade.product_type = "MIS"
     trade.status = "OPEN"

@@ -672,3 +672,114 @@ class TestMockTickBounds:
         assert gen._open_prices[symbol] == pytest.approx(SEED_PRICES[symbol])
         assert symbol in gen._open_prices
         assert gen._open_prices[symbol] == pytest.approx(SEED_PRICES[symbol])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Bias-Modulated Scanner Thresholds
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestScannerBiasModulation:
+    """Scanner.set_market_bias() must update the cached bias that _check_signal()
+    reads to apply market-condition-aware RSI, volume, gap, and NIFTY thresholds."""
+
+    def _make_scanner(self, bias: str = "NEUTRAL") -> Scanner:
+        scanner = Scanner(asyncio.Queue())
+        scanner.set_market_bias(bias)
+        return scanner
+
+    def test_set_market_bias_updates_field(self):
+        """set_market_bias() must persist the bias string on the instance."""
+        scanner = self._make_scanner("BULLISH")
+        assert scanner._market_bias == "BULLISH"
+
+    def test_set_market_bias_normalises_case(self):
+        """Lowercase bias value must be uppercased to match the lookup keys."""
+        scanner = self._make_scanner()
+        scanner.set_market_bias("bearish")
+        assert scanner._market_bias == "BEARISH"
+
+    def test_default_bias_is_neutral(self):
+        scanner = Scanner(asyncio.Queue())
+        assert scanner._market_bias == "NEUTRAL"
+
+    # ── RSI band ──────────────────────────────────────────────────────────────
+
+    def test_rsi_band_bullish_wider(self):
+        """On BULLISH day RSI band = 42–68; RSI=43 should pass."""
+        scanner = self._make_scanner("BULLISH")
+        _rsi_lo, _rsi_hi = {"BULLISH": (42.0, 68.0)}.get(
+            scanner._market_bias, (45.0, 65.0)
+        )
+        assert _rsi_lo <= 43.0 <= _rsi_hi  # RSI=43 passes
+
+    def test_rsi_band_bearish_narrower(self):
+        """On BEARISH day RSI band = 48–63; RSI=43 should fail."""
+        scanner = self._make_scanner("BEARISH")
+        _rsi_lo, _rsi_hi = {"BEARISH": (48.0, 63.0)}.get(
+            scanner._market_bias, (45.0, 65.0)
+        )
+        assert not (_rsi_lo <= 43.0 <= _rsi_hi)  # RSI=43 fails
+
+    def test_rsi_band_neutral_midpoint(self):
+        """On NEUTRAL day RSI band = 45–65; RSI=43 fails, RSI=55 passes."""
+        scanner = self._make_scanner("NEUTRAL")
+        _rsi_lo, _rsi_hi = (45.0, 65.0)
+        assert not (_rsi_lo <= 43.0 <= _rsi_hi)
+        assert _rsi_lo <= 55.0 <= _rsi_hi
+
+    # ── Volume ratio min ─────────────────────────────────────────────────────
+
+    def test_vol_min_bullish_lower(self):
+        """On BULLISH day vol_min = 1.3; 1.35× should be accepted."""
+        scanner = self._make_scanner("BULLISH")
+        _vol_min = {"BULLISH": 1.3, "NEUTRAL": 1.5, "BEARISH": 2.0}.get(
+            scanner._market_bias, 1.5
+        )
+        assert 1.35 >= _vol_min
+
+    def test_vol_min_bearish_higher(self):
+        """On BEARISH day vol_min = 2.0; 1.8× should be rejected."""
+        scanner = self._make_scanner("BEARISH")
+        _vol_min = {"BULLISH": 1.3, "NEUTRAL": 1.5, "BEARISH": 2.0}.get(
+            scanner._market_bias, 1.5
+        )
+        assert 1.8 < _vol_min
+
+    # ── NIFTY drift threshold ────────────────────────────────────────────────
+
+    def test_nifty_thresh_bullish_looser(self):
+        """On BULLISH day NIFTY threshold = -0.8%; a -0.6% drift should NOT block signals."""
+        scanner = self._make_scanner("BULLISH")
+        _thresh = {"BULLISH": -0.008, "NEUTRAL": -0.005, "BEARISH": -0.003}.get(
+            scanner._market_bias, -0.005
+        )
+        drift = -0.006   # -0.6%
+        assert drift >= _thresh  # passes (not below threshold)
+
+    def test_nifty_thresh_bearish_tighter(self):
+        """On BEARISH day NIFTY threshold = -0.3%; a -0.4% drift blocks signals."""
+        scanner = self._make_scanner("BEARISH")
+        _thresh = {"BULLISH": -0.008, "NEUTRAL": -0.005, "BEARISH": -0.003}.get(
+            scanner._market_bias, -0.005
+        )
+        drift = -0.004   # -0.4%
+        assert drift < _thresh  # blocked
+
+    # ── Gap filter ───────────────────────────────────────────────────────────
+
+    def test_gap_filter_bullish_relaxed(self):
+        """On BULLISH day gap_max = 2.0%; a 1.7% gap-up should pass."""
+        scanner = self._make_scanner("BULLISH")
+        _gap_max = {"BULLISH": 2.0, "NEUTRAL": 1.5, "BEARISH": 1.0}.get(
+            scanner._market_bias, 1.5
+        )
+        assert 1.7 <= _gap_max  # passes
+
+    def test_gap_filter_bearish_tighter(self):
+        """On BEARISH day gap_max = 1.0%; a 1.2% gap-up should be rejected."""
+        scanner = self._make_scanner("BEARISH")
+        _gap_max = {"BULLISH": 2.0, "NEUTRAL": 1.5, "BEARISH": 1.0}.get(
+            scanner._market_bias, 1.5
+        )
+        assert 1.2 > _gap_max  # blocked

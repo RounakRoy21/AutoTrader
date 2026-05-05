@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     alpha_vantage_api_key: str = ""
 
     # ── Telegram ──────────────────────────────────
+    telegram_enabled: bool = True
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     # ── API Security ──────────────────────────
@@ -73,10 +74,10 @@ class Settings(BaseSettings):
     hedge_bucket_pct: float = 0.20
     warchest_bucket_pct: float = 0.10
     max_loss_per_trade_pct: float = 0.015
-    stop_loss_pct: float = 0.008
-    min_target_pct: float = 0.016
-    trailing_sl_activation_pct: float = 0.005  # activate trail at 0.5% above entry
-    trailing_sl_trail_pct: float = 0.005       # trail distance: 0.5% below LTP
+    stop_loss_pct: float = 0.010             # 1.0% fixed fallback (NSE large-cap ATR noise floor)
+    min_target_pct: float = 0.020             # 2.0% fixed fallback (maintains 2:1 R:R vs 1.0% SL)
+    trailing_sl_activation_pct: float = 0.008  # activate trail at 0.8% above entry
+    trailing_sl_trail_pct: float = 0.007       # trail distance: 0.7% below LTP
     atr_sl_multiplier: float = 1.5             # SL = entry − ATR × multiplier
     atr_target_multiplier: float = 3.0         # target = entry + ATR × multiplier (2:1 RR)
     stock_lock_after_sl: bool = True           # lock stock after SL hit for rest of day
@@ -85,7 +86,8 @@ class Settings(BaseSettings):
     roi_decay_enabled: bool = True             # reduce target over time if not hit
     max_open_positions: int = 3
     max_trades_per_day: int = 6
-    daily_drawdown_limit_pct: float = 0.03
+    daily_drawdown_soft_alert_pct: float = 0.02   # 2% soft warning tier (Telegram alert, no halt)
+    daily_drawdown_limit_pct: float = 0.03         # 3% hard halt
     # SH2: Gap-at-open filter — reject signals when stock gapped up more than
     # this percentage vs previous close.  NSE intraday longs on >1.5% gap-up
     # stocks have a high false-signal rate due to early mean-reversion pressure.

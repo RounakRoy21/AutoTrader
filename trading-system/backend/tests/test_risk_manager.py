@@ -20,14 +20,14 @@ class TestTrailingSL:
     def test_activation_above_threshold(self):
         """Trailing SL activates when LTP >= entry * (1 + activation_pct)."""
         entry = 2500.0
-        activation_pct = 0.005
-        trail_pct = 0.005
+        activation_pct = 0.008   # updated: 0.8%
+        trail_pct = 0.007        # updated: 0.7%
 
-        activation = entry * (1 + activation_pct)       # 2512.50
-        ltp = 2515.0                                     # above threshold
+        activation = entry * (1 + activation_pct)       # 2520.0
+        ltp = 2522.0                                     # above threshold
 
-        trailing_sl = round(ltp * (1 - trail_pct), 2)   # 2502.43
-        current_sl = 2480.0                               # original SL
+        trailing_sl = round(ltp * (1 - trail_pct), 2)   # 2506.46
+        current_sl = 2475.0                               # original SL (1.0%)
 
         assert ltp >= activation
         assert trailing_sl > current_sl                   # update should fire
@@ -35,20 +35,20 @@ class TestTrailingSL:
     def test_no_activation_below_threshold(self):
         """Trailing SL should NOT activate when LTP < threshold."""
         entry = 2500.0
-        activation_pct = 0.005
+        activation_pct = 0.008   # updated: 0.8%
 
-        activation = entry * (1 + activation_pct)        # 2512.50
-        ltp = 2510.0                                      # below threshold
+        activation = entry * (1 + activation_pct)        # 2520.0
+        ltp = 2518.0                                      # below threshold
 
         assert ltp < activation
 
     def test_sl_never_moves_down(self):
         """Once the trailing SL ratchets up, a pullback must NOT lower it."""
-        trail_pct = 0.005
+        trail_pct = 0.007   # updated: 0.7%
 
-        # Peak at 2530 → SL = 2517.35
+        # Peak at 2530 → SL = 2512.29
         sl_at_peak = round(2530.0 * (1 - trail_pct), 2)
-        # Pullback to 2520 → SL would be 2507.40
+        # Pullback to 2520 → SL would be 2502.36
         sl_at_pullback = round(2520.0 * (1 - trail_pct), 2)
 
         # The condition `trailing_sl > trade.stop_loss_price` prevents lowering
@@ -56,8 +56,8 @@ class TestTrailingSL:
 
     def test_sl_progression_is_monotonic(self):
         """As price rises, trailing SL should strictly increase."""
-        trail_pct = 0.005
-        prices = [2515, 2520, 2525, 2530, 2540, 2550]
+        trail_pct = 0.007   # updated: 0.7%
+        prices = [2522, 2525, 2530, 2540, 2550, 2560]
         sls = [round(p * (1 - trail_pct), 2) for p in prices]
 
         for i in range(1, len(sls)):
@@ -65,24 +65,22 @@ class TestTrailingSL:
 
     def test_trailing_sl_values(self):
         """Verify exact trailing SL values at specific price points."""
-        entry = 2500.0
-        trail_pct = 0.005
+        trail_pct = 0.007   # updated: 0.7%
 
-        # At 2520 → SL = 2507.40
-        assert round(2520.0 * (1 - trail_pct), 2) == 2507.40
-        # At 2540 → SL = 2527.30
-        assert round(2540.0 * (1 - trail_pct), 2) == 2527.30
+        # At 2520 → SL = 2520 * 0.993 = 2502.36
+        assert round(2520.0 * (1 - trail_pct), 2) == 2502.36
+        # At 2550 → SL = 2550 * 0.993 = 2532.15
+        assert round(2550.0 * (1 - trail_pct), 2) == 2532.15
 
     def test_trailing_sl_breakeven(self):
         """After sufficient movement, trailing SL should be above entry (breakeven+)."""
         entry = 2500.0
-        activation_pct = 0.005
-        trail_pct = 0.005
+        activation_pct = 0.008   # updated: 0.8%
+        trail_pct = 0.007        # updated: 0.7%
 
-        # Entry=2500, activation=2512.50, trail=0.5%
-        # At exactly 2512.50: SL = 2512.50 * 0.995 = 2499.94 (just under entry)
-        # At 2513.0: SL = 2513 * 0.995 = 2500.44 (above entry — breakeven!)
-        ltp = 2513.0
+        # Entry=2500, activation=2520.0, trail=0.7%
+        # At exactly 2520.0: SL = 2520 * 0.993 = 2502.36 (above entry — breakeven+)
+        ltp = 2520.0
         sl = round(ltp * (1 - trail_pct), 2)
         assert sl > entry
 
@@ -97,21 +95,21 @@ class TestExitDetection:
 
     def test_sl_hit(self, open_trade):
         """SL triggers when LTP <= stop_loss_price."""
-        ltp = 2479.0
+        ltp = 2474.0  # below new 1.0% SL of 2475
         assert ltp <= open_trade.stop_loss_price
 
     def test_sl_exact_boundary(self, open_trade):
         """SL should trigger at exactly the stop_loss_price."""
-        ltp = 2480.0
+        ltp = 2475.0  # exactly at new 1.0% SL
         assert ltp <= open_trade.stop_loss_price
 
     def test_target_hit(self, open_trade):
         """Target triggers when LTP >= target_price."""
-        ltp = 2541.0
+        ltp = 2551.0  # above new 2.0% target of 2550
         assert ltp >= open_trade.target_price
 
     def test_target_exact_boundary(self, open_trade):
-        ltp = 2540.0
+        ltp = 2550.0  # exactly at new 2.0% target
         assert ltp >= open_trade.target_price
 
     def test_no_exit_between_sl_and_target(self, open_trade):
@@ -122,15 +120,15 @@ class TestExitDetection:
 
     def test_pnl_on_sl(self, open_trade):
         """P&L on stop-loss = (exit - entry) × qty → negative."""
-        exit_price = open_trade.stop_loss_price
+        exit_price = open_trade.stop_loss_price  # 2475.0
         pnl = (exit_price - open_trade.entry_price) * open_trade.quantity
-        assert pnl == pytest.approx(-2000.0)
+        assert pnl == pytest.approx(-2500.0)  # (2475-2500)*100
 
     def test_pnl_on_target(self, open_trade):
         """P&L on target hit = (exit - entry) × qty → positive."""
-        exit_price = open_trade.target_price
+        exit_price = open_trade.target_price  # 2550.0
         pnl = (exit_price - open_trade.entry_price) * open_trade.quantity
-        assert pnl == pytest.approx(4000.0)
+        assert pnl == pytest.approx(5000.0)  # (2550-2500)*100
 
     def test_risk_reward_ratio(self, open_trade):
         """Risk-reward should be at least 1:2 (target P&L / SL P&L >= 2)."""
@@ -253,20 +251,20 @@ class TestRoiDecay:
         assert decayed == 2502.5
 
     def test_decayed_lower_than_original_target(self):
-        """All decay levels should be below the original 1.6% target."""
+        """All decay levels should be below the original 2.0% target."""
         entry = 2500.0
-        original_target = round(entry * 1.016, 2)   # 2540.0
-        for multiplier in [1.008, 1.003, 1.001]:
+        original_target = round(entry * 1.020, 2)   # 2550.0 (new min_target_pct=2%)
+        for multiplier in [1.015, 1.010, 1.005]:
             decayed = round(entry * multiplier, 2)
             assert decayed < original_target
 
     def test_roi_decay_never_falls_below_stop_loss(self):
         """Decayed target must always remain above the current stop-loss."""
         entry = 2500.0
-        # Scenario: trailing SL has moved up close to entry
-        trailing_sl = round(entry * 1.005, 2)   # SL now at 2512.50 (above entry)
-        # At 40+ min the 0.1% decay gives 2502.50 — below the trailing SL!
-        decayed = round(entry * 1.001, 2)        # 2502.50
+        # Scenario: trailing SL has moved up close to entry (trail activated at 0.8%)
+        trailing_sl = round(entry * 1.010, 2)   # SL now at 2525.0 (above entry)
+        # At 50+ min the 0.5% ATR-floor decay gives 2512.50 — below the trailing SL!
+        decayed = round(entry * 1.005, 2)        # 2512.50
         # The production guard: only update if decayed > stop_loss_price
         should_update = decayed < 9999.0 and decayed > trailing_sl
         assert not should_update, (
@@ -452,3 +450,130 @@ class TestConsecutiveLossEodNeutral:
             # EOD_CLOSE and RECONCILED should be neutral
             if reason in ("EOD_CLOSE", "RECONCILED"):
                 assert not modifies_streak
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Daily Drawdown Soft Alert (2% warning tier)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestDrawdownSoftAlert:
+    """2% soft-alert must fire once before the 3% hard halt.
+
+    The soft alert fires when total_loss >= capital * 2% but < 3% hard limit.
+    It must fire only ONCE per session (idempotent) and must NOT halt trading.
+    """
+
+    def test_soft_alert_threshold_below_hard_limit(self):
+        """Soft alert threshold (2%) must be strictly below the hard halt (3%)."""
+        soft_pct = 0.02
+        hard_pct = 0.03
+        assert soft_pct < hard_pct
+
+    def test_loss_at_soft_level_does_not_exceed_hard(self):
+        """Loss exactly at 2% of capital does not reach the 3% hard halt."""
+        capital = 1_000_000.0
+        soft_limit = capital * 0.02    # 20_000
+        hard_limit = capital * 0.03   # 30_000
+        assert soft_limit < hard_limit
+
+    def test_soft_alert_fires_between_2_and_3_pct(self):
+        """Total loss between 2% and 3% must trigger the soft alert and NOT the hard halt."""
+        capital = 1_000_000.0
+        soft_limit = capital * 0.02   # 20_000
+        hard_limit = capital * 0.03   # 30_000
+        total_loss = 22_000.0
+
+        should_soft_alert = total_loss >= soft_limit
+        should_halt = total_loss >= hard_limit
+        assert should_soft_alert
+        assert not should_halt
+
+    def test_soft_alert_state_fires_only_once(self):
+        """Simulate the idempotent flag: soft alert should not re-fire when already set."""
+        soft_alerted = False
+        capital = 1_000_000.0
+        soft_limit = capital * 0.02
+        total_loss = 22_000.0
+
+        # First poll — should fire
+        if not soft_alerted and total_loss >= soft_limit:
+            soft_alerted = True
+            alert_1_fired = True
+        else:
+            alert_1_fired = False
+
+        # Second poll (same loss) — should NOT re-fire
+        if not soft_alerted and total_loss >= soft_limit:
+            alert_2_fired = True
+        else:
+            alert_2_fired = False
+
+        assert alert_1_fired
+        assert not alert_2_fired
+
+    def test_risk_manager_has_drawdown_soft_alert_flag(self):
+        """RiskManager must expose _drawdown_soft_alerted as an instance attribute."""
+        rm = RiskManager()
+        assert hasattr(rm, "_drawdown_soft_alerted")
+        assert rm._drawdown_soft_alerted is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ATR-Based ROI Decay Floor
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestAtrRoiDecayFloor:
+    """ROI decay final tier uses max(0.5%, 0.4 × ATR_pct) to avoid setting targets
+    below the stock's typical noise floor."""
+
+    def test_floor_with_low_atr_uses_minimum(self):
+        """When 0.4 × ATR_pct < 0.5%, the 0.5% floor applies."""
+        entry = 2500.0
+        atr = 5.0                                 # ATR_pct = 0.2%
+        atr_pct = atr / entry                     # 0.002
+        floor_pct = max(0.005, 0.4 * atr_pct)    # max(0.5%, 0.08%) = 0.5%
+        assert floor_pct == pytest.approx(0.005)
+
+    def test_floor_with_high_atr_uses_atr(self):
+        """When 0.4 × ATR_pct > 0.5%, the ATR-based floor applies."""
+        entry = 1000.0
+        atr = 20.0                                # ATR_pct = 2.0%
+        atr_pct = atr / entry                     # 0.02
+        floor_pct = max(0.005, 0.4 * atr_pct)    # max(0.5%, 0.8%) = 0.8%
+        assert floor_pct == pytest.approx(0.008)
+
+    def test_decayed_target_at_atr_floor(self):
+        """Decayed target = entry * (1 + max(0.5%, 0.4 × ATR_pct))."""
+        entry = 1000.0
+        atr = 20.0                                # ATR_pct = 2%
+        atr_pct = atr / entry
+        floor_pct = max(0.005, 0.4 * atr_pct)    # 0.8%
+        decayed = round(entry * (1 + floor_pct), 2)
+        assert decayed == 1008.0
+
+    def test_atr_floor_prevents_target_below_sl(self):
+        """Even with ATR-based floor, decayed target must remain above trailing SL."""
+        entry = 2500.0
+        atr = 12.0                               # ATR_pct = 0.48%
+        atr_pct = atr / entry
+        floor_pct = max(0.005, 0.4 * atr_pct)   # max(0.5%, 0.192%) = 0.5%
+        decayed = round(entry * (1 + floor_pct), 2)   # 2512.50
+
+        # Suppose trailing SL has moved to 2515 (above the decayed level)
+        trailing_sl = 2515.0
+        should_update = decayed > trailing_sl
+        assert not should_update  # production guard prevents this update
+
+    def test_standard_0_5_pct_fallback_when_atr_missing(self):
+        """When ATR is not in Redis (None/missing), default 0.5% floor applies."""
+        entry = 2500.0
+        atr_str = None   # simulate missing Redis key
+        atr_floor_pct = 0.005   # default
+        if atr_str:
+            atr_val = float(atr_str)
+            if atr_val > 0 and entry > 0:
+                atr_floor_pct = max(0.005, 0.4 * atr_val / entry)
+        decayed = round(entry * (1 + atr_floor_pct), 2)
+        assert decayed == round(entry * 1.005, 2)   # 2512.50

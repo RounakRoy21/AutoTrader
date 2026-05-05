@@ -37,6 +37,9 @@ async def send_telegram(message: str) -> bool:
     Returns True if successful, False otherwise.
     """
     settings = get_settings()
+    if not settings.telegram_enabled:
+        logger.debug("Telegram disabled (TELEGRAM_ENABLED=false) — skipping alert")
+        return False
     if not settings.telegram_bot_token or not settings.telegram_chat_id:
         logger.warning("Telegram not configured — skipping alert")
         return False
@@ -158,6 +161,22 @@ async def send_target_hit_alert(
             detail += f"  ·  Held {held_min:.0f} min"
     lines.append(detail)
 
+    return await send_telegram("\n".join(lines))
+
+
+async def send_drawdown_soft_alert(
+    current_loss: float,
+    soft_pct: float,
+    paper: bool = False,
+) -> bool:
+    """Send a 2% daily drawdown warning alert (soft tier — no halt)."""
+    capital_pct = soft_pct * 100
+    paper_tag = "[PAPER] " if paper else ""
+    lines = [
+        f"⚠️ {paper_tag}<b>Drawdown Warning</b>",
+        f"Daily loss ₹{current_loss:.2f} has crossed the {capital_pct:.0f}% soft-alert level.",
+        "No action taken — monitor closely. Hard halt at 3%.",
+    ]
     return await send_telegram("\n".join(lines))
 
 

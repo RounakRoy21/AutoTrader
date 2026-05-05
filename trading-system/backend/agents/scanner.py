@@ -362,6 +362,14 @@ class Scanner:
         # Suppresses long signals when NIFTY drifts below nifty_trend_filter_pct from open.
         self._nifty_open_price: float = 0.0
         self._nifty_ltp: float = 0.0
+        # Market bias (BEARISH / NEUTRAL / BULLISH) — updated by set_market_bias() when
+        # the research agent publishes a new brief.  Used to modulate signal thresholds.
+        self._market_bias: str = "NEUTRAL"
+
+    def set_market_bias(self, bias: str) -> None:
+        """Update the cached market bias (called by TradingAgent when a new brief arrives)."""
+        self._market_bias = bias.upper()
+        logger.info("[Scanner] Market bias updated to %s", self._market_bias)
 
     def _calculate_suggested_qty(self, ltp: float, atr: float = 0.0, n_candles: int = 0) -> int:
         """
@@ -491,32 +499,62 @@ class Scanner:
         # at the session open and carry no information about index direction.
         # In paper mode or when NIFTY data hasn't arrived yet, skip the check
         # (open=0 means no tick received) to avoid blocking all signals at startup.
+        #
+        # Bias modulation: on bullish days widen the threshold so the filter only
+        # triggers on genuinely severe index drops; on bearish days tighten it so
+        # even a mild drift suppresses long entries.
+        #   BULLISH: -0.8%   NEUTRAL: -0.5%   BEARISH: -0.3%
+        _nifty_thresh = {
+            "BULLISH": -0.008,
+            "NEUTRAL": self._settings.nifty_trend_filter_pct,   # -0.005 from config
+            "BEARISH": -0.003,
+        }.get(self._market_bias, self._settings.nifty_trend_filter_pct)
         if self._nifty_open_price > 0 and self._nifty_ltp > 0:
             nifty_drift = (self._nifty_ltp - self._nifty_open_price) / self._nifty_open_price
-            if nifty_drift < self._settings.nifty_trend_filter_pct:
+            if nifty_drift < _nifty_thresh:
                 logger.debug(
-                    "NIFTY trend filter: index drift %.3f%% < threshold %.3f%% — no long signals",
-                    nifty_drift * 100, self._settings.nifty_trend_filter_pct * 100,
+                    "NIFTY trend filter: index drift %.3f%% < threshold %.3f%% (%s bias) — no long signals",
+                    nifty_drift * 100, _nifty_thresh * 100, self._market_bias,
                 )
                 return None
 
         # Condition 1: Price > VWAP
         if ltp <= vwap:
             return None
-        # Condition 2: RSI between 45 and 65 (scanner pre-filter; see docstring)
-        if not (45 <= rsi <= 65):
+        # Condition 2: RSI between bias-modulated band (scanner pre-filter; see docstring)
+        #   BULLISH: 42–68   NEUTRAL: 45–65   BEARISH: 48–63
+        _rsi_lo, _rsi_hi = {
+            "BULLISH": (42.0, 68.0),
+            "NEUTRAL": (45.0, 65.0),
+            "BEARISH": (48.0, 63.0),
+        }.get(self._market_bias, (45.0, 65.0))
+        if not (_rsi_lo <= rsi <= _rsi_hi):
             return None
-        # Condition 3: Volume > 1.5x 20-day average (skip when historical data unavailable)
-        if store.avg_volume_20d > 0 and vol_ratio < 1.5:
+        # Condition 3: Volume > bias-modulated minimum (skip when historical data unavailable)
+        #   BULLISH: 1.3×   NEUTRAL: 1.5×   BEARISH: 2.0×
+        _vol_min = {
+            "BULLISH": 1.3,
+            "NEUTRAL": 1.5,
+            "BEARISH": 2.0,
+        }.get(self._market_bias, 1.5)
+        if store.avg_volume_20d > 0 and vol_ratio < _vol_min:
             return None
 
         # Condition 7: Gap-at-open filter (SH2)
         # Reject signals when the stock gapped up beyond the configured threshold
         # vs the previous session's close.  Stocks already extended at open are
         # prone to intraday mean-reversion even when momentum indicators look green.
+        # Bias modulation: on bearish days lower the gap tolerance (less room for
+        # extended stocks); on bullish days relax it slightly.
+        #   BULLISH: 2.0%   NEUTRAL: 1.5%   BEARISH: 1.0%
+        _gap_max = {
+            "BULLISH": 2.0,
+            "NEUTRAL": self._settings.gap_filter_pct,   # 1.5 from config
+            "BEARISH": 1.0,
+        }.get(self._market_bias, self._settings.gap_filter_pct)
         if store._prev_close > 0 and store._open_price > 0:
             gap_pct = (store._open_price - store._prev_close) / store._prev_close * 100
-            if gap_pct > self._settings.gap_filter_pct:
+            if gap_pct > _gap_max:
                 return None
 
         # ── Candle-based indicators (1m) ───────────

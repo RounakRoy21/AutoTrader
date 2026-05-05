@@ -61,7 +61,7 @@ export class TradeLogComponent implements OnInit, AfterViewInit, OnDestroy {
     'expand',
     'trade_date',
     'stock',
-    'direction',
+    'quantity',
     'entry_price',
     'exit_price',
     'exit_reason',

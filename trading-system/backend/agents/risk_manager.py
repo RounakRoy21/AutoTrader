@@ -27,6 +27,7 @@ from core.redis_keys import HALT_KEY
 from integrations.groww_client import get_groww_client
 from integrations import ltp_store
 from integrations.telegram_client import (
+    send_drawdown_soft_alert,
     send_eod_report,
     send_halt_alert,
     send_intraday_close_alert,
@@ -114,13 +115,19 @@ class RiskManager:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._eod_reported_today = False
         self._intraday_close_initiated = False
+        self._drawdown_soft_alerted = False
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         """Start the risk manager on a separate daemon thread."""
         self._loop = loop
         self._running = True
-        self._eod_reported_today = False
-        self._intraday_close_initiated = False
+        now_time = datetime.now(IST).time()
+        # Pre-mark as done if we are restarting after the cut-off times so a
+        # restart post-3:30 PM doesn't re-fire the EOD report or intraday
+        # square-off alert on every subsequent poll cycle.
+        self._eod_reported_today = now_time >= EOD_REPORT_TIME
+        self._intraday_close_initiated = now_time >= MIS_CLOSE_START
+        self._drawdown_soft_alerted = False
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="RiskManager")
         self._thread.start()
         # Publish status so the dashboard can show it
@@ -235,7 +242,19 @@ class RiskManager:
                 entry_dt = IST.localize(datetime.combine(trade.trade_date, trade.entry_time))
                 elapsed_min = (now_ist - entry_dt).total_seconds() / 60
                 if elapsed_min > 50:
-                    decayed = round(trade.entry_price * 1.005, 2)   # 0.5%
+                    # ATR-based floor: max(0.5%, 0.4 × ATR_pct) so the decay target
+                    # never falls below the stock's typical noise level.
+                    # ATR is stored in Redis by trading_agent.py at order placement time.
+                    atr_floor_pct = 0.005   # 0.5% default
+                    try:
+                        atr_str = await get_value(f"trade_atr:{trade.stock}")
+                        if atr_str:
+                            atr_val = float(atr_str)
+                            if atr_val > 0 and trade.entry_price > 0:
+                                atr_floor_pct = max(0.005, 0.4 * atr_val / trade.entry_price)
+                    except Exception:
+                        pass  # non-critical — fall back to 0.5% default
+                    decayed = round(trade.entry_price * (1 + atr_floor_pct), 2)
                 elif elapsed_min > 35:
                     decayed = round(trade.entry_price * 1.010, 2)   # 1.0%
                 elif elapsed_min > 20:
@@ -556,6 +575,29 @@ class RiskManager:
         drawdown_pct = round((total_loss / limit) * 100, 2) if limit > 0 else 0.0
         await set_value("agent:risk:daily_loss", str(round(total_loss, 2)))
         await set_value("agent:risk:drawdown_pct", str(drawdown_pct))
+
+        # ── Soft alert at 2% (warn once — no halt) ────────────────────────────
+        soft_limit = self._settings.total_capital * self._settings.daily_drawdown_soft_alert_pct
+        if not self._drawdown_soft_alerted and total_loss >= soft_limit:
+            self._drawdown_soft_alerted = True
+            logger.warning(
+                "Drawdown soft alert: ₹%.2f >= ₹%.2f (%.0f%% of capital) — warning sent",
+                total_loss, soft_limit, self._settings.daily_drawdown_soft_alert_pct * 100,
+            )
+            await send_drawdown_soft_alert(
+                current_loss=total_loss,
+                soft_pct=self._settings.daily_drawdown_soft_alert_pct,
+                paper=self._settings.paper_trading,
+            )
+            await publish("system_alerts", {
+                "type": "warning",
+                "message": (
+                    f"Drawdown warning: ₹{total_loss:.2f} "
+                    f"({self._settings.daily_drawdown_soft_alert_pct * 100:.0f}% of capital) "
+                    f"— monitor closely"
+                ),
+                "timestamp": datetime.now(IST).isoformat(),
+            })
 
         if total_loss >= limit:
             await set_value(HALT_KEY, "TRUE")

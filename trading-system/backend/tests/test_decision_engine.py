@@ -68,22 +68,22 @@ class TestValidateDecision:
             decision=Decision.EXECUTE,
             adjusted_qty=100,
             stop_loss_price=2498.0,           # only 0.08% below entry
-            target_price=2540.0,
+            target_price=2550.0,
             rationale="Test",
             product_type=ProductType.MIS,
             signal_audit=_audit(),
         )
         result = engine._validate_decision(signal, decision)
-        expected_sl = round(2500.0 * (1 - 0.008), 2)   # 2480.0
+        expected_sl = round(2500.0 * (1 - 0.010), 2)   # 2475.0
         assert result.stop_loss_price == expected_sl
 
     def test_sl_at_minimum_passes(self, engine, signal):
-        min_sl = round(2500.0 * (1 - 0.008), 2)
+        min_sl = round(2500.0 * (1 - 0.010), 2)  # 2475.0
         decision = DecisionOutput(
             decision=Decision.EXECUTE,
             adjusted_qty=100,
             stop_loss_price=min_sl,
-            target_price=2540.0,
+            target_price=2550.0,
             rationale="Test",
             product_type=ProductType.MIS,
             signal_audit=_audit(),
@@ -96,7 +96,7 @@ class TestValidateDecision:
             decision=Decision.EXECUTE,
             adjusted_qty=100,
             stop_loss_price=2450.0,           # 2% below — more conservative
-            target_price=2540.0,
+            target_price=2550.0,
             rationale="Test",
             product_type=ProductType.MIS,
             signal_audit=_audit(),
@@ -104,7 +104,7 @@ class TestValidateDecision:
         result = engine._validate_decision(signal, decision)
         # _validate_decision always recomputes SL from signal.ltp regardless of what
         # the LLM returned; the "wider" SL is replaced by the ATR/%-derived minimum.
-        assert result.stop_loss_price == round(2500.0 * (1 - 0.008), 2)  # 2480.0
+        assert result.stop_loss_price == round(2500.0 * (1 - 0.010), 2)  # 2475.0
 
     # ── Target clamping ────────────────────────────────────────────────
 
@@ -112,22 +112,22 @@ class TestValidateDecision:
         decision = DecisionOutput(
             decision=Decision.EXECUTE,
             adjusted_qty=100,
-            stop_loss_price=2480.0,
+            stop_loss_price=2475.0,
             target_price=2510.0,              # only 0.4%
             rationale="Test",
             product_type=ProductType.MIS,
             signal_audit=_audit(),
         )
         result = engine._validate_decision(signal, decision)
-        expected_tgt = round(2500.0 * (1 + 0.016), 2)  # 2540.0
+        expected_tgt = round(2500.0 * (1 + 0.020), 2)  # 2550.0
         assert result.target_price == expected_tgt
 
     def test_target_at_minimum_passes(self, engine, signal):
-        min_tgt = round(2500.0 * (1 + 0.016), 2)
+        min_tgt = round(2500.0 * (1 + 0.020), 2)  # 2550.0
         decision = DecisionOutput(
             decision=Decision.EXECUTE,
             adjusted_qty=100,
-            stop_loss_price=2480.0,
+            stop_loss_price=2475.0,
             target_price=min_tgt,
             rationale="Test",
             product_type=ProductType.MIS,
@@ -140,7 +140,7 @@ class TestValidateDecision:
         decision = DecisionOutput(
             decision=Decision.EXECUTE,
             adjusted_qty=100,
-            stop_loss_price=2480.0,
+            stop_loss_price=2475.0,
             target_price=2600.0,              # generous
             rationale="Test",
             product_type=ProductType.MIS,
@@ -149,7 +149,7 @@ class TestValidateDecision:
         result = engine._validate_decision(signal, decision)
         # _validate_decision always recomputes target from signal.ltp; the generous
         # target is replaced by the ATR/%-derived value.
-        assert result.target_price == round(2500.0 * (1 + 0.016), 2)  # 2540.0
+        assert result.target_price == round(2500.0 * (1 + 0.020), 2)  # 2550.0
 
     # ── Quantity clamping ──────────────────────────────────────────────
 
@@ -157,8 +157,8 @@ class TestValidateDecision:
         decision = DecisionOutput(
             decision=Decision.EXECUTE,
             adjusted_qty=0,
-            stop_loss_price=2480.0,
-            target_price=2540.0,
+            stop_loss_price=2475.0,
+            target_price=2550.0,
             rationale="Test",
             product_type=ProductType.MIS,
             signal_audit=_audit(),
@@ -170,8 +170,8 @@ class TestValidateDecision:
         decision = DecisionOutput(
             decision=Decision.EXECUTE,
             adjusted_qty=500,                 # signal.suggested_qty = 100
-            stop_loss_price=2480.0,
-            target_price=2540.0,
+            stop_loss_price=2475.0,
+            target_price=2550.0,
             rationale="Test",
             product_type=ProductType.MIS,
             signal_audit=_audit(),
@@ -183,8 +183,8 @@ class TestValidateDecision:
         decision = DecisionOutput(
             decision=Decision.REJECT,
             adjusted_qty=0,
-            stop_loss_price=2480.0,
-            target_price=2540.0,
+            stop_loss_price=2475.0,
+            target_price=2550.0,
             rationale="Bad setup",
             product_type=ProductType.MIS,
             signal_audit=_audit(),
@@ -212,8 +212,8 @@ class TestMockDecision:
     def test_sl_and_target(self, engine, signal):
         d = engine._mock_decision(signal)
         assert d.decision == Decision.EXECUTE
-        assert d.stop_loss_price == round(2500.0 * 0.992, 2)    # 0.8% below
-        assert d.target_price == round(2500.0 * 1.016, 2)       # 1.6% above
+        assert d.stop_loss_price == round(2500.0 * (1 - 0.010), 2)  # 2475.0 (1.0% SL)
+        assert d.target_price == round(2500.0 * (1 + 0.020), 2)     # 2550.0 (2.0% target)
 
     def test_qty_matches_signal(self, engine, signal):
         d = engine._mock_decision(signal)
@@ -438,8 +438,8 @@ class TestAtrDecision:
     def test_mock_decision_without_atr_fallback(self, engine, signal):
         """When ATR is None, should use fixed percentage SL/target."""
         d = engine._mock_decision(signal)
-        assert d.stop_loss_price == round(2500.0 * 0.992, 2)
-        assert d.target_price == round(2500.0 * 1.016, 2)
+        assert d.stop_loss_price == round(2500.0 * (1 - 0.010), 2)  # 2475.0 (1.0% SL)
+        assert d.target_price == round(2500.0 * (1 + 0.020), 2)     # 2550.0 (2.0% target)
 
     def test_validate_clamps_to_atr_distances(self, engine):
         sig = ScannerSignal(
@@ -1027,3 +1027,232 @@ class TestVwapUnavailableGuard:
         )
         result = engine._validate_decision(signal, decision)
         assert "vwap_data_unavailable" not in result.signal_audit.conditions_not_met
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Bias-Modulated Volume and VWAP Thresholds
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestBiasModulatedThresholds:
+    """_validate_decision() uses bias-modulated thresholds for volume_confirms and
+    price_vwap_valid so that bearish markets require stronger confirmation."""
+
+    def _make_brief(self, bias: MarketBias) -> MagicMock:
+        brief = MagicMock(spec=MarketBriefLLMOutput)
+        brief.market_bias = bias
+        return brief
+
+    # ── Volume ratio min: BULLISH=1.3, NEUTRAL=1.5, BEARISH=2.0 ──────────
+
+    def test_volume_1_4x_confirms_on_bullish(self, engine, signal):
+        """1.4× volume is sufficient on a BULLISH day (threshold=1.3×)."""
+        engine._market_brief = self._make_brief(MarketBias.BULLISH)
+        low_vol_signal = signal.model_copy(update={"volume_ratio": 1.4})
+        decision = DecisionOutput(
+            decision=Decision.EXECUTE, adjusted_qty=100,
+            stop_loss_price=2475.0, target_price=2550.0,
+            rationale="Bullish bias test",
+            product_type=ProductType.MIS,
+            signal_audit=_audit(confidence_score=70),
+        )
+        result = engine._validate_decision(low_vol_signal, decision)
+        assert result.signal_audit.volume_confirms is True
+
+    def test_volume_1_4x_not_confirmed_on_neutral(self, engine, signal):
+        """1.4× volume fails the NEUTRAL threshold (1.5×) → volume_confirms=False."""
+        engine._market_brief = self._make_brief(MarketBias.NEUTRAL)
+        low_vol_signal = signal.model_copy(update={"volume_ratio": 1.4})
+        decision = DecisionOutput(
+            decision=Decision.EXECUTE, adjusted_qty=100,
+            stop_loss_price=2475.0, target_price=2550.0,
+            rationale="Neutral bias test",
+            product_type=ProductType.MIS,
+            signal_audit=_audit(confidence_score=70),
+        )
+        result = engine._validate_decision(low_vol_signal, decision)
+        assert result.signal_audit.volume_confirms is False
+
+    def test_volume_1_8x_not_confirmed_on_bearish(self, engine, signal):
+        """1.8× volume fails the BEARISH threshold (2.0×) → volume_confirms=False."""
+        engine._market_brief = self._make_brief(MarketBias.BEARISH)
+        mid_vol_signal = signal.model_copy(update={"volume_ratio": 1.8})
+        decision = DecisionOutput(
+            decision=Decision.EXECUTE, adjusted_qty=100,
+            stop_loss_price=2475.0, target_price=2550.0,
+            rationale="Bearish bias test",
+            product_type=ProductType.MIS,
+            signal_audit=_audit(confidence_score=70),
+        )
+        result = engine._validate_decision(mid_vol_signal, decision)
+        assert result.signal_audit.volume_confirms is False
+
+    def test_volume_2_1x_confirms_on_bearish(self, engine, signal):
+        """2.1× volume meets the BEARISH threshold (2.0×) → volume_confirms=True."""
+        engine._market_brief = self._make_brief(MarketBias.BEARISH)
+        strong_vol_signal = signal.model_copy(update={"volume_ratio": 2.1})
+        decision = DecisionOutput(
+            decision=Decision.EXECUTE, adjusted_qty=100,
+            stop_loss_price=2475.0, target_price=2550.0,
+            rationale="Bearish bias, strong volume",
+            product_type=ProductType.MIS,
+            signal_audit=_audit(confidence_score=70),
+        )
+        result = engine._validate_decision(strong_vol_signal, decision)
+        assert result.signal_audit.volume_confirms is True
+
+    # ── VWAP dev max: BULLISH=1.8%, NEUTRAL=1.5%, BEARISH=1.0% ──────────
+
+    def test_vwap_dev_1_6_valid_on_bullish(self, engine):
+        """1.6% above VWAP is valid on BULLISH day (max=1.8%)."""
+        engine._market_brief = self._make_brief(MarketBias.BULLISH)
+        # ltp = 2500, vwap = 2460 → dev = 40/2460*100 ≈ 1.626%
+        sig = ScannerSignal(
+            stock="RELIANCE", exchange="NSE", signal_time="10:30:00",
+            ltp=2500.0, vwap=2460.0, rsi=55.0, volume_ratio=1.8, suggested_qty=100,
+        )
+        decision = DecisionOutput(
+            decision=Decision.EXECUTE, adjusted_qty=100,
+            stop_loss_price=2475.0, target_price=2550.0,
+            rationale="VWAP bullish test",
+            product_type=ProductType.MIS,
+            signal_audit=_audit(confidence_score=70),
+        )
+        result = engine._validate_decision(sig, decision)
+        assert result.signal_audit.price_vwap_valid is True
+
+    def test_vwap_dev_1_6_invalid_on_neutral(self, engine):
+        """1.6% above VWAP fails on NEUTRAL day (max=1.5%) → price_vwap_valid=False."""
+        engine._market_brief = self._make_brief(MarketBias.NEUTRAL)
+        sig = ScannerSignal(
+            stock="RELIANCE", exchange="NSE", signal_time="10:30:00",
+            ltp=2500.0, vwap=2460.0, rsi=55.0, volume_ratio=1.8, suggested_qty=100,
+        )
+        decision = DecisionOutput(
+            decision=Decision.EXECUTE, adjusted_qty=100,
+            stop_loss_price=2475.0, target_price=2550.0,
+            rationale="VWAP neutral test",
+            product_type=ProductType.MIS,
+            signal_audit=_audit(confidence_score=70),
+        )
+        result = engine._validate_decision(sig, decision)
+        assert result.signal_audit.price_vwap_valid is False
+
+    def test_vwap_dev_1_1_invalid_on_bearish(self, engine):
+        """1.1% above VWAP fails on BEARISH day (max=1.0%) → price_vwap_valid=False."""
+        engine._market_brief = self._make_brief(MarketBias.BEARISH)
+        # ltp=2500, vwap=2473 → dev = 27/2473*100 ≈ 1.09%
+        sig = ScannerSignal(
+            stock="RELIANCE", exchange="NSE", signal_time="10:30:00",
+            ltp=2500.0, vwap=2473.0, rsi=55.0, volume_ratio=2.1, suggested_qty=100,
+        )
+        decision = DecisionOutput(
+            decision=Decision.EXECUTE, adjusted_qty=100,
+            stop_loss_price=2475.0, target_price=2550.0,
+            rationale="VWAP bearish test",
+            product_type=ProductType.MIS,
+            signal_audit=_audit(confidence_score=70),
+        )
+        result = engine._validate_decision(sig, decision)
+        assert result.signal_audit.price_vwap_valid is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Bias-Modulated Position and Trade Limits
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestBiasModulatedLimits:
+    """_pre_check() uses market_bias to adjust max_open_positions and max_trades_per_day."""
+
+    def _make_brief(self, bias: MarketBias) -> MagicMock:
+        brief = MagicMock(spec=MarketBriefLLMOutput)
+        brief.market_bias = bias
+        brief.recommended_stance = RecommendedStance.FULL_SIZE_POSITIONS
+        brief.avoid_today = []
+        brief.watchlist_today = []
+        brief.news_flags = []
+        return brief
+
+    @pytest.mark.asyncio
+    @patch("agents.decision_engine.datetime")
+    @patch("agents.decision_engine.get_value", return_value=None)
+    async def test_bearish_rejects_all_long_entries(self, mock_get_value, mock_dt, engine, signal):
+        """BEARISH bias rejects all long entries before reaching position limit checks."""
+        mock_dt.now.return_value = _MARKET_DT
+        engine._market_brief = self._make_brief(MarketBias.BEARISH)
+        engine._count_open_positions = AsyncMock(return_value=0)
+
+        with patch("agents.decision_engine.get_db_context", return_value=_mock_db_context(0)):
+            passed, reason, _ = await engine._pre_check(signal)
+        assert not passed
+        assert "bearish" in reason.lower()
+
+    @pytest.mark.asyncio
+    @patch("agents.decision_engine.datetime")
+    @patch("agents.decision_engine.get_value", return_value=None)
+    async def test_neutral_max_3_positions(self, mock_get_value, mock_dt, engine, signal):
+        """NEUTRAL bias caps max open positions at 3 (settings default)."""
+        mock_dt.now.return_value = _MARKET_DT
+        engine._market_brief = self._make_brief(MarketBias.NEUTRAL)
+        engine._count_open_positions = AsyncMock(return_value=3)
+
+        with patch("agents.decision_engine.get_db_context", return_value=_mock_db_context(0)):
+            passed, reason, _ = await engine._pre_check(signal)
+        assert not passed
+        assert "3" in reason and "neutral" in reason.lower()
+
+    @pytest.mark.asyncio
+    @patch("agents.decision_engine.datetime")
+    @patch("agents.decision_engine.get_value", return_value=None)
+    async def test_bullish_allows_4_positions(self, mock_get_value, mock_dt, engine, signal):
+        """BULLISH bias raises max open positions to 4."""
+        mock_dt.now.return_value = _MARKET_DT
+        engine._market_brief = self._make_brief(MarketBias.BULLISH)
+        engine._count_open_positions = AsyncMock(return_value=3)
+
+        with patch("agents.decision_engine.get_db_context", return_value=_mock_db_context(0)):
+            passed, reason, _ = await engine._pre_check(signal)
+        # 3 open positions < 4 bullish limit → should PASS
+        assert passed
+
+    @pytest.mark.asyncio
+    @patch("agents.decision_engine.datetime")
+    @patch("agents.decision_engine.get_redis", side_effect=ConnectionError)
+    @patch("agents.decision_engine.get_value")
+    async def test_neutral_max_6_daily_trades(self, mock_get_value, mock_get_redis, mock_dt, engine, signal):
+        """NEUTRAL bias caps daily trades at 6 (settings default)."""
+        mock_dt.now.return_value = _MARKET_DT
+        engine._market_brief = self._make_brief(MarketBias.NEUTRAL)
+        engine._count_open_positions = AsyncMock(return_value=0)
+
+        async def side_effect(key):
+            if key == "daily_trade_count":
+                return "6"
+            return None
+        mock_get_value.side_effect = side_effect
+
+        with patch("agents.decision_engine.get_db_context", return_value=_mock_db_context(0)):
+            passed, reason, _ = await engine._pre_check(signal)
+        assert not passed
+        assert "6" in reason and "neutral" in reason.lower()
+
+    @pytest.mark.asyncio
+    @patch("agents.decision_engine.datetime")
+    @patch("agents.decision_engine.get_redis", side_effect=ConnectionError)
+    @patch("agents.decision_engine.get_value")
+    async def test_bullish_allows_8_daily_trades(self, mock_get_value, mock_get_redis, mock_dt, engine, signal):
+        """BULLISH bias raises daily trade limit to 8."""
+        mock_dt.now.return_value = _MARKET_DT
+        engine._market_brief = self._make_brief(MarketBias.BULLISH)
+        engine._count_open_positions = AsyncMock(return_value=0)
+
+        async def side_effect(key):
+            if key == "daily_trade_count":
+                return "7"   # 7 trades < 8 limit → should PASS
+            return None
+        mock_get_value.side_effect = side_effect
+
+        with patch("agents.decision_engine.get_db_context", return_value=_mock_db_context(0)):
+            passed, reason, _ = await engine._pre_check(signal)
+        assert passed

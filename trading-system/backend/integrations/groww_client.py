@@ -107,10 +107,10 @@ class GrowwClient:
         """Return an authenticated GrowwAPI instance."""
         token = await self._get_access_token()
         if self._groww is None:
-            self._groww = _GrowwAPI(access_token=token)
+            self._groww = _GrowwAPI(token)
         else:
             # Refresh the token on the existing instance in case it was rotated
-            self._groww.access_token = token
+            self._groww.token = token
         return self._groww
 
     # ── Order Management ──────────────────────────────────────────────────────
@@ -562,7 +562,10 @@ class GrowwClient:
         """
         token = await self._get_access_token()
         from growwapi import GrowwFeed
-        ticker = GrowwFeed(access_token=token)
+        # GrowwFeed takes a GrowwAPI instance, not raw credentials.
+        # get_groww() returns an authenticated GrowwAPI with the current token.
+        groww = await self.get_groww()
+        ticker = GrowwFeed(groww_api=groww)
         return ticker
 
     # ── Circuit Breaker ───────────────────────────────────────────────────────

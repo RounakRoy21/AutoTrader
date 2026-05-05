@@ -126,16 +126,26 @@ export class DashboardComponent implements OnInit, OnDestroy {
     this.dialog.open(ConfirmDialogComponent, {
       data: { title: 'Halt Trading', message: 'Stop all new trade entries until manually resumed?', confirmLabel: 'Halt', confirmColor: 'warn' },
     }).afterClosed().subscribe((confirmed) => {
-      if (confirmed) this.api.haltTrading().subscribe(() => this.state.refreshAll());
+      if (confirmed) {
+        // Optimistic: flip the flag immediately so buttons update without waiting for the next poll.
+        this.agentStatus = { ...this.agentStatus, trading_agent: { ...this.agentStatus.trading_agent, trading_halted: true } };
+        this.cdr.markForCheck();
+        this.api.haltTrading().subscribe(() => this.state.refreshAll());
+      }
     });
   }
 
   resume(): void {
+    // Optimistic: flip the flag immediately.
+    this.agentStatus = { ...this.agentStatus, trading_agent: { ...this.agentStatus.trading_agent, trading_halted: false } };
+    this.cdr.markForCheck();
     this.api.resumeTrading().subscribe(() => this.state.refreshAll());
   }
 
   startAgent(): void {
     this.agentActionInProgress = true;
+    // Optimistic: mark ACTIVE so Start disables and Stop enables right away.
+    this.agentStatus = { ...this.agentStatus, trading_agent: { ...this.agentStatus.trading_agent, status: 'ACTIVE' } };
     this.cdr.markForCheck();
     this.api.startTradingAgent().subscribe({
       next: () => { this.agentActionInProgress = false; this.state.refreshAll(); this.cdr.markForCheck(); },
@@ -149,6 +159,8 @@ export class DashboardComponent implements OnInit, OnDestroy {
     }).afterClosed().subscribe((confirmed) => {
       if (!confirmed) return;
       this.agentActionInProgress = true;
+      // Optimistic: mark INACTIVE so Stop disables and Start enables right away.
+      this.agentStatus = { ...this.agentStatus, trading_agent: { ...this.agentStatus.trading_agent, status: 'INACTIVE' } };
       this.cdr.markForCheck();
       this.api.stopTradingAgent().subscribe({
         next: () => { this.agentActionInProgress = false; this.state.refreshAll(); this.cdr.markForCheck(); },
