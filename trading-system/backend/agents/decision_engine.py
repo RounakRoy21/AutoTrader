@@ -128,8 +128,9 @@ DECISION_SYSTEM_PROMPT = (
     "  • If the signal stock appears in earnings_drift_candidates (results within 7 days), "
     "apply the earnings confidence penalties above before deciding.\n\n"
     "SESSION PHASE RULES (current IST time and minutes to close are provided in each signal):\n"
-    "  • OPENING (09:15–09:45): High noise, gap fills common. "
-    "Reduce confidence_score by 10 for signals in the first 15 minutes.\n"
+    "  • OPENING (09:15–09:45): High noise, gap fills, and opening-range chasing are common. "
+    "Reduce confidence_score by 10 for all signals before 09:45 — "
+    "EMA and MACD confirmation are not yet available in this window.\n"
     "  • DEAD ZONE (11:30–13:00): Low volume / rangebound. "
     "Reduce confidence_score by 10; require volume_ratio ≥ 2.0× to override.\n"
     "  • LATE WINDOW (after 14:30, <60 min to close): "
@@ -286,12 +287,8 @@ class DecisionEngine:
         now_ist = datetime.now(IST)
         day_name = now_ist.strftime("%A")
 
-        # ── Market-hours gate (never bypassed, even by paper_extended_hours) ──
-        # The mock tick generator runs 24/7 to keep candle data warm, so signals
-        # arrive at all hours when paper_extended_hours=True.  But there is no
-        # value in paying for LLM calls on signals that will be paper-executed
-        # against stale mock prices at 2 AM.  Gate the LLM strictly to the NSE
-        # cash session: Mon-Fri 09:15–15:30 IST.
+        # ── Market-hours gate ──
+        # Gate the LLM strictly to the NSE cash session: Mon-Fri 09:15–15:30 IST.
         weekday = now_ist.weekday()  # 0=Mon … 6=Sun
         if weekday >= 5:  # Saturday or Sunday
             return False, "Outside market hours (weekend)", signal
@@ -458,30 +455,28 @@ class DecisionEngine:
             logger.info("Monday rule: halved quantity to %d", signal.suggested_qty)
 
         # Friday after 2:00 PM: reject all new entries
-        # Bypassed in extended-hours testing mode.
-        if day_name == "Friday" and now_ist.hour >= 14 and not self._settings.paper_extended_hours:
+        if day_name == "Friday" and now_ist.hour >= 14:
             return False, "Friday after 2:00 PM — no new entries", signal
 
         # Last 30 minutes (15:00+): insufficient time for MIS target achievement.
         # Hard gate saves an LLM call; the SESSION PHASE RULES in the prompt
         # are a soft backup for edge cases.
-        if now_ist.hour >= 15 and not self._settings.paper_extended_hours:
+        if now_ist.hour >= 15:
             return False, "After 15:00 — insufficient time for MIS exit", signal
 
         # Dead zone gate (11:30–13:00): skip LLM call unless volume surge ≥ 2.0×
         # provides an override — mirrors the SESSION PHASE RULES soft penalty in
         # the prompt.  Without this gate, every scanner restart causes a burst of
         # ~10 LLM calls that all get REJECTED anyway, wasting API budget.
-        if not self._settings.paper_extended_hours:
-            dz_start = now_ist.replace(hour=11, minute=30, second=0, microsecond=0)
-            dz_end   = now_ist.replace(hour=13, minute=0,  second=0, microsecond=0)
-            if dz_start <= now_ist < dz_end and signal.volume_ratio < 2.0:
-                return (
-                    False,
-                    f"Dead zone (11:30–13:00) — vol_ratio={signal.volume_ratio:.1f}× "
-                    f"below 2.0× override threshold",
-                    signal,
-                )
+        dz_start = now_ist.replace(hour=11, minute=30, second=0, microsecond=0)
+        dz_end   = now_ist.replace(hour=13, minute=0,  second=0, microsecond=0)
+        if dz_start <= now_ist < dz_end and signal.volume_ratio < 2.0:
+            return (
+                False,
+                f"Dead zone (11:30–13:00) — vol_ratio={signal.volume_ratio:.1f}× "
+                f"below 2.0× override threshold",
+                signal,
+            )
 
         # ── Signal-quality hard rejects (deterministic — no LLM needed) ──────
         # VWAP check: scanner fires when price > VWAP but doesn't check the *degree*

@@ -405,7 +405,6 @@ class TestPreCheck:
     async def test_friday_afternoon_rejects(self, mock_dt, mock_get_value, engine, signal):
         """No new entries on Friday after 2 PM."""
         mock_dt.now.return_value = _FRIDAY_PM_DT
-        engine._settings.paper_extended_hours = False  # ensure Friday PM gate is active
         engine._market_brief = None
         engine._count_open_positions = AsyncMock(return_value=0)
 

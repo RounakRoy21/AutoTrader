@@ -337,10 +337,16 @@ class RiskManager:
             await self._generate_eod_report()
 
     async def _get_open_trades(self) -> List[Trade]:
-        """Fetch all open trades from the database."""
+        """Fetch all OPEN trades for today from the database.
+
+        Scoped to today to prevent cross-session unrealised MTM from stale
+        paper trades (status=OPEN, trade_date<today) triggering a false
+        daily-drawdown halt on every session restart.
+        """
+        today = ist_today()
         async with get_db_context() as session:
             result = await session.execute(
-                select(Trade).where(Trade.status == "OPEN")
+                select(Trade).where(Trade.status == "OPEN", Trade.trade_date == today)
             )
             return list(result.scalars().all())
 

@@ -439,21 +439,25 @@ class GrowwClient:
         GrowwFeed delivers only LTP + timestamp; open, high, low, close,
         and cumulative volume must be supplemented via REST.
 
-        In paper mode returns {} immediately — MockTickGenerator injects full
-        OHLC data into every tick via tick["ohlc"], so no REST supplement is needed.
+        MockTickGenerator (active when credentials are absent) injects full OHLC
+        data into every tick via tick["ohlc"], so no REST supplement is needed in
+        that mode.  When GrowwFeed is active (credentials present), GrowwFeed
+        delivers only LTP + timestamp — OHLCV must be fetched via REST in both
+        paper-trading and live mode.
 
         Returns:
-            Dict with keys "open", "high", "low", "close", "volume", or {} on
-            paper mode.  Caller is responsible for treating 0-values as missing.
+            Dict with keys "open", "high", "low", "close", "volume", or {} when
+            MockTickGenerator is active.  Caller treats 0-values as missing.
         """
-        if self._settings.paper_trading:
+        # MockTickGenerator is active (no credentials) — OHLC injected per tick.
+        if not self._settings.groww_client_id:
             return {}
 
         groww = await self.get_groww()
 
         @_retry_sync
         def _fetch():
-            return groww.get_quote(trading_symbol=symbol, exchange="NSE")
+            return groww.get_quote(trading_symbol=symbol, exchange="NSE", segment="CASH")
 
         try:
             raw = await asyncio.to_thread(_fetch)
@@ -461,12 +465,17 @@ class GrowwClient:
             logger.warning("get_ohlcv_snapshot failed for %s: %s", symbol, exc)
             return {}
 
+        # Response structure: {"ohlc": {"open": ..., "high": ..., "low": ..., "close": ...},
+        #                       "volume": ..., "last_price": ..., ...}
+        # The "ohlc.close" is the PREVIOUS day's settlement price.  "last_price" is the
+        # current LTP, which is the better intraday "close" for indicator calculation.
+        ohlc = raw.get("ohlc", {})
         return {
-            "open":   float(raw.get("open")  or raw.get("open_price")  or 0),
-            "high":   float(raw.get("high")  or raw.get("high_price")  or raw.get("day_high")  or 0),
-            "low":    float(raw.get("low")   or raw.get("low_price")   or raw.get("day_low")   or 0),
-            "close":  float(raw.get("close") or raw.get("prev_close")  or raw.get("close_price") or 0),
-            "volume": int(  raw.get("volume") or raw.get("total_volume") or raw.get("volume_traded") or 0),
+            "open":   float(ohlc.get("open")  or 0),
+            "high":   float(ohlc.get("high")  or 0),
+            "low":    float(ohlc.get("low")   or 0),
+            "close":  float(raw.get("last_price") or ohlc.get("close") or 0),
+            "volume": int(  raw.get("volume") or raw.get("total_volume") or 0),
         }
 
     async def get_historical_data(
@@ -486,13 +495,13 @@ class GrowwClient:
 
         Args:
             instrument_token: Groww exchange_token integer.
-            interval: candle interval — "1d" for daily, "1" for 1-minute, "5" for 5-minute.
+            interval: candle interval — "day", "minute", "5minute", etc.
             days_back: calendar days of history to fetch.
 
         Returns:
             List of dicts with keys: date, open, high, low, close, volume.
         """
-        from datetime import date, timedelta
+        from datetime import timedelta
         from integrations.instrument_service import get_symbol
 
         symbol = get_symbol(instrument_token)
@@ -502,16 +511,19 @@ class GrowwClient:
             )
             return []
 
-        # Map Kite interval strings to Groww equivalents
+        # Map Kite interval strings to Groww CANDLE_INTERVAL constants
         interval_map = {
-            "day": "1d",
-            "minute": "1",
-            "5minute": "5",
-            "15minute": "15",
-            "30minute": "30",
-            "60minute": "60",
+            "day":      "1day",
+            "minute":   "1minute",
+            "5minute":  "5minute",
+            "15minute": "15minute",
+            "30minute": "30minute",
+            "60minute": "60minute",
         }
-        groww_interval = interval_map.get(interval, interval)
+        groww_interval = interval_map.get(interval, "1day")
+
+        # Groww equity groww_symbol format: "NSE-{SYMBOL}"
+        groww_symbol = f"NSE-{symbol}"
 
         groww = await self.get_groww()
         to_date = ist_today()
@@ -519,32 +531,46 @@ class GrowwClient:
 
         @_retry_sync
         def _fetch():
-            return groww.get_historical_data(
-                trading_symbol=symbol,
+            return groww.get_historical_candles(
                 exchange="NSE",
-                interval=groww_interval,
-                from_date=from_date.strftime("%Y-%m-%d"),
-                to_date=to_date.strftime("%Y-%m-%d"),
+                segment="CASH",
+                groww_symbol=groww_symbol,
+                start_time=from_date.strftime("%Y-%m-%d 09:15:00"),
+                end_time=to_date.strftime("%Y-%m-%d 15:30:00"),
+                candle_interval=groww_interval,
             )
 
         try:
             raw = await asyncio.to_thread(_fetch)
-            candles = raw if isinstance(raw, list) else raw.get("data", raw.get("candles", []))
-            # Normalise to Kite candle schema: {date, open, high, low, close, volume}
+            # Response: {"candles": [[timestamp, o, h, l, c, v, oi], ...], ...}
+            candle_list = raw.get("candles", [])
             normalised = []
-            for c in candles:
-                normalised.append({
-                    "date": c.get("date") or c.get("timestamp") or c.get("t"),
-                    "open": float(c.get("open") or c.get("o") or 0),
-                    "high": float(c.get("high") or c.get("h") or 0),
-                    "low": float(c.get("low") or c.get("l") or 0),
-                    "close": float(c.get("close") or c.get("c") or 0),
-                    "volume": int(c.get("volume") or c.get("v") or 0),
-                })
-            self._last_failure = 0.0
+            for c in candle_list:
+                if isinstance(c, (list, tuple)) and len(c) >= 6:
+                    normalised.append({
+                        "date":   c[0],
+                        "open":   float(c[1] or 0),
+                        "high":   float(c[2] or 0),
+                        "low":    float(c[3] or 0),
+                        "close":  float(c[4] or 0),
+                        "volume": int(c[5] or 0),
+                    })
+                elif isinstance(c, dict):
+                    normalised.append({
+                        "date":   c.get("date") or c.get("timestamp") or c.get("t"),
+                        "open":   float(c.get("open") or c.get("o") or 0),
+                        "high":   float(c.get("high") or c.get("h") or 0),
+                        "low":    float(c.get("low") or c.get("l") or 0),
+                        "close":  float(c.get("close") or c.get("c") or 0),
+                        "volume": int(c.get("volume") or c.get("v") or 0),
+                    })
             return normalised
         except Exception as exc:
-            await self._handle_failure(exc)
+            # Historical data is used only for volume baseline — a failure here
+            # must NOT trip the circuit-breaker halt.  The scanner already
+            # catches this exception and disables the volume filter for the
+            # affected symbol rather than stopping trading.
+            logger.warning("get_historical_data failed for %s: %s", symbol, exc)
             raise
 
     # ── GrowwFeed WebSocket ───────────────────────────────────────────────────

@@ -436,30 +436,26 @@ class Scanner:
         """
         now_ist = datetime.now(IST)
 
-        if not self._settings.paper_extended_hours:
-            # Hard market-hours cutoff: no new signals after 3:15 PM IST
-            cutoff_h, cutoff_m = self.SIGNAL_CUTOFF
-            if (now_ist.hour, now_ist.minute) >= (cutoff_h, cutoff_m):
-                return None
+        # Hard market-hours cutoff: no new signals after 3:15 PM IST
+        cutoff_h, cutoff_m = self.SIGNAL_CUTOFF
+        if (now_ist.hour, now_ist.minute) >= (cutoff_h, cutoff_m):
+            return None
 
-            # SM5: On Fridays, stop generating signals after 14:00 IST so the
-            # DecisionEngine never even calls the LLM on soon-to-expire positions.
-            # (The DecisionEngine also rejects Friday-14:00 signals, but filtering
-            # here prevents wasteful queue entries and LLM call avoidance work.)
-            if now_ist.weekday() == 4 and now_ist.hour >= 14:
-                return None
+        # SM5: On Fridays, stop generating signals after 14:00 IST so the
+        # DecisionEngine never even calls the LLM on soon-to-expire positions.
+        # (The DecisionEngine also rejects Friday-14:00 signals, but filtering
+        # here prevents wasteful queue entries and LLM call avoidance work.)
+        if now_ist.weekday() == 4 and now_ist.hour >= 14:
+            return None
 
         # Require minimum data points for statistically meaningful indicators
         if len(store.ticks) < self.MIN_TICKS_FOR_SIGNAL:
             return None
 
-        # Require minimum completed 1m candles for candle-based indicators
-        # In extended-hours testing mode, require only 3 candles (vs 15 normally)
-        # so the pipeline can be validated quickly without waiting 15 minutes.
+        # Require minimum completed 1m candles for candle-based indicators.
         candles_1m_df = store._candles_1m.completed_df
         n_candles = len(candles_1m_df) if candles_1m_df is not None else 0
-        min_candles = 3 if self._settings.paper_extended_hours else self.MIN_CANDLES_FOR_INDICATORS
-        if n_candles < min_candles:
+        if n_candles < self.MIN_CANDLES_FOR_INDICATORS:
             return None
 
         # Per-symbol cooldown: suppress repeats within SIGNAL_COOLDOWN_SECS
@@ -568,10 +564,7 @@ class Scanner:
         # Conditions 4 + 5: EMA trend and MACD momentum — both require ≥35 candles
         # so that MACD (which needs 26-period EMA) is always evaluated alongside
         # the EMA crossover check, rather than being silently skipped.  (SM2)
-        # Skipped in paper_extended_hours mode: MockTickGenerator's bounded ±2%
-        # random walk never produces genuine EMA crossovers or positive MACD,
-        # so these checks would permanently block all signals in testing mode.
-        if n_candles >= 35 and not self._settings.paper_extended_hours:
+        if n_candles >= 35:
             if ema_9 > 0 and ema_21 > 0 and ema_9 <= ema_21:
                 return None
             if macd_hist <= 0:
@@ -580,10 +573,8 @@ class Scanner:
         # ── Higher timeframe filter (5m) ───────────
         rsi_5m = store.compute_rsi_htf()
         # Condition 6: 5-min RSI in neutral-bullish range (45–72, tightened from 35–70)
-        # Skipped in extended-hours testing: random-walk 5m RSI drifts freely outside range.
-        if not self._settings.paper_extended_hours:
-            if rsi_5m is not None and (rsi_5m < 45 or rsi_5m > 72):
-                return None
+        if rsi_5m is not None and (rsi_5m < 45 or rsi_5m > 72):
+            return None
 
         # Record cooldown timestamp before returning
         self._signal_cooldown[store.symbol] = now_ist

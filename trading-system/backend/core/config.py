@@ -98,11 +98,6 @@ class Settings(BaseSettings):
     # -0.5% is the minimum meaningful drift that indicates broad market selling.
     nifty_trend_filter_pct: float = -0.005
 
-    # ── Paper trading helpers ─────────────────────
-    # When True, MockTickGenerator ignores market-hours gate so signals fire
-    # at any time of day — useful for testing the full pipeline outside 09:15–15:30.
-    paper_extended_hours: bool = False
-
     # ── Derived helpers ───────────────────────────
     @property
     def core_capital(self) -> float:

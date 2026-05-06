@@ -159,23 +159,38 @@ async def load_instrument_map() -> Dict[str, int]:
 
 
 async def _fetch_from_groww(groww_client, focus_stocks: list[str]) -> Dict[str, int]:
-    """Download Groww NSE instrument list and extract exchange_tokens for focus stocks."""
-    groww = await groww_client.get_groww()
+    """Download Groww NSE instrument list and extract exchange_tokens for focus stocks.
 
-    def _get_instruments():
-        return groww.get_instruments(exchange="NSE")
+    The instruments CSV (GrowwAPI.INSTRUMENT_CSV_URL) is a public static file —
+    no authentication required.  We download it in a thread and parse it in
+    memory (io.StringIO) to avoid the PermissionError that occurs when the SDK
+    tries to write instruments.csv into the read-only site-packages directory.
+    """
+    import io
+    import requests
+    import pandas as pd
+    try:
+        from growwapi import GrowwAPI as _GAPI
+        csv_url = _GAPI.INSTRUMENT_CSV_URL
+    except ImportError:
+        csv_url = "https://growwapi-assets.groww.in/instruments/instrument.csv"
 
-    instruments = await asyncio.to_thread(_get_instruments)
-    if not isinstance(instruments, list):
-        instruments = instruments.get("data", instruments.get("instruments", []))
+    def _download():
+        r = requests.get(csv_url, timeout=30)
+        r.raise_for_status()
+        return pd.read_csv(io.StringIO(r.text), dtype="str")
+
+    df = await asyncio.to_thread(_download)
+    # Filter to NSE CASH segment only (EQ series)
+    nse_cash = df[(df["exchange"] == "NSE") & (df["segment"] == "CASH")]
 
     token_map: Dict[str, int] = {}
-    for inst in instruments:
-        symbol = inst.get("trading_symbol") or inst.get("tradingSymbol") or inst.get("tradingsymbol", "")
-        if symbol in focus_stocks:
-            token = inst.get("exchange_token") or inst.get("exchangeToken") or inst.get("instrument_token")
-            if token is not None:
-                token_map[symbol] = int(token)
+    for symbol in focus_stocks:
+        rows = nse_cash[nse_cash["trading_symbol"] == symbol]
+        if not rows.empty:
+            token_str = rows.iloc[0]["exchange_token"]
+            if token_str and str(token_str) != "nan":
+                token_map[symbol] = int(token_str)
     return token_map
 
 

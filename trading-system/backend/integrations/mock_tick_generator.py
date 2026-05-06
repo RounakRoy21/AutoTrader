@@ -80,8 +80,6 @@ class MockTickGenerator:
         self._cum_volume: Dict[str, int] = {}   # cumulative volume per symbol
 
     def _is_market_open(self) -> bool:
-        if self._settings.paper_extended_hours:
-            return True  # testing mode: bypass market-hours gate
         now = datetime.now(IST).time()
         return MARKET_OPEN <= now <= MARKET_CLOSE
 

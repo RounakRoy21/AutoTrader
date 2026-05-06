@@ -198,11 +198,9 @@ class TradingAgent:
             now_ist = datetime.now(IST)
 
             # Market hours guard: belt-and-suspenders (Scanner already filters at 3:15 PM)
-            # Bypassed when paper_extended_hours=True so testing can run at any hour.
-            if not self._settings.paper_extended_hours:
-                if (now_ist.hour, now_ist.minute) >= (15, 15):
-                    logger.debug("Past 3:15 PM IST — discarding late signal for %s", signal.stock)
-                    continue
+            if (now_ist.hour, now_ist.minute) >= (15, 15):
+                logger.debug("Past 3:15 PM IST — discarding late signal for %s", signal.stock)
+                continue
 
             # Track last signal for dashboard visibility
             await set_value("agent:trading:last_signal_stock", signal.stock)
