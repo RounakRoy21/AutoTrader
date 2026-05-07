@@ -14,14 +14,21 @@ from contextlib import asynccontextmanager
 from datetime import datetime, time as dt_time
 
 import pytz
+from sqlalchemy import select
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from core.config import get_settings
-from core.database import check_db_health, dispose_engine, get_engine, Base
+from core.database import check_db_health, dispose_engine, get_engine, Base, get_db_context
 from core.redis_client import check_redis_health, close_redis, get_redis, get_value, set_value, publish
-from core.redis_keys import GROWW_TOKEN_KEY, RESEARCH_STATUS_KEY, TRADING_STATUS_KEY, RISK_STATUS_KEY
+from core.redis_keys import (
+    GROWW_TOKEN_KEY,
+    RESEARCH_LAST_RUN_COMPLETED_KEY,
+    RESEARCH_STATUS_KEY,
+    TRADING_STATUS_KEY,
+    RISK_STATUS_KEY,
+)
 from core.scheduler import (
     schedule_cron,
     shutdown_scheduler,
@@ -40,6 +47,7 @@ from api.websocket import router as ws_router, start_ws_background_tasks
 from agents.research_agent import run_research_agent
 from agents.trading_agent_manager import get_trading_agent_manager
 from integrations.instrument_service import load_instrument_map
+from models.market_brief import MarketBrief
 
 # ─────────────────────────────────────────────────────
 # Logging
@@ -73,6 +81,61 @@ async def lifespan(app: FastAPI):
             })
         except Exception:
             pass  # Redis may be down during early startup
+
+    async def _get_last_research_completed_ist() -> datetime | None:
+        """Return last completed research timestamp in IST, if available."""
+        try:
+            raw = await get_value(RESEARCH_LAST_RUN_COMPLETED_KEY)
+            if not raw:
+                return None
+            parsed = datetime.fromisoformat(raw)
+            return parsed.astimezone(_IST) if parsed.tzinfo else _IST.localize(parsed)
+        except Exception:
+            return None
+
+    async def _has_research_run_today() -> bool:
+        """True if a market brief exists for today (DB), or Redis says completed today."""
+        today_ist = datetime.now(_IST).date()
+
+        # Primary source: persisted DB brief for today.
+        try:
+            async with get_db_context() as session:
+                result = await session.execute(
+                    select(MarketBrief.id).where(MarketBrief.date == today_ist).limit(1)
+                )
+                if result.scalar_one_or_none() is not None:
+                    return True
+        except Exception as exc:
+            logger.warning("Could not verify today's market brief from DB: %s", exc)
+
+        # Fallback: Redis completion timestamp.
+        last_completed = await _get_last_research_completed_ist()
+        return bool(last_completed and last_completed.date() == today_ist)
+
+    async def _run_research_midsession_guarded() -> None:
+        """Run 12:30 research unless a recent startup catch-up already completed."""
+        now_ist = datetime.now(_IST)
+        last_completed = await _get_last_research_completed_ist()
+        suppress_window_min = 45
+
+        if last_completed and last_completed.date() == now_ist.date():
+            minutes_since = (now_ist - last_completed).total_seconds() / 60
+            if 0 <= minutes_since <= suppress_window_min:
+                logger.info(
+                    "Skipping 12:30 research run — last run completed %.1f min ago (%s IST)",
+                    minutes_since,
+                    last_completed.strftime("%H:%M"),
+                )
+                await _alert(
+                    "info",
+                    (
+                        "Skipped 12:30 research run — recent startup catch-up completed "
+                        f"at {last_completed.strftime('%H:%M')} IST"
+                    ),
+                )
+                return
+
+        await run_research_agent(skip_if_trades_exhausted=True)
 
     # 1. Test database connectivity
     db_ok = await check_db_health()
@@ -145,11 +208,10 @@ async def lifespan(app: FastAPI):
         minute=0,
     )
     schedule_cron(
-        func=run_research_agent,
+        func=_run_research_midsession_guarded,
         job_id="research_agent_midsession",
         hour=12,
         minute=30,
-        kwargs={"skip_if_trades_exhausted": True},
     )
 
     # 5. Daily Groww re-authentication at 08:30 IST (before market open).
@@ -196,16 +258,40 @@ async def lifespan(app: FastAPI):
         kwargs={"source": "scheduler"},
     )
 
-    start_scheduler()
-    logger.info("✅ Scheduler started")
-
-    # 7. Catch-up: if backend starts during market hours (09:15–15:29 IST on a
-    #    non-holiday weekday), the 09:15 APScheduler job was already missed.
-    #    Auto-start the trading session so paper trades can fire today.
-    _IST = pytz.timezone("Asia/Kolkata")
+    # 7. Research catch-up: if backend starts during market hours and no research
+    #    run has completed today, trigger one immediate run.
+    #
+    #    This prevents an entire day from running without a market brief when the
+    #    06:00 pre-market job was missed due to downtime.
     _now_ist = datetime.now(_IST)
     from core.nse_calendar import is_nse_holiday
     _in_market_hours = dt_time(9, 15) <= _now_ist.time() <= dt_time(15, 29)
+    _should_research_catchup = (
+        not is_nse_holiday()
+        and _now_ist.weekday() < 5
+        and _in_market_hours
+        and not await _has_research_run_today()
+    )
+    if _should_research_catchup:
+        logger.info(
+            "Backend started with no research run for today (%s IST) — triggering startup catch-up",
+            _now_ist.strftime("%H:%M"),
+        )
+        await _alert(
+            "info",
+            (
+                "Research catch-up triggered on startup — no market brief found for today "
+                f"({_now_ist.strftime('%H:%M')} IST)"
+            ),
+        )
+        await run_research_agent()
+
+    start_scheduler()
+    logger.info("✅ Scheduler started")
+
+    # 8. Catch-up: if backend starts during market hours (09:15–15:29 IST on a
+    #    non-holiday weekday), the 09:15 APScheduler job was already missed.
+    #    Auto-start the trading session so paper trades can fire today.
     _should_autostart = (
         not is_nse_holiday()
         and _now_ist.weekday() < 5  # Mon–Fri
@@ -222,7 +308,7 @@ async def lifespan(app: FastAPI):
         )
         asyncio.create_task(trading_manager.start_session(source="startup"))
 
-    # 8. Start WebSocket background tasks (Redis relay + LTP broadcaster)
+    # 9. Start WebSocket background tasks (Redis relay + LTP broadcaster)
     #    These must start after the event loop is running, hence here not at import time.
     start_ws_background_tasks()
 
