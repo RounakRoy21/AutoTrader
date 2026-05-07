@@ -6,7 +6,7 @@ import {
   OnInit,
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
-import { interval, Subject } from 'rxjs';
+import { Subject, interval } from 'rxjs';
 import { startWith, switchMap, takeUntil } from 'rxjs/operators';
 
 import { MatCardModule } from '@angular/material/card';
@@ -18,6 +18,7 @@ import { MatTabsModule } from '@angular/material/tabs';
 
 import { ApiService } from '../../core/services/api.service';
 import { DecisionEntry } from '../../core/models';
+import { TradingWebSocketService } from '../../core/services/trading-websocket.service';
 
 @Component({
   selector: 'app-decision-feed',
@@ -36,22 +37,26 @@ import { DecisionEntry } from '../../core/models';
   styleUrls: ['./decision-feed.component.scss'],
 })
 export class DecisionFeedComponent implements OnInit, OnDestroy {
+  // Safety-net sync only; real-time updates come from WebSocket decision_feed.
+  private static readonly FALLBACK_SYNC_MS = 300_000;
+
   private destroy$ = new Subject<void>();
 
   decisions: DecisionEntry[] = [];
   loading = true;
   lastUpdated: Date | null = null;
 
-  constructor(private api: ApiService, private cdr: ChangeDetectorRef) {}
+  constructor(
+    private api: ApiService,
+    private ws: TradingWebSocketService,
+    private cdr: ChangeDetectorRef,
+  ) {}
 
   ngOnInit(): void {
-    // Poll every 5 seconds for new decisions
-    interval(5000)
-      .pipe(
-        startWith(0),
-        switchMap(() => this.api.getDecisionFeed(50)),
-        takeUntil(this.destroy$),
-      )
+    // Initial fetch + infrequent reconciliation in case any WS event is missed.
+    interval(DecisionFeedComponent.FALLBACK_SYNC_MS)
+      .pipe(takeUntil(this.destroy$))
+      .pipe(startWith(0), switchMap(() => this.api.getDecisionFeed(50)))
       .subscribe({
         next: (entries) => {
           this.decisions = entries;
@@ -64,11 +69,26 @@ export class DecisionFeedComponent implements OnInit, OnDestroy {
           this.cdr.markForCheck();
         },
       });
+
+    // Real-time decision events via WebSocket push.
+    this.ws.decisions$
+      .pipe(takeUntil(this.destroy$))
+      .subscribe((entry) => {
+        const deduped = this.decisions.filter((d) => this._entryKey(d) !== this._entryKey(entry));
+        this.decisions = [entry, ...deduped].slice(0, 100);
+        this.loading = false;
+        this.lastUpdated = new Date();
+        this.cdr.markForCheck();
+      });
   }
 
   ngOnDestroy(): void {
     this.destroy$.next();
     this.destroy$.complete();
+  }
+
+  private _entryKey(d: DecisionEntry): string {
+    return `${d.date}|${d.ts}|${d.stock}|${d.stage}|${d.decision}|${d.rationale}`;
   }
 
   get traded(): DecisionEntry[] {

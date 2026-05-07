@@ -26,6 +26,15 @@ WORKDIR /app
 # Copy installed Python packages from builder
 COPY --from=builder /install /usr/local
 
+# GrowwFeed writes a temporary creds file under growwapi/common.
+# Ensure that directory is writable by the non-root runtime user.
+RUN set -eux; \
+        GAPI_COMMON_DIR="$(python -c "import pathlib, growwapi; print(pathlib.Path(growwapi.__file__).resolve().parent / 'common')" 2>/dev/null || true)"; \
+        if [ -n "$GAPI_COMMON_DIR" ] && [ -d "$GAPI_COMMON_DIR" ]; then \
+            chown -R appuser:appuser "$GAPI_COMMON_DIR"; \
+            chmod -R u+rwX "$GAPI_COMMON_DIR"; \
+        fi
+
 # Copy application source (chown to appuser)
 COPY --chown=appuser:appuser . .
 

@@ -3,11 +3,52 @@
     <mat-card-title>System Alerts</mat-card-title>
     <span class="alert-count" *ngIf="alerts.length">{{ alerts.length }}</span>
   </mat-card-header>
+
+  <!-- Level filter toggles -->
+  <div class="level-filters">
+    <button
+      class="filter-btn filter-error"
+      [class.active]="isLevelActive('error')"
+      (click)="toggleLevel('error')"
+    >
+      <mat-icon>error</mat-icon>
+      Error
+      <span class="filter-count" *ngIf="levelCounts['error']">{{ levelCounts['error'] }}</span>
+    </button>
+    <button
+      class="filter-btn filter-warning"
+      [class.active]="isLevelActive('warning')"
+      (click)="toggleLevel('warning')"
+    >
+      <mat-icon>warning</mat-icon>
+      Warning
+      <span class="filter-count" *ngIf="levelCounts['warning']">{{ levelCounts['warning'] }}</span>
+    </button>
+    <button
+      class="filter-btn filter-info"
+      [class.active]="isLevelActive('info')"
+      (click)="toggleLevel('info')"
+    >
+      <mat-icon>info</mat-icon>
+      Info
+      <span class="filter-count" *ngIf="levelCounts['info']">{{ levelCounts['info'] }}</span>
+    </button>
+    <button
+      class="filter-btn filter-success"
+      [class.active]="isLevelActive('success')"
+      (click)="toggleLevel('success')"
+    >
+      <mat-icon>check_circle</mat-icon>
+      Success
+      <span class="filter-count" *ngIf="levelCounts['success']">{{ levelCounts['success'] }}</span>
+    </button>
+  </div>
+
   <mat-progress-bar *ngIf="loading" mode="query"></mat-progress-bar>
   <mat-card-content>
     <div class="alerts-scroll" #scrollContainer>
-      <mat-list *ngIf="alerts.length; else empty">
-        <mat-list-item *ngFor="let a of alerts" class="alert-item">
+      <mat-list *ngIf="filteredAlerts.length; else empty">
+        <mat-list-item *ngFor="let a of filteredAlerts" class="alert-item">
           <mat-icon matListItemIcon [ngClass]="iconClass(a.type)">
             {{ iconName(a.type) }}
           </mat-icon>
@@ -19,7 +60,7 @@
         </mat-list-item>
       </mat-list>
       <ng-template #empty>
-        <p class="empty-msg">No alerts yet.</p>
+        <p class="empty-msg">No alerts match the active filters.</p>
       </ng-template>
     </div>
   </mat-card-content>

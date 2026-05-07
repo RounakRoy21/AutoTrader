@@ -23,7 +23,7 @@ router = APIRouter()
 _connections: Set[WebSocket] = set()
 
 # Redis channels to forward to frontend
-CHANNELS = ["trade_events", "eod_report", "market_brief", "system_alerts"]
+CHANNELS = ["trade_events", "eod_report", "market_brief", "system_alerts", "decision_feed"]
 
 # How often to push a fresh LTP snapshot (seconds)
 LTP_BROADCAST_INTERVAL = 2

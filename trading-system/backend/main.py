@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from core.config import get_settings
 from core.database import check_db_health, dispose_engine, get_engine, Base
-from core.redis_client import check_redis_health, close_redis, get_redis, get_value, set_value
+from core.redis_client import check_redis_health, close_redis, get_redis, get_value, set_value, publish
 from core.redis_keys import GROWW_TOKEN_KEY, RESEARCH_STATUS_KEY, TRADING_STATUS_KEY, RISK_STATUS_KEY
 from core.scheduler import (
     schedule_cron,
@@ -61,6 +61,19 @@ async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle for the FastAPI application."""
     logger.info("═══ AutoTrader starting up ═══")
 
+    _IST = pytz.timezone("Asia/Kolkata")
+
+    async def _alert(level: str, msg: str) -> None:
+        """Publish a system alert — safe to call even if Redis is down."""
+        try:
+            await publish("system_alerts", {
+                "type": level,
+                "message": msg,
+                "timestamp": datetime.now(_IST).isoformat(),
+            })
+        except Exception:
+            pass  # Redis may be down during early startup
+
     # 1. Test database connectivity
     db_ok = await check_db_health()
     if db_ok:
@@ -79,45 +92,46 @@ async def lifespan(app: FastAPI):
         await set_value(TRADING_STATUS_KEY, "INACTIVE")
         await set_value(RISK_STATUS_KEY, "INACTIVE")
         logger.info("✅ Agent status keys reset to INACTIVE")
+        await _alert("info", "AutoTrader starting up — Redis connected, agents reset to INACTIVE")
     except Exception:
         logger.warning("⚠️ Redis unreachable — running in fallback mode")
 
-    # 3. Groww auto-authentication: if TOTP credentials are configured and no session
-    #    token is present in Redis (e.g. fresh container rebuild clears Redis), log in
-    #    automatically so the Scanner can connect GrowwFeed without requiring a manual
-    #    POST /api/auth/groww/login call first.
+    # 3. Groww auto-authentication: always reauthenticate on startup.
+    #    The Redis volume persists across Docker rebuilds, so a stale token may
+    #    already be present even on a fresh container.  Reauthenticating
+    #    unconditionally guarantees the scanner always starts with a valid token.
     if settings.groww_client_id and settings.groww_totp_secret:
-        _existing_token = await get_value(GROWW_TOKEN_KEY)
-        if not _existing_token:
-            try:
-                import pyotp
-                from growwapi import GrowwAPI as _GrowwAPI_startup
-                from integrations.groww_client import get_groww_client as _get_groww_client
-                _totp_now = pyotp.TOTP(settings.groww_totp_secret).now()
-                _new_token = await asyncio.to_thread(
-                    lambda: _GrowwAPI_startup.get_access_token(
-                        api_key=settings.groww_client_id,
-                        totp=_totp_now,
-                    )
+        try:
+            import pyotp
+            from growwapi import GrowwAPI as _GrowwAPI_startup
+            from integrations.groww_client import get_groww_client as _get_groww_client
+            _totp_now = pyotp.TOTP(settings.groww_totp_secret).now()
+            _new_token = await asyncio.to_thread(
+                lambda: _GrowwAPI_startup.get_access_token(
+                    api_key=settings.groww_client_id,
+                    totp=_totp_now,
                 )
-                await set_value(GROWW_TOKEN_KEY, _new_token)
-                _get_groww_client().invalidate_token()
-                logger.info("✅ Groww auto-authenticated on startup")
-            except Exception as _auth_exc:
-                logger.error(
-                    "❌ Groww auto-authentication failed: %s — "
-                    "Scanner cannot connect GrowwFeed; call POST /api/auth/groww/login",
-                    _auth_exc,
-                )
-        else:
-            logger.info("✅ Groww session token already present in Redis")
+            )
+            await set_value(GROWW_TOKEN_KEY, _new_token)
+            _get_groww_client().invalidate_token()
+            logger.info("✅ Groww auto-authenticated on startup")
+            await _alert("success", "Groww authenticated — fresh session token stored")
+        except Exception as _auth_exc:
+            logger.error(
+                "❌ Groww auto-authentication failed: %s — "
+                "Scanner cannot connect GrowwFeed; call POST /api/auth/groww/login",
+                _auth_exc,
+            )
+            await _alert("error", f"Groww auto-authentication failed: {_auth_exc}")
 
     # 4. Load instrument token map (Groww API → Redis → hardcoded fallback)
     try:
         token_map = await load_instrument_map()
         logger.info("✅ Instrument map loaded (%d symbols)", len(token_map))
+        await _alert("info", f"Instrument map loaded — {len(token_map)} symbols")
     except Exception as exc:
         logger.warning("⚠️ Instrument map load failed: %s — using fallback", exc)
+        await _alert("warning", f"Instrument map load failed: {exc} — using fallback")
 
     # 4. Schedule Research Agent:
     #    • 06:00 IST — pre-market run (overnight data, sets the day's brief)
@@ -138,7 +152,32 @@ async def lifespan(app: FastAPI):
         kwargs={"skip_if_trades_exhausted": True},
     )
 
-    # 5. (Groww TOTP tokens do not expire — no daily token refresh job needed)
+    # 5. Daily Groww re-authentication at 08:30 IST (before market open).
+    #    Groww session tokens expire after ~18 hours.  Re-authenticating each
+    #    morning ensures the token is always fresh when the scanner connects
+    #    GrowwFeed at 09:15.  The scanner also auto-reauthenticates if the
+    #    token expires during the session (GrowwAPIAuthenticationException →
+    #    reauthenticate() + reconnect), so this is a belt-and-suspenders measure.
+    async def _daily_groww_reauth() -> None:
+        from integrations.groww_client import get_groww_client as _get_gc
+        _gc = _get_gc()
+        try:
+            await _gc.reauthenticate()
+            logger.info("Daily Groww re-authentication succeeded")
+        except Exception as _reauth_exc:
+            logger.error(
+                "Daily Groww re-authentication failed: %s \u2014 "
+                "manual login via POST /api/auth/groww/login may be required",
+                _reauth_exc,
+            )
+
+    if settings.groww_client_id and settings.groww_totp_secret:
+        schedule_cron(
+            func=_daily_groww_reauth,
+            job_id="groww_daily_reauth",
+            hour=8,
+            minute=30,
+        )
 
     # 6. Trading Agent — auto-start at 09:15 IST, auto-stop at 15:30 IST (Mon-Fri)
     trading_manager = get_trading_agent_manager()
@@ -177,6 +216,10 @@ async def lifespan(app: FastAPI):
             "Backend started during market hours (%s IST) — auto-starting trading session",
             _now_ist.strftime("%H:%M"),
         )
+        await _alert(
+            "info",
+            f"Market hours catch-up — auto-starting trading session ({_now_ist.strftime('%H:%M')} IST)",
+        )
         asyncio.create_task(trading_manager.start_session(source="startup"))
 
     # 8. Start WebSocket background tasks (Redis relay + LTP broadcaster)
@@ -186,7 +229,9 @@ async def lifespan(app: FastAPI):
     # Expose manager on app.state so API routes can reach it
     app.state.trading_manager = trading_manager
 
+    _mode = "PAPER" if settings.paper_trading else "LIVE"
     logger.info("═══ AutoTrader ready ═══ (paper_trading=%s)", settings.paper_trading)
+    await _alert("success", f"AutoTrader ready — {_mode} mode")
 
     yield
 

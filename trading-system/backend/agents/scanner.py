@@ -509,13 +509,14 @@ class Scanner:
             nifty_drift = (self._nifty_ltp - self._nifty_open_price) / self._nifty_open_price
             if nifty_drift < _nifty_thresh:
                 logger.debug(
-                    "NIFTY trend filter: index drift %.3f%% < threshold %.3f%% (%s bias) — no long signals",
-                    nifty_drift * 100, _nifty_thresh * 100, self._market_bias,
+                    "[Scanner] %s REJECT NIFTY-TREND drift=%.3f%% < threshold=%.3f%% (%s bias) — suppressing long signals",
+                    store.symbol, nifty_drift * 100, _nifty_thresh * 100, self._market_bias,
                 )
                 return None
 
         # Condition 1: Price > VWAP
         if ltp <= vwap:
+            logger.debug("[Scanner] %s REJECT C1 ltp=%.2f <= vwap=%.2f", store.symbol, ltp, vwap)
             return None
         # Condition 2: RSI between bias-modulated band (scanner pre-filter; see docstring)
         #   BULLISH: 42–68   NEUTRAL: 45–65   BEARISH: 48–63
@@ -525,6 +526,10 @@ class Scanner:
             "BEARISH": (48.0, 63.0),
         }.get(self._market_bias, (45.0, 65.0))
         if not (_rsi_lo <= rsi <= _rsi_hi):
+            logger.debug(
+                "[Scanner] %s REJECT C2 rsi=%.1f not in [%.0f,%.0f] bias=%s",
+                store.symbol, rsi, _rsi_lo, _rsi_hi, self._market_bias,
+            )
             return None
         # Condition 3: Volume > bias-modulated minimum (skip when historical data unavailable)
         #   BULLISH: 1.3×   NEUTRAL: 1.5×   BEARISH: 2.0×
@@ -534,6 +539,10 @@ class Scanner:
             "BEARISH": 2.0,
         }.get(self._market_bias, 1.5)
         if store.avg_volume_20d > 0 and vol_ratio < _vol_min:
+            logger.debug(
+                "[Scanner] %s REJECT C3 vol_ratio=%.2f < %.1fx bias=%s",
+                store.symbol, vol_ratio, _vol_min, self._market_bias,
+            )
             return None
 
         # Condition 7: Gap-at-open filter (SH2)
@@ -551,6 +560,10 @@ class Scanner:
         if store._prev_close > 0 and store._open_price > 0:
             gap_pct = (store._open_price - store._prev_close) / store._prev_close * 100
             if gap_pct > _gap_max:
+                logger.debug(
+                    "[Scanner] %s REJECT C7 gap_pct=%.2f%% > max %.1f%% bias=%s",
+                    store.symbol, gap_pct, _gap_max, self._market_bias,
+                )
                 return None
 
         # ── Candle-based indicators (1m) ───────────
@@ -566,14 +579,24 @@ class Scanner:
         # the EMA crossover check, rather than being silently skipped.  (SM2)
         if n_candles >= 35:
             if ema_9 > 0 and ema_21 > 0 and ema_9 <= ema_21:
+                logger.debug(
+                    "[Scanner] %s REJECT C4 ema9=%.2f <= ema21=%.2f",
+                    store.symbol, ema_9, ema_21,
+                )
                 return None
             if macd_hist <= 0:
+                logger.debug(
+                    "[Scanner] %s REJECT C5 macd_hist=%.4f", store.symbol, macd_hist
+                )
                 return None
 
         # ── Higher timeframe filter (5m) ───────────
         rsi_5m = store.compute_rsi_htf()
         # Condition 6: 5-min RSI in neutral-bullish range (45–72, tightened from 35–70)
         if rsi_5m is not None and (rsi_5m < 45 or rsi_5m > 72):
+            logger.debug(
+                "[Scanner] %s REJECT C6 rsi_5m=%.1f not in [45,72]", store.symbol, rsi_5m
+            )
             return None
 
         # Record cooldown timestamp before returning
@@ -604,6 +627,9 @@ class Scanner:
 
     def _on_ticks(self, ws, ticks: List[Dict[str, Any]]) -> None:
         """Callback invoked by GrowwFeed or MockTickGenerator on each tick batch."""
+        logger.log(
+            _PERF, "[Scanner] _on_ticks: %d tick(s) received", len(ticks)
+        )
         for tick in ticks:
             # ── P1: tick entry ────────────────────────────────────────────────
             _p1 = time.perf_counter_ns()
@@ -703,18 +729,36 @@ class Scanner:
                 fetched = 0
                 for sym, result in zip(symbols, results):
                     if isinstance(result, Exception):
-                        logger.warning("[Scanner] OHLCV poll error for %s: %s", sym, result)
+                        logger.warning(
+                            "[Scanner] OHLCV poll failed for %s: %s (%s)",
+                            sym, result, type(result).__name__,
+                        )
                         continue
                     if result:  # empty dict in paper mode — nothing to cache
                         _ohlc_cache[sym] = result
                         _ohlc_last_ts[sym] = time.monotonic()
                         fetched += 1
+                        logger.log(
+                            _PERF,
+                            "[Scanner] OHLCV %s: O=%.2f H=%.2f L=%.2f C=%.2f V=%d",
+                            sym,
+                            result.get("open", 0), result.get("high", 0),
+                            result.get("low", 0), result.get("close", 0),
+                            result.get("volume", 0),
+                        )
                 logger.log(
                     _PERF,
                     "[PERF T1→T2] OHLCV REST poll: %d/%d symbols %.1f ms",
                     fetched, len(symbols), (_t2 - _t1) / 1_000_000,
                 )
-                logger.debug("[Scanner] OHLCV poll: %d/%d symbols updated", fetched, len(symbols))
+                if fetched < len(symbols):
+                    logger.warning(
+                        "[Scanner] OHLCV poll: only %d/%d symbols updated "
+                        "(check per-symbol warnings above)",
+                        fetched, len(symbols),
+                    )
+                else:
+                    logger.debug("[Scanner] OHLCV poll: all %d symbols updated", fetched)
             except Exception as exc:
                 logger.error("[Scanner] OHLCV poll loop exception: %s", exc, exc_info=True)
             await asyncio.sleep(OHLCV_POLL_INTERVAL_SECS)
@@ -769,14 +813,27 @@ class Scanner:
         if tokens:
             ws.subscribe(tokens)
             ws.set_mode(ws.MODE_FULL, tokens)
-            logger.info("GrowwFeed subscribed to %d instruments (incl. NIFTY 50 index)", len(tokens))
+            from integrations.instrument_service import get_symbol as _gs
+            token_labels = [
+                f"{_gs(t) or 'NIFTY50'}={t}" for t in tokens
+            ]
+            logger.info(
+                "[Scanner] GrowwFeed connected — subscribed %d instruments: %s",
+                len(tokens), ", ".join(token_labels),
+            )
 
     def _on_close(self, ws, code, reason) -> None:
-        logger.warning("GrowwFeed closed: code=%s reason=%s", code, reason)
+        logger.warning(
+            "[Scanner] GrowwFeed connection closed: code=%s reason=%s",
+            code, reason,
+        )
         self._running = False
 
     def _on_error(self, ws, code, reason) -> None:
-        logger.error("GrowwFeed error: code=%s reason=%s", code, reason)
+        logger.error(
+            "[Scanner] GrowwFeed error: code=%s reason=%s (type=%s)",
+            code, reason, type(reason).__name__ if reason is not None else "None",
+        )
 
     async def start(self) -> None:
         """Start the scanner.
@@ -840,16 +897,122 @@ class Scanner:
             logger.info("[Scanner] OHLCV poll task started (interval=%ds)", OHLCV_POLL_INTERVAL_SECS)
 
             groww_client = get_groww_client()
-            ticker = await groww_client.create_ticker()
 
-            ticker.on_ticks = self._on_ticks
-            ticker.on_connect = self._on_connect
-            ticker.on_close = self._on_close
-            ticker.on_error = self._on_error
+            # Reconnect loop: transparently reauthenticate and reconnect if
+            # GrowwFeed raises any connection or auth exception.
+            _reconnect_attempt = 0
+            while self._running:
+                _reconnect_attempt += 1
+                if _reconnect_attempt > 1:
+                    logger.info(
+                        "[Scanner] GrowwFeed reconnect attempt #%d", _reconnect_attempt
+                    )
 
-            # GrowwFeed.connect is blocking; run in a thread
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, ticker.connect, True)
+                loop = asyncio.get_event_loop()
+                _stage = "create_ticker"
+                try:
+                    # create_ticker() is inside the try so that a constructor
+                    # failure (e.g. bad token on GrowwFeed init) is also caught
+                    # and handled by the reauth logic below.
+                    ticker = await groww_client.create_ticker()
+                    _stage = "configure_callbacks"
+                    ticker.on_ticks = self._on_ticks
+                    ticker.on_connect = self._on_connect
+                    ticker.on_close = self._on_close
+                    ticker.on_error = self._on_error
+
+                    logger.info(
+                        "[Scanner] Connecting GrowwFeed (attempt #%d)…", _reconnect_attempt
+                    )
+                    _stage = "connect_executor"
+                    await loop.run_in_executor(None, ticker.connect, True)
+                    # connect() returned normally — GrowwFeed closed gracefully.
+                    break
+
+                except Exception as exc:
+                    if not self._running:
+                        break  # scanner.stop() was called — exit cleanly
+
+                    exc_type = type(exc).__name__
+                    exc_msg = str(exc)
+                    logger.exception(
+                        "[Scanner] GrowwFeed exception on attempt #%d at stage=%s — %s: %s",
+                        _reconnect_attempt,
+                        _stage,
+                        exc_type,
+                        exc_msg,
+                    )
+
+                    # Detect authentication / connection failure.
+                    # GrowwAPIAuthenticationException  → expired REST token
+                    # GrowwFeedConnectionException     → any feed connection failure
+                    #   (expired token causes the WebSocket handshake to fail, which
+                    #    the SDK surfaces as GrowwFeedConnectionException regardless
+                    #    of the specific HTTP status code — so we always try reauth
+                    #    for this exception type before giving up)
+                    _is_auth = False
+                    try:
+                        from growwapi.groww.exceptions import (
+                            GrowwAPIAuthenticationException,
+                            GrowwFeedConnectionException,
+                        )
+                        if isinstance(exc, GrowwAPIAuthenticationException):
+                            _is_auth = True
+                            logger.warning(
+                                "[Scanner] GrowwAPIAuthenticationException — "
+                                "token expired; reauthenticating"
+                            )
+                        elif isinstance(exc, GrowwFeedConnectionException):
+                            # Any feed connection failure is treated as potentially
+                            # auth-related because an expired/invalid token is the
+                            # most common cause of GrowwFeed refusing to connect.
+                            _is_auth = True
+                            logger.warning(
+                                "[Scanner] GrowwFeedConnectionException — "
+                                "connection refused; attempting reauth before reconnect"
+                            )
+                    except ImportError:
+                        pass
+
+                    # Message-based fallback (e.g. SDK wraps auth errors in a
+                    # plain Exception with a descriptive message).
+                    if not _is_auth:
+                        _lmsg = exc_msg.lower()
+                        if (
+                            "authentication" in _lmsg or "unauthori" in _lmsg
+                            or "token" in _lmsg or "expire" in _lmsg
+                            or "invalid" in _lmsg or "401" in _lmsg
+                        ):
+                            _is_auth = True
+                            logger.warning(
+                                "[Scanner] Auth-related message detected in %s — "
+                                "attempting reauth before reconnect",
+                                exc_type,
+                            )
+
+                    if _is_auth:
+                        try:
+                            await groww_client.reauthenticate()
+                            logger.info(
+                                "[Scanner] Re-authentication succeeded — "
+                                "reconnecting GrowwFeed in 2s"
+                            )
+                            await asyncio.sleep(2)
+                            continue  # reconnect with fresh token
+                        except Exception as reauth_exc:
+                            logger.error(
+                                "[Scanner] Reauthentication failed: %s — "
+                                "scanner stopping; call POST /api/auth/groww/login",
+                                reauth_exc,
+                            )
+                            raise  # propagate to let the manager report it
+                    else:
+                        logger.error(
+                            "[Scanner] Non-auth GrowwFeed failure (%s) — "
+                            "scanner stopping",
+                            exc_type,
+                        )
+                        raise  # non-auth error: propagate crash as before
 
     def stop(self) -> None:
         """Stop the scanner and any running tick source."""

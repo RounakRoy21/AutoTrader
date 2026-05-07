@@ -2,6 +2,70 @@
   margin: 16px;
 }
 
+// ── Level filter toggle buttons ────────────────────────────────
+.level-filters {
+  display: flex;
+  gap: 6px;
+  padding: 0 16px 8px;
+  flex-wrap: wrap;
+}
+
+.filter-btn {
+  --filter-color: #666;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border: 1px solid #ccc;
+  border-radius: 16px;
+  background: transparent;
+  cursor: pointer;
+  font-size: 0.75rem;
+  font-weight: 500;
+  opacity: 0.45;
+  transition: opacity 0.15s, background 0.15s, border-color 0.15s;
+
+  mat-icon {
+    font-size: 16px;
+    width: 16px;
+    height: 16px;
+  }
+
+  &.active { opacity: 1; }
+
+  &.filter-error {
+    --filter-color: #f44336;
+    color: var(--filter-color);
+    &.active { background: rgba(244, 67, 54, 0.10); border-color: #f44336; }
+  }
+  &.filter-warning {
+    --filter-color: #ff9800;
+    color: var(--filter-color);
+    &.active { background: rgba(255, 152, 0, 0.10); border-color: #ff9800; }
+  }
+  &.filter-info {
+    --filter-color: #2196f3;
+    color: var(--filter-color);
+    &.active { background: rgba(33, 150, 243, 0.10); border-color: #2196f3; }
+  }
+  &.filter-success {
+    --filter-color: #4caf50;
+    color: var(--filter-color);
+    &.active { background: rgba(76, 175, 80, 0.10); border-color: #4caf50; }
+  }
+}
+
+.filter-count {
+  background: var(--filter-color);
+  color: #fff;
+  border-radius: 8px;
+  padding: 0 5px;
+  font-size: 0.65rem;
+  min-width: 16px;
+  text-align: center;
+  line-height: 16px;
+}
+
 .alerts-scroll {
   max-height: 520px;
   overflow-y: auto;
@@ -33,7 +97,7 @@
   text-transform: uppercase;
 }
 
-.icon-warn { color: #ff9800; }
+.icon-warning { color: #ff9800; }
 .icon-error { color: #f44336; }
 .icon-info { color: #2196f3; }
 .icon-success { color: #4caf50; }
@@ -49,9 +113,11 @@
   .alert-item  { border-bottom-color: var(--at-border); }
   .alert-meta  { color: var(--at-text-secondary); }
   .empty-msg   { color: var(--at-text-muted); }
+  .filter-btn  { border-color: var(--at-border); }
 }
 
 // ── Mobile ─────────────────────────────────────────────────────
 @media (max-width: 600px) {
   .alerts-card  { margin: 8px; }
+  .level-filters { padding: 0 8px 6px; }
 }

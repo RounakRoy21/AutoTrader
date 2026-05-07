@@ -73,6 +73,260 @@ def _retry_sync(func: Callable) -> Callable:
     return wrapper
 
 
+class _GrowwFeedKiteTicker:
+    """KiteTicker-compatible adapter around the official GrowwFeed API.
+
+    The scanner was written against the Zerodha KiteTicker interface:
+      • ticker.on_ticks / on_connect / on_close / on_error  (callback attributes)
+      • ticker.connect(reconnect=True)  (blocking call)
+      • ws.subscribe(tokens)  +  ws.set_mode(mode, tokens)  (in on_connect)
+      • ticker.MODE_FULL  (mode constant)
+
+    GrowwFeed's actual SDK API is completely different:
+      • feed.subscribe_ltp(instruments, on_data_received=cb)
+      • feed.subscribe_index_value(instruments, on_data_received=cb)
+      • feed.consume()   ← blocking call
+
+    This adapter bridges the two so scanner.py requires zero changes.
+
+    Tick format emitted to on_ticks:
+      [{"instrument_token": <int>, "exchange_token": <int>,
+        "ltp": <float>, "last_price": <float>}]
+    """
+
+    # Mode constant required by scanner._on_connect → ws.set_mode(ws.MODE_FULL, tokens)
+    MODE_FULL = "ltp"
+    MODE_QUOTE = "ltp"
+    MODE_LTP = "ltp"
+
+    def __init__(self, feed=None, groww=None) -> None:
+        # Either an already-created feed (tests/mocks) or a GrowwAPI client that
+        # we will use to lazily construct GrowwFeed inside connect().
+        self._feed = feed
+        self._groww = groww
+        self._subscribed_tokens: List[int] = []
+
+        # Callbacks — assigned by scanner.py before connect() is called
+        self.on_ticks = None
+        self.on_connect = None
+        self.on_close = None
+        self.on_error = None
+
+    def subscribe(self, tokens: List[int]) -> None:
+        """Store token list.  Called from scanner._on_connect via ws.subscribe()."""
+        self._subscribed_tokens = list(tokens)
+
+    def set_mode(self, mode: str, tokens: List[int]) -> None:
+        """No-op: GrowwFeed always delivers LTP only."""
+
+    def connect(self, reconnect: bool = True) -> None:
+        """Connect to GrowwFeed and block until it closes or raises.
+
+        This method is called from scanner.py inside run_in_executor so it
+        runs on a thread-pool thread, not the event loop.
+
+        Flow:
+          1. Fire on_connect(self, {}) → scanner._on_connect calls
+             ws.subscribe(tokens) which populates self._subscribed_tokens.
+          2. Build the GrowwFeed instrument lists from those tokens.
+          3. Register subscriptions with callbacks that convert GrowwFeed's
+             data format to KiteTicker-style tick dicts.
+          4. Call feed.consume() — blocks until disconnect or exception.
+        """
+        # IMPORTANT: GrowwFeed uses asyncio internally for all operations
+        # (subscribe, consume, etc.).  This connect() method runs inside
+        # run_in_executor on a thread-pool thread.  Without a fresh event loop,
+        # the thread inherits the main FastAPI loop via asyncio.get_event_loop()
+        # → "Cannot run the event loop while another loop is running".
+        # Install a brand-new loop FIRST, before any GrowwFeed calls.
+        _stage = "init_loop"
+        _thread_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_thread_loop)
+
+        try:
+            # Construct GrowwFeed in this worker thread so any internal
+            # run_until_complete calls do not execute on FastAPI's running loop.
+            _stage = "create_feed"
+            if self._feed is None:
+                if self._groww is None:
+                    raise RuntimeError("GrowwFeed adapter missing feed and groww client")
+                from growwapi import GrowwFeed
+                self._feed = GrowwFeed(self._groww)
+
+            # Lazy import to avoid circular-import at module load time.
+            _stage = "import_nifty_token"
+            try:
+                from integrations.instrument_service import NIFTY50_TOKEN as _NIFTY_TOKEN
+            except Exception:
+                _NIFTY_TOKEN = 2999  # hardcoded fallback
+
+            # Step 1 — fire on_connect to collect subscription tokens.
+            _stage = "on_connect"
+            if self.on_connect:
+                self.on_connect(self, {})
+
+            # Step 2 — split tokens into equity and index buckets.
+            _stage = "build_instrument_buckets"
+            stock_instruments: List[Dict[str, str]] = []
+            index_instruments: List[Dict[str, str]] = []
+            for token in self._subscribed_tokens:
+                if token == _NIFTY_TOKEN:
+                    index_instruments.append(
+                        {"exchange": "NSE", "segment": "CASH", "exchange_token": "NIFTY"}
+                    )
+                else:
+                    stock_instruments.append(
+                        {"exchange": "NSE", "segment": "CASH", "exchange_token": str(token)}
+                    )
+
+            # Step 3 — register callbacks with GrowwFeed.
+            _stage = "register_callbacks"
+            feed = self._feed
+            on_ticks_cb = self.on_ticks
+
+            def _safe_float(value: Any) -> float:
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return 0.0
+
+            def _extract_price(payload: Any) -> float:
+                """Best-effort extraction across observed GrowwFeed payload shapes."""
+                if isinstance(payload, dict):
+                    direct = _safe_float(
+                        payload.get("ltp")
+                        or payload.get("last_price")
+                        or payload.get("value")
+                        or payload.get("price")
+                    )
+                    if direct > 0:
+                        return direct
+                    nested = payload.get("data")
+                    if isinstance(nested, dict):
+                        nested_val = _safe_float(
+                            nested.get("ltp")
+                            or nested.get("last_price")
+                            or nested.get("value")
+                            or nested.get("price")
+                        )
+                        if nested_val > 0:
+                            return nested_val
+                return 0.0
+
+            if stock_instruments:
+                def _on_stock_data(meta) -> None:
+                    meta = meta or {}
+                    exchange = meta.get("exchange", "NSE")
+                    segment = meta.get("segment", "CASH")
+                    token_str = str(meta.get("feed_key") or meta.get("exchange_token") or "")
+                    try:
+                        token_int = int(token_str)
+                    except (ValueError, TypeError):
+                        return
+
+                    ltp_val = _extract_price(meta)
+                    if ltp_val <= 0:
+                        try:
+                            ltp_data = (
+                                feed.get_ltp()
+                                .get("ltp", {})
+                                .get(exchange, {})
+                                .get(segment, {})
+                                .get(token_str, {})
+                            )
+                            ltp_val = _safe_float(ltp_data.get("ltp"))
+                        except Exception as exc:
+                            logger.warning(
+                                "GrowwFeed LTP snapshot fetch failed in callback: %s: %s",
+                                type(exc).__name__,
+                                exc,
+                            )
+                            return
+
+                    if ltp_val > 0 and on_ticks_cb:
+                        try:
+                            on_ticks_cb(self, [{
+                                "instrument_token": token_int,
+                                "exchange_token": token_int,
+                                "ltp": ltp_val,
+                                "last_price": ltp_val,
+                            }])
+                        except Exception as exc:
+                            logger.warning(
+                                "Scanner tick callback failed for token %s: %s: %s",
+                                token_str,
+                                type(exc).__name__,
+                                exc,
+                            )
+
+                _stage = "subscribe_ltp"
+                feed.subscribe_ltp(stock_instruments, on_data_received=_on_stock_data)
+
+            if index_instruments:
+                def _on_index_data(meta) -> None:
+                    meta = meta or {}
+                    exchange = meta.get("exchange", "NSE")
+                    segment = meta.get("segment", "CASH")
+                    token_str = str(meta.get("feed_key") or meta.get("exchange_token") or "")
+
+                    idx_val = _extract_price(meta)
+                    if idx_val <= 0:
+                        try:
+                            idx_data = (
+                                feed.get_index_value()
+                                .get(exchange, {})
+                                .get(segment, {})
+                                .get(token_str, {})
+                            )
+                            idx_val = _safe_float(idx_data.get("value"))
+                        except Exception as exc:
+                            logger.warning(
+                                "GrowwFeed index snapshot fetch failed in callback: %s: %s",
+                                type(exc).__name__,
+                                exc,
+                            )
+                            return
+
+                    if idx_val > 0 and on_ticks_cb:
+                        try:
+                            on_ticks_cb(self, [{
+                                "instrument_token": _NIFTY_TOKEN,
+                                "exchange_token": _NIFTY_TOKEN,
+                                "ltp": idx_val,
+                                "last_price": idx_val,
+                            }])
+                        except Exception as exc:
+                            logger.warning(
+                                "Scanner tick callback failed for index %s: %s: %s",
+                                token_str,
+                                type(exc).__name__,
+                                exc,
+                            )
+
+                _stage = "subscribe_index_value"
+                feed.subscribe_index_value(index_instruments, on_data_received=_on_index_data)
+
+            # Step 4 — block until done.
+            _stage = "consume"
+            feed.consume()
+        except Exception as exc:
+            logger.exception(
+                "GrowwFeed adapter connect failed at stage=%s: %s: %s",
+                _stage,
+                type(exc).__name__,
+                exc,
+            )
+            if self.on_error:
+                self.on_error(self, None, f"stage={_stage}: {exc}")
+            raise
+        else:
+            if self.on_close:
+                self.on_close(self, None, "feed closed normally")
+        finally:
+            _thread_loop.close()
+            asyncio.set_event_loop(None)
+
+
 class GrowwClient:
     """Wrapper around the Groww API SDK with retry and circuit-breaker logic.
 
@@ -88,7 +342,35 @@ class GrowwClient:
     def invalidate_token(self) -> None:
         """Evict the in-memory token so the next call re-reads from Redis."""
         self._cached_token = None
+        self._groww = None
         logger.info("GrowwClient: access token cache invalidated")
+
+    async def reauthenticate(self) -> None:
+        """Re-authenticate with Groww using TOTP and store the new token in Redis.
+
+        Called automatically when a GrowwAPIAuthenticationException is detected
+        (i.e. the session token expired).  Requires GROWW_TOTP_SECRET to be
+        configured in .env.  Resets the circuit-breaker timer so a successful
+        re-auth doesn't leave the halt flag armed.
+        """
+        settings = self._settings
+        if not (settings.groww_client_id and settings.groww_totp_secret):
+            raise RuntimeError(
+                "Cannot reauthenticate: GROWW_CLIENT_ID or GROWW_TOTP_SECRET not configured"
+            )
+        import pyotp
+        totp_code = pyotp.TOTP(settings.groww_totp_secret).now()
+        new_token = await asyncio.to_thread(
+            lambda: _GrowwAPI.get_access_token(
+                api_key=settings.groww_client_id,
+                totp=totp_code,
+            )
+        )
+        await set_value(GROWW_TOKEN_KEY, new_token)
+        self._groww = None           # force fresh GrowwAPI instance on next call
+        self._cached_token = None    # clear in-memory token cache
+        self._last_failure = 0.0     # reset circuit-breaker timer
+        logger.info("✅ Groww re-authenticated — new session token stored in Redis")
 
     async def _get_access_token(self) -> str:
         """Return the access token, using the in-memory cache when available."""
@@ -361,34 +643,50 @@ class GrowwClient:
     async def get_ltp(self, instruments: List[str]) -> Dict[str, Any]:
         """Fetch last traded price for a list of instruments (e.g. ['NSE:RELIANCE']).
 
-        Groww uses trading_symbol + exchange rather than Kite's combined string.
-        We parse the 'NSE:SYMBOL' format for compatibility.
+        Groww's bulk LTP API: get_ltp(segment=, exchange_trading_symbols=)
+        where exchange_trading_symbols is a tuple of strings like 'NSE_RELIANCE'.
+        Response: {"NSE_RELIANCE": 2500.5, "NSE_NIFTY": 22962.10}  (flat dict).
+
         Returns a dict keyed by 'NSE:SYMBOL' → {'last_price': float} to match
         Kite's response shape.
         """
         groww = await self.get_groww()
-        result: Dict[str, Any] = {}
 
+        # Build exchange_trading_symbols and a reverse map back to 'NSE:SYMBOL' keys.
+        et_symbols: List[str] = []
+        sym_map: Dict[str, str] = {}
         for instrument in instruments:
-            # Parse 'NSE:RELIANCE' → exchange='NSE', symbol='RELIANCE'
             if ":" in instrument:
                 exchange, symbol = instrument.split(":", 1)
             else:
                 exchange, symbol = "NSE", instrument
+            et_sym = f"{exchange}_{symbol}"
+            et_symbols.append(et_sym)
+            sym_map[et_sym] = instrument
 
-            @_retry_sync
-            def _fetch(sym=symbol, exch=exchange):
-                return groww.get_ltp(trading_symbol=sym, exchange=exch)
+        @_retry_sync
+        def _fetch():
+            # Groww accepts a single string or a tuple of strings.
+            return groww.get_ltp(
+                segment="CASH",
+                exchange_trading_symbols=tuple(et_symbols),
+            )
 
-            try:
-                raw = await asyncio.to_thread(_fetch)
-                ltp = float(raw.get("ltp") or raw.get("last_price") or 0)
-                result[instrument] = {"last_price": ltp}
-            except Exception as exc:
-                logger.warning("get_ltp failed for %s: %s", instrument, exc)
-                result[instrument] = {"last_price": 0.0}
-
-        return result
+        try:
+            raw = await asyncio.to_thread(_fetch)
+            # raw = {"NSE_RELIANCE": 2500.5, ...}  — values are plain floats
+            result: Dict[str, Any] = {}
+            for et_sym, price in raw.items():
+                orig_key = sym_map.get(et_sym, et_sym.replace("_", ":", 1))
+                result[orig_key] = {"last_price": float(price or 0)}
+            # Fill missing instruments with 0.0
+            for instrument in instruments:
+                if instrument not in result:
+                    result[instrument] = {"last_price": 0.0}
+            return result
+        except Exception as exc:
+            logger.warning("get_ltp failed for %s: %s", instruments, exc)
+            return {instr: {"last_price": 0.0} for instr in instruments}
 
     async def get_quote(self, instruments: List[str]) -> Dict[str, Any]:
         """Fetch full market quote including circuit limits.
@@ -411,19 +709,20 @@ class GrowwClient:
 
             @_retry_sync
             def _fetch(sym=symbol, exch=exchange):
-                return groww.get_quote(trading_symbol=sym, exchange=exch)
+                # segment is required; equity stocks are always CASH segment.
+                return groww.get_quote(exchange=exch, segment="CASH", trading_symbol=sym)
 
             try:
                 raw = await asyncio.to_thread(_fetch)
                 result[instrument] = {
-                    "last_price": float(raw.get("ltp") or raw.get("last_price") or 0),
+                    "last_price": float(raw.get("last_price") or raw.get("ltp") or 0),
                     "upper_circuit_limit": float(
-                        raw.get("upper_circuit") or raw.get("upperCircuit") or
-                        raw.get("upper_circuit_limit") or 0
+                        raw.get("upper_circuit_limit") or raw.get("upper_circuit") or
+                        raw.get("upperCircuit") or 0
                     ),
                     "lower_circuit_limit": float(
-                        raw.get("lower_circuit") or raw.get("lowerCircuit") or
-                        raw.get("lower_circuit_limit") or 0
+                        raw.get("lower_circuit_limit") or raw.get("lower_circuit") or
+                        raw.get("lowerCircuit") or 0
                     ),
                 }
             except Exception as exc:
@@ -576,28 +875,66 @@ class GrowwClient:
     # ── GrowwFeed WebSocket ───────────────────────────────────────────────────
 
     async def create_ticker(self):
-        """Create and return a GrowwFeed WebSocket instance.
+        """Create and return a KiteTicker-compatible GrowwFeed adapter.
 
-        GrowwFeed delivers only LTP + timestamp per tick — it does NOT send
-        volume_traded or OHLC fields. The Scanner supplements these via a
-        periodic REST polling thread (see scanner.py _start_ohlcv_poll_thread).
-
-        Returns a GrowwFeed-like object with the same callback interface as
-        KiteTicker (on_ticks, on_connect, on_close, on_error) for drop-in
-        compatibility in scanner.py.
+        Returns a _GrowwFeedKiteTicker that wraps the official GrowwFeed
+        API (subscribe_ltp + consume) behind the KiteTicker callback
+        interface that scanner.py expects.
         """
-        token = await self._get_access_token()
-        from growwapi import GrowwFeed
-        # GrowwFeed takes a GrowwAPI instance, not raw credentials.
-        # get_groww() returns an authenticated GrowwAPI with the current token.
         groww = await self.get_groww()
-        ticker = GrowwFeed(groww_api=groww)
-        return ticker
+        # IMPORTANT: do not construct GrowwFeed on the FastAPI event loop thread.
+        # The adapter creates it lazily inside connect() (executor thread).
+        token_tail = (self._cached_token or "")[-6:] or "?"
+        logger.debug("GrowwFeed adapter created (token tail=...%s)", token_tail)
+        return _GrowwFeedKiteTicker(groww=groww)
 
     # ── Circuit Breaker ───────────────────────────────────────────────────────
 
     async def _handle_failure(self, exc: Exception) -> None:
-        """If Groww API has been failing for > 60s, set halt flag and alert."""
+        """If Groww API has been failing for > 60s, set halt flag and alert.
+
+        Authentication failures (token expired) are handled separately:
+        they trigger automatic re-authentication rather than a circuit-breaker
+        halt, since a 401 means the session token expired — not that the API
+        is down.  Re-auth resets the failure timer.
+        """
+        # --- Auth failure: reauthenticate, do NOT trip the circuit breaker ---
+        _is_auth = False
+        try:
+            from growwapi.groww.exceptions import (
+                GrowwAPIAuthenticationException,
+                GrowwFeedConnectionException,
+            )
+            if isinstance(exc, GrowwAPIAuthenticationException):
+                _is_auth = True
+            elif isinstance(exc, GrowwFeedConnectionException):
+                # GrowwFeed wraps many auth handshake failures in this type.
+                # Treat all such failures as potentially auth-related first.
+                _is_auth = True
+        except ImportError:
+            pass
+        # Fallback: message-based detection regardless of exception type.
+        if not _is_auth:
+            _msg = str(exc).lower()
+            _is_auth = "authentication failed" in _msg or "unauthori" in _msg
+
+        if _is_auth:
+            logger.warning(
+                "Groww auth failure detected (%s: %s) — attempting automatic re-authentication",
+                type(exc).__name__, exc,
+            )
+            try:
+                await self.reauthenticate()
+                logger.info("Re-authentication succeeded — circuit breaker reset")
+            except Exception as reauth_exc:
+                logger.error(
+                    "Re-authentication failed: %s — manual login via "
+                    "POST /api/auth/groww/login required",
+                    reauth_exc,
+                )
+            return  # never halt on auth errors
+
+        # --- Network / API failure: apply circuit-breaker logic ---
         now = time.time()
         if self._last_failure == 0.0:
             self._last_failure = now

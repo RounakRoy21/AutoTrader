@@ -922,6 +922,8 @@ class DecisionEngine:
             payload = _orjson.dumps(entry) if _orjson is not None else json.dumps(entry).encode()
             await r.lpush(DECISION_FEED_KEY, payload)
             await r.ltrim(DECISION_FEED_KEY, 0, 99)  # keep last 100
+            # Push real-time decision updates to frontend via Redis pub/sub.
+            await publish("decision_feed", entry)
         except Exception:
             pass  # non-blocking — never raise
 
