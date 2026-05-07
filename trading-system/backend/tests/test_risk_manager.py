@@ -3,6 +3,8 @@ Tests for the Risk Manager — SL/target detection, trailing SL, drawdown, EOD.
 """
 
 from datetime import date, datetime, time as dt_time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -397,6 +399,52 @@ class TestDrawdownLtpMap:
 
         ltp = ltp_map.get(stock)
         assert ltp is None  # not in map → must fall back
+
+
+class TestPaperBrokerLtpSource:
+    """Paper mode can use broker LTP and safely fall back to tick cache."""
+
+    @pytest.mark.asyncio
+    async def test_build_ltp_map_uses_broker_when_enabled(self):
+        rm = RiskManager()
+        rm._settings = SimpleNamespace(paper_trading=True, paper_risk_use_broker_ltp=True)
+        trade = SimpleNamespace(stock="RELIANCE", entry_price=2500.0)
+
+        groww = SimpleNamespace(
+            get_ltp=AsyncMock(return_value={"NSE:RELIANCE": {"last_price": 2512.5}})
+        )
+        with patch("agents.risk_manager.get_groww_client", return_value=groww):
+            with patch("agents.risk_manager.ltp_store.get_ltp", return_value=2499.0) as store_ltp:
+                ltp_map = await rm._build_ltp_map([trade])
+
+        assert ltp_map == {"RELIANCE": 2512.5}
+        store_ltp.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_build_ltp_map_falls_back_to_tick_store_on_broker_error(self):
+        rm = RiskManager()
+        rm._settings = SimpleNamespace(paper_trading=True, paper_risk_use_broker_ltp=True)
+        trade = SimpleNamespace(stock="RELIANCE", entry_price=2500.0)
+
+        groww = SimpleNamespace(get_ltp=AsyncMock(side_effect=RuntimeError("boom")))
+        with patch("agents.risk_manager.get_groww_client", return_value=groww):
+            with patch("agents.risk_manager.ltp_store.get_ltp", return_value=2504.0):
+                ltp_map = await rm._build_ltp_map([trade])
+
+        assert ltp_map == {"RELIANCE": 2504.0}
+
+    @pytest.mark.asyncio
+    async def test_get_trade_ltp_uses_tick_store_when_broker_disabled(self):
+        rm = RiskManager()
+        rm._settings = SimpleNamespace(paper_trading=True, paper_risk_use_broker_ltp=False)
+        trade = SimpleNamespace(stock="RELIANCE")
+
+        with patch("agents.risk_manager.get_groww_client") as groww_client:
+            with patch("agents.risk_manager.ltp_store.get_ltp", return_value=2498.5):
+                ltp = await rm._get_trade_ltp(trade)
+
+        assert ltp == 2498.5
+        groww_client.assert_not_called()
 
 
 # ═══════════════════════════════════════════════════════════════════════════

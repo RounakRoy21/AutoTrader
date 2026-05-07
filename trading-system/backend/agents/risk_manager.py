@@ -157,6 +157,75 @@ class RiskManager:
                 logger.exception("Risk Manager poll error: %s", exc)
             time.sleep(POLL_INTERVAL)
 
+    def _paper_fallback_price(self, trade: Trade) -> float:
+        """Read paper LTP from scanner tick store, falling back to entry price."""
+        price = ltp_store.get_ltp(trade.stock)
+        if price is None:
+            price = trade.entry_price
+            logger.debug(
+                "[RiskManager] No tick yet for %s — using entry price",
+                trade.stock,
+            )
+        return price
+
+    async def _build_ltp_map(self, open_trades: List[Trade]) -> Dict[str, float]:
+        """Build symbol → LTP mapping for the current poll cycle.
+
+        Live mode always uses broker LTP.
+        Paper mode uses broker LTP when enabled and falls back per symbol to
+        scanner ticks (or entry price when no tick is available).
+        """
+        settings = self._settings
+        use_broker = (not settings.paper_trading) or settings.paper_risk_use_broker_ltp
+        ltp_map: Dict[str, float] = {}
+        raw: Dict[str, Dict[str, float]] = {}
+
+        if use_broker:
+            try:
+                groww = get_groww_client()
+                instruments = [f"NSE:{t.stock}" for t in open_trades]
+                raw = await groww.get_ltp(instruments)
+            except Exception as exc:
+                if not settings.paper_trading:
+                    logger.error("Failed to fetch LTP for risk check: %s", exc)
+                    raise
+                logger.warning(
+                    "Paper broker LTP fetch failed for risk check: %s — falling back to scanner ticks",
+                    exc,
+                )
+
+        for trade in open_trades:
+            key = f"NSE:{trade.stock}"
+            if key in raw and raw[key].get("last_price") is not None:
+                ltp_map[trade.stock] = raw[key]["last_price"]
+                continue
+
+            if settings.paper_trading:
+                ltp_map[trade.stock] = self._paper_fallback_price(trade)
+
+        return ltp_map
+
+    async def _get_trade_ltp(self, trade: Trade) -> Optional[float]:
+        """Get a single-trade LTP with the same source preference as main poll."""
+        settings = self._settings
+        use_broker = (not settings.paper_trading) or settings.paper_risk_use_broker_ltp
+
+        if use_broker:
+            try:
+                groww = get_groww_client()
+                raw = await groww.get_ltp([f"NSE:{trade.stock}"])
+                ltp = raw.get(f"NSE:{trade.stock}", {}).get("last_price")
+                if ltp is not None:
+                    return ltp
+            except Exception:
+                # Keep existing live-mode behavior: silently continue to fallback.
+                pass
+
+        if settings.paper_trading:
+            return ltp_store.get_ltp(trade.stock)
+
+        return None
+
     async def _poll(self) -> None:
         """Single poll cycle: check positions, enforce rules."""
         now_ist = datetime.now(IST)
@@ -175,32 +244,13 @@ class RiskManager:
             return
 
         # Build a symbol → LTP mapping:
-        #   • Paper mode  → LTP store (written by Scanner on every tick)
         #   • Live mode   → Groww REST LTP (real market data)
+        #   • Paper mode  → Groww REST LTP (optional), then tick-store fallback
         settings = self._settings
-        ltp_map: Dict[str, float] = {}
-
-        if settings.paper_trading:
-            for trade in open_trades:
-                price = ltp_store.get_ltp(trade.stock)
-                if price is None:
-                    # Tick not received yet — fall back to entry price (safe default)
-                    price = trade.entry_price
-                    logger.debug(
-                        "[RiskManager] No tick yet for %s — using entry price",
-                        trade.stock,
-                    )
-                ltp_map[trade.stock] = price
-        else:
-            groww = get_groww_client()
-            try:
-                instruments = [f"NSE:{t.stock}" for t in open_trades]
-                raw = await groww.get_ltp(instruments)
-                ltp_map = {t.stock: raw[f"NSE:{t.stock}"]["last_price"] for t in open_trades
-                           if f"NSE:{t.stock}" in raw}
-            except Exception as exc:
-                logger.error("Failed to fetch LTP for risk check: %s", exc)
-                return
+        try:
+            ltp_map = await self._build_ltp_map(open_trades)
+        except Exception:
+            return
 
         for trade in open_trades:
             if trade.stock not in ltp_map:
@@ -554,20 +604,11 @@ class RiskManager:
         # ── Unrealised losses from open positions ──
         open_trades = await self._get_open_trades()
         unrealised_loss = 0.0
-        settings = self._settings
         for trade in open_trades:
             # Prefer the ltp_map already fetched in the main poll cycle
             ltp = (ltp_map or {}).get(trade.stock)
             if ltp is None:
-                if settings.paper_trading:
-                    ltp = ltp_store.get_ltp(trade.stock)
-                else:
-                    try:
-                        groww = get_groww_client()
-                        raw = await groww.get_ltp([f"NSE:{trade.stock}"])
-                        ltp = raw.get(f"NSE:{trade.stock}", {}).get("last_price")
-                    except Exception:
-                        ltp = None
+                ltp = await self._get_trade_ltp(trade)
             if ltp is None:
                 ltp = trade.entry_price
             mtm = (ltp - trade.entry_price) * trade.quantity

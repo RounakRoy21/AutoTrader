@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     app_env: str = "development"
     log_level: str = "INFO"
     paper_trading: bool = True
+    paper_risk_use_broker_ltp: bool = True
 
     # ── PostgreSQL ─────────────────────────────────
     postgres_host: str = "postgres"
