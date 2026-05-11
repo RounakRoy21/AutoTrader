@@ -773,32 +773,57 @@ class Scanner:
 
         Best-effort: symbols whose historical fetch fails are initialised with 0.0
         (volume check bypassed only for that symbol, a warning is logged).
+
+        All fetches run concurrently (asyncio.gather) with a per-symbol timeout so a
+        rate-limit or API-forbidden response on any symbol does not block the entire
+        pre-load phase.  Without concurrency, 49 sequential retries × ~14 s each
+        = ~11 minutes before GrowwFeed ever connects.
         """
         groww_client = get_groww_client()
         instrument_map = get_instrument_map()
-        loaded = 0
-        for symbol, token in instrument_map.items():
+
+        # Per-symbol timeout: cap at one full retry cycle (2+4+8 = 14 s + margin).
+        # asyncio.wait_for cancels the to_thread Future; the background thread may
+        # finish later but the scanner proceeds immediately with avg_vol=0.
+        _FETCH_TIMEOUT = 20.0
+
+        async def _fetch_one(symbol: str, token: int):
             try:
-                candles = await groww_client.get_historical_data(
-                    token, interval="day", days_back=30
+                candles = await asyncio.wait_for(
+                    groww_client.get_historical_data(token, interval="day", days_back=30),
+                    timeout=_FETCH_TIMEOUT,
                 )
                 volumes = [c["volume"] for c in candles if c.get("volume", 0) > 0]
-                # Take the last 20 trading days; fall back to all available if <20
                 recent = volumes[-20:] if len(volumes) >= 20 else volumes
                 avg_vol = sum(recent) / len(recent) if recent else 0.0
-                self._stores[symbol] = TickDataStore(symbol, avg_volume_20d=avg_vol)
                 if avg_vol > 0:
-                    loaded += 1
                     logger.debug("[Scanner] %s avg_volume_20d=%.0f", symbol, avg_vol)
                 else:
                     logger.warning("[Scanner] %s: no volume data in historical candles", symbol)
+                return symbol, avg_vol
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[Scanner] Could not fetch avg volume for %s: timed out after %.0fs "
+                    "— volume filter disabled for this symbol",
+                    symbol, _FETCH_TIMEOUT,
+                )
+                return symbol, 0.0
             except Exception as exc:
                 logger.warning(
                     "[Scanner] Could not fetch avg volume for %s: %s "
                     "— volume filter disabled for this symbol",
                     symbol, exc,
                 )
-                self._stores[symbol] = TickDataStore(symbol)
+                return symbol, 0.0
+
+        results = await asyncio.gather(
+            *[_fetch_one(sym, tok) for sym, tok in instrument_map.items()]
+        )
+        loaded = 0
+        for symbol, avg_vol in results:
+            self._stores[symbol] = TickDataStore(symbol, avg_volume_20d=avg_vol)
+            if avg_vol > 0:
+                loaded += 1
         logger.info(
             "[Scanner] Loaded 20-day avg volumes for %d/%d symbols",
             loaded, len(instrument_map),

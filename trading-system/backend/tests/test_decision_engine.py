@@ -357,6 +357,74 @@ class TestPreCheck:
             assert not passed
             assert "max daily trades" in reason.lower()
 
+
+class TestProcessSignalFeedVisibility:
+    """process_signal should always persist pre-check rejects to decision feed."""
+
+    @pytest.mark.asyncio
+    @patch("agents.decision_engine.datetime")
+    @patch("agents.decision_engine.get_redis", side_effect=ConnectionError("Redis unavailable in unit tests"))
+    @patch("agents.decision_engine.get_value", return_value=None)
+    @patch("agents.decision_engine.publish", new_callable=AsyncMock)
+    async def test_silent_watchlist_reject_still_pushes_feed(
+        self,
+        mock_publish,
+        mock_get_value,
+        mock_get_redis,
+        mock_dt,
+        engine,
+        signal,
+    ):
+        mock_dt.now.return_value = _MARKET_DT
+        brief = MagicMock(spec=MarketBriefLLMOutput)
+        brief.market_bias = MarketBias.NEUTRAL
+        brief.recommended_stance = RecommendedStance.FULL_SIZE_POSITIONS
+        brief.avoid_today = []
+        brief.watchlist_today = ["TCS"]
+        brief.news_flags = []
+        engine._market_brief = brief
+        engine._count_open_positions = AsyncMock(return_value=0)
+        engine._push_feed_entry = AsyncMock()
+
+        with patch("agents.decision_engine.get_db_context", return_value=_mock_db_context(0)):
+            result = await engine.process_signal(signal)
+
+        assert result is None
+        engine._push_feed_entry.assert_awaited_once()
+        mock_publish.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch("agents.decision_engine.datetime")
+    @patch("agents.decision_engine.get_redis", side_effect=ConnectionError("Redis unavailable in unit tests"))
+    @patch("agents.decision_engine.get_value", return_value=None)
+    @patch("agents.decision_engine.publish", new_callable=AsyncMock)
+    async def test_actionable_precheck_reject_pushes_feed_and_alert(
+        self,
+        mock_publish,
+        mock_get_value,
+        mock_get_redis,
+        mock_dt,
+        engine,
+        signal,
+    ):
+        mock_dt.now.return_value = _MARKET_DT
+        brief = MagicMock(spec=MarketBriefLLMOutput)
+        brief.market_bias = MarketBias.NEUTRAL
+        brief.recommended_stance = RecommendedStance.FULL_SIZE_POSITIONS
+        brief.avoid_today = [signal.stock]
+        brief.watchlist_today = []
+        brief.news_flags = []
+        engine._market_brief = brief
+        engine._count_open_positions = AsyncMock(return_value=0)
+        engine._push_feed_entry = AsyncMock()
+
+        with patch("agents.decision_engine.get_db_context", return_value=_mock_db_context(0)):
+            result = await engine.process_signal(signal)
+
+        assert result is None
+        engine._push_feed_entry.assert_awaited_once()
+        mock_publish.assert_awaited_once()
+
     @pytest.mark.asyncio
     @patch("agents.decision_engine.datetime")
     @patch("agents.decision_engine.get_value", return_value=None)

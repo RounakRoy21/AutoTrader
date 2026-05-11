@@ -807,20 +807,26 @@ class DecisionEngine:
         """Process a single scanner signal through pre-checks and LLM decision."""
         passed, reason, signal = await self._pre_check(signal)
         if not passed:
-            logger.debug("Signal rejected by pre-check: %s — %s", signal.stock, reason)
+            logger.info("[DIAG] process_signal PRE_CHECK REJECT: %s — %s", signal.stock, reason)
             # Only publish to system_alerts when the rejection reason carries actionable
             # information (risk rules, pauses, avoid-list).  Watchlist-filter misses and
             # outside-hours rejections are expected and normal — suppress them to avoid
             # flooding the alerts feed with 24/7 noise during extended-hours testing.
             _silent_reasons = ("not in today's watchlist", "Outside")
+            # Always record pre-check rejects in decision_feed for operator visibility,
+            # even when the corresponding system alert is intentionally suppressed.
+            await self._push_feed_entry(
+                signal,
+                stage="PRE_CHECK",
+                decision="REJECT",
+                rationale=reason,
+            )
             if not any(s in reason for s in _silent_reasons):
                 await publish("system_alerts", {
                     "type": "warning",
                     "message": f"Signal skipped ({signal.stock}): {reason}",
                     "timestamp": datetime.now(IST).isoformat(),
                 })
-                await self._push_feed_entry(signal, stage="PRE_CHECK", decision="REJECT",
-                                            rationale=reason)
             return None
 
         decision = await self._call_llm(signal)
@@ -924,8 +930,9 @@ class DecisionEngine:
             await r.ltrim(DECISION_FEED_KEY, 0, 99)  # keep last 100
             # Push real-time decision updates to frontend via Redis pub/sub.
             await publish("decision_feed", entry)
-        except Exception:
-            pass  # non-blocking — never raise
+        except Exception as _feed_exc:
+            logger.error("[DIAG] _push_feed_entry FAILED for %s: %s: %s",
+                         signal.stock, type(_feed_exc).__name__, _feed_exc, exc_info=True)
 
     def stop(self) -> None:
         """Stop the decision engine."""

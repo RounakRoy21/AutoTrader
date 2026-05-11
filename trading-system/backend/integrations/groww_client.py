@@ -229,7 +229,6 @@ class _GrowwFeedKiteTicker:
                         try:
                             ltp_data = (
                                 feed.get_ltp()
-                                .get("ltp", {})
                                 .get(exchange, {})
                                 .get(segment, {})
                                 .get(token_str, {})
