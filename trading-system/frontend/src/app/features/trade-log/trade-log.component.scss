@@ -93,3 +93,43 @@
   .filter-field   { width: 100%; }
   .summary-row    { gap: 12px; }
 }
+
+// ── Table polish ─────────────────────────────────────────────────
+::ng-deep .mat-mdc-table {
+  .mat-mdc-header-row {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--at-surface-2, #1e252e);
+
+    .mat-mdc-header-cell {
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--at-text-muted, #8899aa);
+      border-bottom: 1px solid var(--at-border-subtle, rgba(255,255,255,.07));
+    }
+  }
+
+  // Data rows only — exclude the expandable detail row
+  .mat-mdc-row:not(.detail-row) {
+    height: 44px;
+    border-bottom: 1px solid var(--at-border-subtle, rgba(255,255,255,.07));
+    &:hover { background: var(--at-surface-2, #1e252e); }
+  }
+
+  // Detail (expandable) row: collapse fully and suppress hover
+  tr.detail-row {
+    height: 0 !important;
+    border-bottom: none !important;
+    &:hover { background: transparent !important; }
+  }
+
+  .mat-column-entry_price,
+  .mat-column-exit_price,
+  .mat-column-realized_pnl {
+    font-family: var(--at-font-mono, 'JetBrains Mono', monospace);
+    font-variant-numeric: tabular-nums;
+  }
+}

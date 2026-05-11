@@ -5,6 +5,7 @@
 
 import { Component, OnInit, OnDestroy, ChangeDetectionStrategy, ChangeDetectorRef } from '@angular/core';
 import { CommonModule } from '@angular/common';
+import { Router } from '@angular/router';
 import { Subject } from 'rxjs';
 import { takeUntil } from 'rxjs/operators';
 
@@ -89,7 +90,21 @@ export class PnlChartComponent implements OnInit, OnDestroy {
     private api: ApiService,
     private cdr: ChangeDetectorRef,
     private themeService: ThemeService,
+    private router: Router,
   ) {}
+
+  onBarClick(event: any): void {
+    try {
+      const active = event?.active as any[];
+      if (!active?.length) return;
+      const idx = active[0].index;
+      const labels = this.chartData.labels as string[];
+      const date = labels?.[idx];
+      if (date) {
+        this.router.navigate(['/trades'], { queryParams: { date } });
+      }
+    } catch { /* ignore */ }
+  }
 
   ngOnInit(): void {
     this.themeService.dark$.pipe(takeUntil(this.destroy$)).subscribe(dark => {

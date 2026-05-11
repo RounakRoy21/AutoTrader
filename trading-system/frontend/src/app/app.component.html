@@ -19,6 +19,9 @@
     [mode]="isHandset ? 'over' : 'side'"
     [opened]="!isHandset"
     class="sidenav">
+    <div class="sidenav-header">
+      <span class="at-wordmark">Auto<span class="at-accent">Trader</span></span>
+    </div>
     <mat-nav-list>
       <a mat-list-item routerLink="/dashboard" routerLinkActive="active"
          (click)="closeOnMobile(sidenav)">
@@ -27,7 +30,7 @@
       </a>
       <a mat-list-item routerLink="/positions" routerLinkActive="active"
          (click)="closeOnMobile(sidenav)">
-        <mat-icon matListItemIcon>trending_up</mat-icon>
+        <mat-icon matListItemIcon>account_balance_wallet</mat-icon>
         <span matListItemTitle>Open Positions</span>
       </a>
       <a mat-list-item routerLink="/trades" routerLinkActive="active"
@@ -40,11 +43,6 @@
         <mat-icon matListItemIcon>show_chart</mat-icon>
         <span matListItemTitle>P&L Chart</span>
       </a>
-      <a mat-list-item routerLink="/decisions" routerLinkActive="active"
-         (click)="closeOnMobile(sidenav)">
-        <mat-icon matListItemIcon>psychology</mat-icon>
-        <span matListItemTitle>Decision Feed</span>
-      </a>
     </mat-nav-list>
   </mat-sidenav>
 
@@ -53,9 +51,12 @@
       <button mat-icon-button (click)="sidenav.toggle()" aria-label="Toggle navigation">
         <mat-icon>menu</mat-icon>
       </button>
-      <span class="title-text">AutoTrader</span>
+      <span class="at-wordmark toolbar-wordmark">Auto<span class="at-accent">Trader</span></span>
 
       <span class="toolbar-spacer"></span>
+
+      <!-- Live IST clock -->
+      <span class="at-clock at-mono" *ngIf="currentTime$ | async as time">{{ time }} IST</span>
 
       <!-- Paper trading badge -->
       <span class="paper-badge" *ngIf="paperTrading" matTooltip="All orders are simulated — no real money at risk">
@@ -71,6 +72,7 @@
 
       <!-- WebSocket connection chip -->
       <span class="ws-chip" [class]="'ws-' + wsState"
+            [class.at-pulse]="wsState === 'connected'"
             [matTooltip]="wsState === 'failed' ? 'Live feed lost — refresh the page to reconnect' : 'Live data feed status'">
         <mat-icon>{{ wsIcon }}</mat-icon>
         <span class="ws-label">{{ wsLabel }}</span>
@@ -82,3 +84,4 @@
     </div>
   </mat-sidenav-content>
 </mat-sidenav-container>
+

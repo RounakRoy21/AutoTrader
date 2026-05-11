@@ -1,68 +1,117 @@
-.dashboard-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
-  gap: 16px;
+﻿// â”€â”€ Dashboard wrapper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+.dashboard-wrapper {
   padding: 16px;
+  max-width: 1400px;
+  margin: 0 auto;
 }
 
-// ── Market Brief card ──────────────────────────────────────────
-.brief-header-spacer {
-  flex: 1 1 auto;
+// â”€â”€ KPI Strip â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+.at-kpi-strip {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  margin-bottom: 16px;
+
+  @media (max-width: 900px) { grid-template-columns: repeat(2, 1fr); }
+  @media (max-width: 480px) { grid-template-columns: 1fr; }
 }
 
-.brief-empty {
+.at-kpi-tile {
+  background: var(--at-surface-1);
+  border: 1px solid var(--at-border-default);
+  border-radius: 12px;
+  padding: 14px 16px;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  gap: 12px;
-  padding: 24px 0;
-  color: #888;
+  gap: 4px;
+  transition: border-color 200ms;
 
-  mat-icon {
-    font-size: 40px;
-    width: 40px;
-    height: 40px;
-  }
+  &.kpi-warn   { border-color: rgba(245, 158, 11, 0.4); }
+  &.kpi-danger { border-color: rgba(239, 68, 68, 0.5); }
+}
 
-  p {
-    margin: 0;
-    font-size: 0.9rem;
+.kpi-label {
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--at-text-muted);
+}
+
+.kpi-value {
+  font-size: 1.6rem;
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+}
+
+.kpi-sub {
+  font-size: 0.72rem;
+  color: var(--at-text-muted);
+}
+
+// â”€â”€ Dashboard grid â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 16px;
+
+  @media (max-width: 600px) { grid-template-columns: 1fr; gap: 12px; }
+}
+
+// â”€â”€ Agent Status card â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+.status-card {
+  &.halted {
+    border-color: rgba(239, 68, 68, 0.4) !important;
   }
 }
+
+.halt-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  color: var(--at-loss);
+  font-weight: 600;
+  font-size: 0.875rem;
+
+  mat-icon { font-size: 18px; width: 18px; height: 18px; }
+}
+
+.status-header-spacer { flex: 1 1 auto; }
 
 .status-row {
   display: flex;
   align-items: center;
   gap: 8px;
   margin-bottom: 8px;
+  font-size: 0.875rem;
 }
 
-// ── Pulse animation for active agents ──────────────────────────
-@keyframes pulse {
-  0%   { box-shadow: 0 0 0 0 rgba(76, 175, 80, 0.7); }
-  70%  { box-shadow: 0 0 0 6px rgba(76, 175, 80, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(76, 175, 80, 0); }
+// â”€â”€ Pulse dot â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+@keyframes pulse-ring {
+  0%   { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+  70%  { box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
 }
 
 .status-dot {
-  width: 12px;
-  height: 12px;
+  width: 10px;
+  height: 10px;
   border-radius: 50%;
-  background: #999;
+  background: var(--at-status-inactive);
   display: inline-block;
   flex-shrink: 0;
 
-  &.active {
-    background: #4caf50;
-    animation: pulse 1.8s infinite;
-  }
+  &.active   { background: var(--at-status-active); animation: pulse-ring 2s infinite; }
+  &.inactive { background: var(--at-status-inactive); }
 }
 
-// ── Market status badge (System Status card header) ────────────────────────
-.status-header-spacer {
-  flex: 1 1 auto;
-}
-
+// â”€â”€ Market status badge â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 .market-status-badge {
   display: inline-flex;
   align-items: center;
@@ -70,8 +119,8 @@
   padding: 3px 10px;
   border-radius: 12px;
   font-size: 0.7rem;
-  font-weight: 600;
-  letter-spacing: 0.4px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
   text-transform: uppercase;
   align-self: center;
 
@@ -83,60 +132,146 @@
   }
 
   &.market-open {
-    background: rgba(76, 175, 80, 0.15);
-    color: #4caf50;
-    .market-dot { background: #4caf50; animation: pulse 1.8s infinite; }
+    background: rgba(16, 185, 129, 0.15);
+    color: var(--at-status-active);
+    .market-dot { background: var(--at-status-active); }
   }
-
   &.market-pre-open {
-    background: rgba(255, 193, 7, 0.15);
-    color: #e6ac00;
-    .market-dot { background: #ffc107; }
+    background: rgba(245, 158, 11, 0.15);
+    color: var(--at-status-degraded);
+    .market-dot { background: var(--at-status-degraded); }
   }
-
   &.market-closed {
-    background: rgba(150, 150, 150, 0.12);
-    color: #888;
-    .market-dot { background: #999; }
+    background: rgba(107, 114, 128, 0.15);
+    color: var(--at-status-inactive);
+    .market-dot { background: var(--at-status-inactive); }
   }
 }
 
-.halt-controls {
+// â”€â”€ Drawdown bar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+.drawdown-section { margin-top: 16px; margin-bottom: 4px; }
+
+.drawdown-header {
   display: flex;
-  gap: 12px;
-  margin-top: 16px;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.8rem;
+  color: var(--at-text-secondary);
+  margin-bottom: 6px;
+  cursor: default;
 }
 
-.agent-controls {
+.drawdown-pct {
   display: flex;
-  gap: 12px;
-  margin-top: 8px;
+  align-items: center;
+  gap: 3px;
+  font-family: var(--at-font-mono);
+  font-weight: 600;
+
+  .info-icon { font-size: 13px; width: 13px; height: 13px; color: var(--at-text-muted); }
 }
 
-// ── P&L card ───────────────────────────────────────────────────
-.pnl-value {
-  font-size: 2.4rem;
-  font-weight: 700;
+.drawdown-bar-track {
+  position: relative;
+  height: 8px;
+  background: var(--at-surface-3);
+  border-radius: 4px;
+  overflow: visible;
+}
+
+.drawdown-bar-fill {
+  height: 100%;
+  border-radius: 4px;
+  max-width: 100%;
+  transition: width 400ms ease, background-color 400ms;
+
+  &.fill-safe   { background: var(--at-status-active); }
+  &.fill-warn   { background: var(--at-status-degraded); }
+  &.fill-danger { background: var(--at-status-error); }
+}
+
+.drawdown-marker {
+  position: absolute;
+  top: -16px;
+  transform: translateX(-50%);
+  font-size: 0.6rem;
+  color: var(--at-text-muted);
+  pointer-events: none;
+}
+
+.drawdown-loss {
+  font-size: 0.75rem;
+  color: var(--at-loss);
+  margin-top: 4px;
+}
+
+// â”€â”€ Controls â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+.halt-controls, .agent-controls {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.halt-controls { margin-top: 16px; }
+.agent-controls { margin-top: 8px; }
+
+// â”€â”€ P&L card â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+.pnl-hero-row {
   text-align: center;
-  padding: 16px 0 4px;
+  padding: 20px 0 8px;
 }
 
 .pnl-breakdown {
   display: flex;
-  justify-content: center;
-  gap: 20px;
-  font-size: 0.85rem;
-  color: #666;
-  margin-bottom: 4px;
+  justify-content: space-around;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--at-border-subtle);
 }
 
-.pnl-detail {
-  text-align: center;
-  color: #888;
-  font-size: 0.85rem;
+.pnl-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
 }
 
-// ── Market Brief ───────────────────────────────────────────────
+.pnl-item-label {
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--at-text-muted);
+}
+
+.pnl-item-value {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.pnl-divider {
+  width: 1px;
+  height: 32px;
+  background: var(--at-border-subtle);
+}
+
+// â”€â”€ Market Brief card â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+.brief-header-spacer { flex: 1 1 auto; }
+
+.brief-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 24px 0;
+  color: var(--at-text-secondary);
+
+  mat-icon { font-size: 40px; width: 40px; height: 40px; }
+  p { margin: 0; font-size: 0.9rem; }
+}
+
 .brief-top-row {
   display: flex;
   align-items: center;
@@ -148,12 +283,45 @@
 .bias-badge {
   display: inline-block;
   padding: 4px 12px;
-  border-radius: 12px;
-  font-weight: 600;
+  border-radius: 8px;
+  font-weight: 700;
+  font-size: 0.8rem;
+  letter-spacing: 0.04em;
 
-  &.bullish { background: #e8f5e9; color: #2e7d32; }
-  &.bearish { background: #ffebee; color: #c62828; }
-  &.neutral  { background: #fff8e1; color: #f57f17; }
+  &.bullish { background: var(--at-profit-bg); color: var(--at-profit); border: 1px solid rgba(129, 199, 132, 0.3); }
+  &.bearish { background: var(--at-loss-bg);   color: var(--at-loss);   border: 1px solid rgba(239, 154, 154, 0.3); }
+  &.neutral  { background: var(--at-warn-bg);   color: var(--at-warn-color); border: 1px solid rgba(255, 183, 77, 0.3); }
+}
+
+.confidence-wrap {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 80px;
+}
+
+.confidence-bar-track {
+  flex: 1;
+  height: 3px;
+  background: var(--at-surface-3);
+  border-radius: 2px;
+}
+
+.confidence-bar-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 400ms ease;
+
+  &.conf-high { background: var(--at-status-active); }
+  &.conf-mid  { background: var(--at-status-degraded); }
+  &.conf-low  { background: var(--at-status-error); }
+}
+
+.confidence-label {
+  font-size: 0.72rem;
+  color: var(--at-text-muted);
+  white-space: nowrap;
 }
 
 .vix-badge {
@@ -161,19 +329,20 @@
   align-items: center;
   gap: 6px;
   padding: 4px 10px;
-  border-radius: 12px;
-  font-size: 0.8rem;
+  border-radius: 8px;
+  font-size: 0.75rem;
   font-weight: 600;
   cursor: default;
 
-  &.regime-normal   { background: #e8f5e9; color: #2e7d32; }
-  &.regime-elevated { background: #fff3e0; color: #e65100; }
-  &.regime-stress   { background: #ffebee; color: #b71c1c; }
+  &.regime-normal   { background: var(--at-profit-bg); color: var(--at-profit); }
+  &.regime-elevated { background: var(--at-warn-bg);   color: var(--at-warn-color); }
+  &.regime-stress   { background: var(--at-loss-bg);   color: var(--at-loss); }
 
   .vix-regime {
-    font-size: 0.7rem;
-    opacity: 0.8;
+    font-size: 0.65rem;
+    opacity: 0.75;
     text-transform: uppercase;
+    letter-spacing: 0.04em;
   }
 }
 
@@ -185,155 +354,207 @@
   font-size: 0.875rem;
 }
 
-.stance-icon { font-size: 18px; width: 18px; height: 18px; color: #666; }
-.stance-label { color: #666; }
-.stance-value { font-weight: 600; }
-.stance-avoid { color: #c62828; }
-.stance-half  { color: #e65100; }
+.stance-icon  { font-size: 16px; width: 16px; height: 16px; color: var(--at-text-muted); }
+.stance-label { color: var(--at-text-secondary); font-size: 0.8rem; }
 
-.brief-signals div {
-  margin-bottom: 4px;
+.stance-badge {
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+
+  &.stance-normal { background: var(--at-profit-bg); color: var(--at-profit); }
+  &.stance-half   { background: var(--at-warn-bg);   color: var(--at-warn-color); }
+  &.stance-avoid  { background: var(--at-loss-bg);   color: var(--at-loss); }
+}
+
+.signal-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.signal-cell {
+  background: var(--at-surface-2);
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.signal-key {
+  font-size: 0.62rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--at-text-muted);
+}
+
+.signal-val {
+  font-size: 0.78rem;
+  line-height: 1.3;
+  color: var(--at-text-secondary);
+}
+
+.watchlist, .avoid-list {
+  margin-top: 12px;
   font-size: 0.875rem;
 }
 
-.watchlist,
-.avoid-list {
-  margin-top: 12px;
-}
+::ng-deep .chip-watch .mdc-evolution-chip__text-label { color: var(--at-profit) !important; font-size: 0.75rem !important; }
+::ng-deep .chip-avoid .mdc-evolution-chip__text-label { color: var(--at-loss) !important;   font-size: 0.75rem !important; }
 
-// ── Quick Stats ────────────────────────────────────────────────
+// â”€â”€ Quick Stats card â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 .stat-item {
   display: flex;
   justify-content: space-between;
   align-items: baseline;
-  padding: 8px 0;
-  border-bottom: 1px solid #eee;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--at-border-subtle);
 }
 
-.stat-label { color: #666; }
+.stat-label {
+  color: var(--at-text-secondary);
+  font-size: 0.875rem;
+}
+
 .stat-value { font-weight: 600; }
-.stat-muted { font-weight: 400; color: #999; }
+
 .stat-sub {
   font-size: 0.72rem;
   font-weight: 400;
-  color: #888;
+  color: var(--at-text-muted);
   margin-left: 4px;
 }
 
 .stat-divider {
-  border-top: 1px dashed #ddd;
+  border-top: 1px dashed var(--at-border-default);
   margin: 4px 0;
 }
 
-// ── System Health ──────────────────────────────────────────────
+// â”€â”€ System Health â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 .health-row {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 7px 0;
-  border-bottom: 1px solid #eee;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--at-border-subtle);
   font-size: 0.875rem;
 
   .health-label {
     margin-left: auto;
     font-size: 0.75rem;
-    color: #888;
+    color: var(--at-text-muted);
     text-transform: lowercase;
   }
 }
 
-.health-ok  { color: #4caf50; }
-.health-bad { color: #f44336; }
-.health-unknown { color: #9e9e9e; }
+.health-ok      { color: var(--at-status-active); }
+.health-bad     { color: var(--at-status-error); }
+.health-unknown { color: var(--at-status-inactive); }
 
 .health-loading {
   display: flex;
   align-items: center;
   gap: 12px;
   padding: 16px 0;
-  color: #888;
+  color: var(--at-text-secondary);
 }
 
-// ── Drawdown ───────────────────────────────────────────────────
-.drawdown-section { margin-top: 12px; margin-bottom: 4px; }
-.drawdown-label {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 0.8rem;
-  color: #666;
-  margin-bottom: 4px;
-  cursor: default;
-
-  .info-icon {
-    font-size: 14px;
-    width: 14px;
-    height: 14px;
-    color: #9e9e9e;
-    vertical-align: middle;
-  }
-}
-.drawdown-loss  { color: #c62828; }
-
-// ── System Alerts panel — full-width at bottom of dashboard ───
+// â”€â”€ Alerts panel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 .alerts-panel {
   grid-column: 1 / -1;
 
-  // Constrain the alerts card height when embedded in dashboard
   ::ng-deep .alerts-card {
     margin: 0;
-
-    .alerts-scroll {
-      max-height: 220px;
-      overflow-y: auto;
-    }
+    .alerts-scroll { max-height: 220px; overflow-y: auto; }
   }
 }
 
-// ── Dark theme overrides ───────────────────────────────────────
-:host-context(.dark-theme) {
-  .pnl-breakdown, .pnl-detail,
-  .stat-label, .stat-muted, .stat-sub,
-  .health-label, .health-loading,
-  .drawdown-label, .stance-icon, .stance-label,
-  .brief-empty { color: var(--at-text-secondary); }
 
-  .stat-item     { border-bottom-color: var(--at-border); }
-  .stat-divider  { border-top-color: var(--at-border); }
-  .health-row    { border-bottom-color: var(--at-border); }
-  .drawdown-loss { color: var(--at-loss); }
-  .stance-avoid  { color: var(--at-loss); }
-  .stance-half   { color: var(--at-warn-color); }
-
-  .bias-badge {
-    &.bullish { background: rgba(46, 125, 50, 0.2);  color: #81c784; }
-    &.bearish { background: rgba(198, 40, 40, 0.2);  color: #ef9a9a; }
-    &.neutral  { background: rgba(245, 124, 0, 0.2); color: #ffb74d; }
-  }
-
-  .vix-badge {
-    &.regime-normal   { background: rgba(46, 125, 50, 0.2);  color: #81c784; }
-    &.regime-elevated { background: rgba(230, 81, 0, 0.2);   color: #ffb74d; }
-    &.regime-stress   { background: rgba(183, 28, 28, 0.2);  color: #ef9a9a; }
-  }
-
-  .market-status-badge {
-    &.market-open     { background: rgba(76, 175, 80, 0.2);  color: #81c784; }
-    &.market-pre-open { background: rgba(255, 193, 7, 0.2);  color: #ffd54f; }
-    &.market-closed   { background: rgba(150, 150, 150, 0.15); color: #aaa;  }
-  }
+// ── Strategy Health card ──────────────────────────────────────────
+.strategy-health-card {
+  grid-column: 1 / -1;
 }
 
-// ── Mobile ─────────────────────────────────────────────────────
-@media (max-width: 600px) {
-  .dashboard-grid {
-    grid-template-columns: 1fr;
-    gap: 12px;
-    padding: 12px;
-  }
+.sh-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 16px;
+  align-items: start;
 
-  .halt-controls,
-  .agent-controls { flex-wrap: wrap; gap: 8px; }
+  @media (max-width: 600px) { grid-template-columns: 1fr 1fr; }
+}
 
-  .pnl-value { font-size: 1.9rem; }
+.sh-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sh-label {
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--at-text-muted);
+}
+
+.sh-value {
+  font-size: 1.4rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+}
+
+.sh-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.sh-bar-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sh-bar-label {
+  font-size: 0.65rem;
+  color: var(--at-text-muted);
+  width: 32px;
+  flex-shrink: 0;
+}
+
+.sh-bar-track {
+  flex: 1;
+  height: 6px;
+  background: var(--at-surface-3);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.sh-bar-fill {
+  height: 100%;
+  background: var(--at-loss);
+  border-radius: 3px;
+  transition: width 400ms ease;
+}
+
+.sh-bar-val {
+  font-size: 0.65rem;
+  color: var(--at-text-muted);
+  width: 20px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+// Decision feed widget card
+.decision-feed-widget-card {
+  grid-column: 1 / -1;
+  mat-card-content { padding-top: 0; }
 }

@@ -14,6 +14,28 @@
 
 .sidenav {
   width: 220px;
+  background: var(--at-surface-1) !important;
+  border-right: 1px solid var(--at-border-subtle) !important;
+}
+
+// ── Sidenav header with wordmark ─────────────────────────────────────
+.sidenav-header {
+  padding: 20px 16px 12px;
+  border-bottom: 1px solid var(--at-border-subtle);
+  margin-bottom: 8px;
+}
+
+// ── Active nav item ──────────────────────────────────────────────────
+.active {
+  border-left: 2px solid #FFD740 !important; // amber A200
+  background: var(--at-surface-2) !important;
+}
+
+mat-nav-list a {
+  border-left: 2px solid transparent;
+  transition: background 150ms ease, border-color 150ms ease;
+  border-radius: 0 8px 8px 0 !important;
+  margin-right: 8px !important;
 }
 
 // ── Content area: toolbar + scrollable page ──────────────────────────
@@ -21,8 +43,7 @@
   display: flex;
   flex-direction: column;
   height: 100%;
-  overflow-x: hidden; // prevent CDK overlay (dialog/snackbar) from causing horizontal scroll on mobile
-  // No outer padding — components own their own margins
+  overflow-x: hidden;
 }
 
 .toolbar {
@@ -30,99 +51,130 @@
   top: 0;
   z-index: 1000;
   flex-shrink: 0;
-  // Prevent items from wrapping out of the bar on narrow screens
   overflow: hidden;
   min-width: 0;
+  background: var(--at-surface-1) !important;
+  border-bottom: 1px solid var(--at-border-subtle);
 }
 
 .page-content {
   flex: 1;
   overflow-y: auto;
-  overflow-x: hidden; // belt-and-suspenders: clip any child overflow before it reaches mat-sidenav-content
+  overflow-x: hidden;
+  background: var(--at-surface-0);
 }
 
 .toolbar-spacer {
   flex: 1;
 }
 
-// Paper-trading badge in toolbar
-.paper-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  background: #ff9800;
-  color: #fff;
-  font-size: 0.75rem;
-  font-weight: 700;
-  padding: 3px 10px;
-  border-radius: 12px;
-  margin-right: 12px;
-  letter-spacing: 0.05em;
-
-  mat-icon { font-size: 16px; width: 16px; height: 16px; }
-}
-
-// WebSocket status chip
-.ws-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 0.75rem;
+// ── Wordmark ─────────────────────────────────────────────────────────
+.at-wordmark {
+  font-family: var(--at-font-ui), sans-serif;
+  font-size: 1.1rem;
   font-weight: 600;
-  padding: 3px 10px;
-  border-radius: 12px;
-  letter-spacing: 0.05em;
-  cursor: default;
-  flex-shrink: 0; // never compress the chip
+  letter-spacing: 0.02em;
+  color: inherit;
 
-  mat-icon { font-size: 16px; width: 16px; height: 16px; }
-
-  &.ws-connected    { background: rgba(76, 175, 80, 0.25); color: #c8e6c9; }
-  &.ws-connecting   { background: rgba(255, 193, 7, 0.25);  color: #fff9c4; }
-  &.ws-disconnected { background: rgba(255, 152, 0, 0.25);  color: #ffe0b2; }
-  &.ws-failed       { background: rgba(244, 67, 54, 0.3);   color: #ffcdd2; }
+  .at-accent {
+    color: #FFD740; // amber A200 — accent
+  }
 }
 
-.ws-label {
-  @media (max-width: 480px) { display: none; }
-}
-
-// WS permanently dead warning bar
-.ws-dead-banner {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 20px;
-  background: #b71c1c;
-  color: #fff;
-  font-size: 0.875rem;
-
-  mat-icon { flex-shrink: 0; }
-  button { margin-left: auto; color: #fff; }
-}
-
-// Title text — truncate on very small screens
-.title-text {
+.toolbar-wordmark {
+  margin-left: 4px;
+  flex-shrink: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
 }
 
-.sidenav {
-  width: 220px;
+// ── Live clock ───────────────────────────────────────────────────────
+.at-clock {
+  font-size: 0.8rem;
+  color: var(--at-text-secondary);
+  margin-right: 12px;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+
+  @media (max-width: 600px) { display: none; }
 }
 
-// .content duplicate block removed — defined once above
+// ── Paper-trading badge ───────────────────────────────────────────────
+.paper-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: rgba(255, 152, 0, 0.2);
+  color: #FFB300;
+  border: 1px solid #FFB300;
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 3px 10px;
+  border-radius: 12px;
+  margin-right: 8px;
+  letter-spacing: 0.06em;
+  box-shadow: 0 0 8px rgba(255, 179, 0, 0.3);
 
-.active {
-  background-color: rgba(0, 0, 0, 0.04);
+  mat-icon { font-size: 14px; width: 14px; height: 14px; }
 }
+
+// ── WebSocket status chip ─────────────────────────────────────────────
+.ws-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: 12px;
+  letter-spacing: 0.06em;
+  cursor: default;
+  flex-shrink: 0;
+
+  mat-icon { font-size: 14px; width: 14px; height: 14px; }
+
+  &.ws-connected    { background: rgba(16, 185, 129, 0.15); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.3); }
+  &.ws-connecting   { background: rgba(245, 158, 11, 0.15); color: #fde68a; border: 1px solid rgba(245, 158, 11, 0.3); }
+  &.ws-disconnected { background: rgba(251, 146, 60, 0.15); color: #fdba74; border: 1px solid rgba(251, 146, 60, 0.3); }
+  &.ws-failed       { background: rgba(239, 68, 68, 0.15);  color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.3); }
+}
+
+.ws-label {
+  @media (max-width: 480px) { display: none; }
+}
+
+// ── WS permanently dead warning bar ─────────────────────────────────
+.ws-dead-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 20px;
+  background: #7f1d1d;
+  border-bottom: 1px solid #991b1b;
+  color: #fca5a5;
+  font-size: 0.875rem;
+
+  mat-icon { flex-shrink: 0; }
+  button { margin-left: auto; color: #fca5a5; }
+}
+
 
 // ── Dark theme overrides ─────────────────────────────────────
 :host-context(.dark-theme) {
   .active {
     background-color: rgba(255, 255, 255, 0.1) !important;
+  }
+}
+
+// ── Light mode: toolbar icons must be dark (mat-toolbar color=primary forces white) ──
+:host-context(body:not(.dark-theme)) .toolbar {
+  color: var(--at-text-primary) !important;
+
+  button.mat-icon-button,
+  button[mat-icon-button] {
+    color: var(--at-text-primary);
   }
 }
 

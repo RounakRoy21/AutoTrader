@@ -18,6 +18,8 @@ import { MatFormFieldModule } from '@angular/material/form-field';
 import { MatIconModule } from '@angular/material/icon';
 import { MatProgressBarModule } from '@angular/material/progress-bar';
 import { MatTooltipModule } from '@angular/material/tooltip';
+import { BreakpointObserver } from '@angular/cdk/layout';
+import { ActivatedRoute } from '@angular/router';
 import { animate, state, style, transition, trigger } from '@angular/animations';
 
 import { ApiService } from '../../core/services/api.service';
@@ -57,16 +59,13 @@ export class TradeLogComponent implements OnInit, AfterViewInit, OnDestroy {
   private destroy$ = new Subject<void>();
 
   dataSource = new MatTableDataSource<Trade>([]);
-  displayedColumns = [
-    'expand',
-    'trade_date',
-    'stock',
-    'quantity',
-    'entry_price',
-    'exit_price',
-    'exit_reason',
-    'realized_pnl',
+
+  private readonly ALL_COLUMNS = [
+    'expand', 'trade_date', 'stock', 'quantity',
+    'entry_price', 'exit_price', 'exit_reason', 'realized_pnl',
   ];
+  private readonly MOBILE_COLUMNS = ['expand', 'trade_date', 'stock', 'realized_pnl'];
+  displayedColumns = this.ALL_COLUMNS;
 
   totalTrades = 0;
   wins = 0;
@@ -76,9 +75,25 @@ export class TradeLogComponent implements OnInit, AfterViewInit, OnDestroy {
   loading = true;
   expandedRow: Trade | null = null;
 
-  constructor(private api: ApiService, private cdr: ChangeDetectorRef) {}
+  constructor(private api: ApiService, private cdr: ChangeDetectorRef, private bp: BreakpointObserver, private route: ActivatedRoute) {}
 
   ngOnInit(): void {
+    this.bp.observe(['(max-width: 768px)'])
+      .pipe(takeUntil(this.destroy$))
+      .subscribe(r => {
+        this.displayedColumns = r.matches ? this.MOBILE_COLUMNS : this.ALL_COLUMNS;
+        this.cdr.markForCheck();
+      });
+
+    // Apply date filter from query param (navigated from PnlChart click)
+    this.route.queryParams
+      .pipe(takeUntil(this.destroy$))
+      .subscribe(params => {
+        if (params['date']) {
+          this.dataSource.filter = params['date'].trim().toLowerCase();
+        }
+      });
+
     this.loadTrades();
   }
 

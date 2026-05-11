@@ -24,6 +24,7 @@ import { ApiService } from '../../core/services/api.service';
 import { MarketBrief, Trade, AgentStatus, HealthCheck } from '../../core/models';
 import { ConfirmDialogComponent } from '../../shared/confirm-dialog/confirm-dialog.component';
 import { SystemAlertsComponent } from '../system-alerts/system-alerts.component';
+import { DecisionFeedComponent } from '../decision-feed/decision-feed.component';
 
 @Component({
   selector: 'app-dashboard',
@@ -41,6 +42,7 @@ import { SystemAlertsComponent } from '../system-alerts/system-alerts.component'
     MatTooltipModule,
     MatSnackBarModule,
     SystemAlertsComponent,
+    DecisionFeedComponent,
   ],
   templateUrl: './dashboard.component.html',
   styleUrls: ['./dashboard.component.scss'],
@@ -63,6 +65,14 @@ export class DashboardComponent implements OnInit, OnDestroy {
   agentActionInProgress = false;
   briefRunInProgress = false;
   ltpMap: Record<string, number> = {};
+
+  // Strategy Health (derived from dailyPnl$)
+  strategyProfitFactor: number | null = null;
+  strategyAvgRR: number | null = null;
+  strategySharpe: number | null = null;
+  strategyLossEarly = 0;   // losses before 10:30
+  strategyLossMid = 0;     // losses 10:30–13:30
+  strategyLossLate = 0;    // losses after 13:30
 
   constructor(
     private state: StateService,
@@ -106,6 +116,7 @@ export class DashboardComponent implements OnInit, OnDestroy {
           this.todayTrades = pnl[0].total_trades;
           this.todayPnl = pnl[0].realized_pnl;
         }
+        this._computeStrategyHealth(pnl);
         this.cdr.markForCheck();
       });
 
@@ -120,6 +131,32 @@ export class DashboardComponent implements OnInit, OnDestroy {
       if (ltp == null) return sum;
       return sum + (ltp - t.entry_price) * t.quantity;
     }, 0);
+  }
+
+  private _computeStrategyHealth(pnl: import('../../core/models').DailyPnl[]): void {
+    if (!pnl.length) return;
+    // Profit factor = sum of winning day PnL / abs(sum of losing day PnL)
+    const wins  = pnl.filter(d => d.realized_pnl > 0).reduce((s, d) => s + d.realized_pnl, 0);
+    const losses = pnl.filter(d => d.realized_pnl < 0).reduce((s, d) => s + d.realized_pnl, 0);
+    this.strategyProfitFactor = losses !== 0 ? parseFloat((wins / Math.abs(losses)).toFixed(2)) : null;
+
+    // Average R:R from DailyPnl.avg_realised_rr (may be null)
+    const rrValues = pnl.map(d => d.avg_realised_rr).filter((v): v is number => v !== null && v !== undefined);
+    this.strategyAvgRR = rrValues.length ? parseFloat((rrValues.reduce((s, v) => s + v, 0) / rrValues.length).toFixed(2)) : null;
+
+    // Rolling Sharpe — daily returns
+    if (pnl.length >= 5) {
+      const returns = pnl.map(d => d.return_pct);
+      const mean = returns.reduce((s, v) => s + v, 0) / returns.length;
+      const variance = returns.reduce((s, v) => s + (v - mean) ** 2, 0) / returns.length;
+      const stddev = Math.sqrt(variance);
+      this.strategySharpe = stddev !== 0 ? parseFloat(((mean / stddev) * Math.sqrt(252)).toFixed(2)) : null;
+    }
+
+    // Loss distribution across the day — sum across all days
+    this.strategyLossEarly = pnl.reduce((s, d) => s + (d.losses_before_1030 ?? 0), 0);
+    this.strategyLossMid   = pnl.reduce((s, d) => s + (d.losses_1030_to_1330 ?? 0), 0);
+    this.strategyLossLate  = pnl.reduce((s, d) => s + (d.losses_after_1330 ?? 0), 0);
   }
 
   halt(): void {
@@ -253,6 +290,11 @@ export class DashboardComponent implements OnInit, OnDestroy {
     const s = this.brief?.recommended_stance;
     if (!s) return '';
     return s.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+  }
+
+  lossDistPct(val: number): number {
+    const total = this.strategyLossEarly + this.strategyLossMid + this.strategyLossLate;
+    return total > 0 ? (val / total) * 100 : 0;
   }
 
   runBrief(): void {

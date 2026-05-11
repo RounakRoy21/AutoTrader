@@ -45,3 +45,111 @@
 @media (max-width: 600px) {
   .positions-card { margin: 8px; }
 }
+
+// ── Table polish ─────────────────────────────────────────────────
+::ng-deep .mat-mdc-table {
+  .mat-mdc-header-row {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--at-surface-2, #1e252e);
+
+    .mat-mdc-header-cell {
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--at-text-muted, #8899aa);
+      border-bottom: 1px solid var(--at-border-subtle, rgba(255,255,255,.07));
+    }
+  }
+
+  .mat-mdc-row {
+    height: 44px;
+    border-bottom: 1px solid var(--at-border-subtle, rgba(255,255,255,.07));
+
+    &:hover { background: var(--at-surface-2, #1e252e); }
+  }
+
+  .mat-column-entry_price,
+  .mat-column-ltp,
+  .mat-column-unrealized_pnl {
+    font-family: var(--at-font-mono, 'JetBrains Mono', monospace);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+// SL proximity bar
+.sl-bar-cell { min-width: 80px; }
+
+.sl-bar-track {
+  width: 100%;
+  height: 5px;
+  background: var(--at-surface-3, #2a3240);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.sl-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 300ms ease, background 300ms ease;
+
+  &.safe  { background: var(--at-profit,  #4caf50); }
+  &.warn  { background: var(--at-warn-color, #ffc107); }
+  &.danger { background: var(--at-loss,   #f44336); }
+}
+
+// ── Table polish ─────────────────────────────────────────────────
+::ng-deep .mat-mdc-table {
+  .mat-mdc-header-row {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--at-surface-2, #1e252e);
+
+    .mat-mdc-header-cell {
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--at-text-muted, #8899aa);
+      border-bottom: 1px solid var(--at-border-subtle, rgba(255,255,255,.07));
+    }
+  }
+
+  .mat-mdc-row {
+    height: 44px;
+    border-bottom: 1px solid var(--at-border-subtle, rgba(255,255,255,.07));
+
+    &:hover { background: var(--at-surface-2, #1e252e); }
+  }
+
+  .mat-column-entry_price,
+  .mat-column-ltp,
+  .mat-column-unrealized_pnl {
+    font-family: var(--at-font-mono, 'JetBrains Mono', monospace);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+// SL proximity bar
+.sl-bar-cell { min-width: 80px; }
+
+.sl-bar-track {
+  width: 100%;
+  height: 5px;
+  background: var(--at-surface-3, #2a3240);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.sl-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 300ms ease, background 300ms ease;
+
+  &.safe  { background: var(--at-profit,  #4caf50); }
+  &.warn  { background: var(--at-warn-color, #ffc107); }
+  &.danger { background: var(--at-loss,   #f44336); }
+}

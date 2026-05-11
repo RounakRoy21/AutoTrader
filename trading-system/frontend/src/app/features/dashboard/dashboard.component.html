@@ -1,230 +1,404 @@
-<div class="dashboard-grid">
-  <!-- Agent Status -->
-  <mat-card class="status-card">
-    <mat-card-header>
-      <mat-card-title>System Status</mat-card-title>
-      <span class="status-header-spacer"></span>
-      <span class="market-status-badge" [ngClass]="marketStatusClass">
-        <span class="market-dot"></span>{{ marketStatusLabel }}
+﻿<div class="dashboard-wrapper">
+
+  <!-- â”€â”€ KPI Strip â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ -->
+  <div class="at-kpi-strip">
+    <div class="at-kpi-tile">
+      <span class="kpi-label">NET P&L TODAY</span>
+      <span class="kpi-value at-mono at-pnl-hero"
+            [class.at-profit]="totalPnl >= 0"
+            [class.at-loss]="totalPnl < 0"
+            [class.at-flash-profit]="totalPnl > 0"
+            [class.at-flash-loss]="totalPnl < 0">
+        ₹{{ totalPnl | number:'1.0-0' }}
       </span>
-    </mat-card-header>
-    <mat-card-content>
-      <div class="status-row">
-        <span class="status-dot" [class.active]="agentStatus.research_agent.status === 'ACTIVE'"></span>
-        <span>Research Agent: <strong>{{ agentStatus.research_agent.status }}</strong></span>
-      </div>
-      <div class="status-row">
-        <span class="status-dot" [class.active]="agentStatus.trading_agent.status === 'ACTIVE'"></span>
-        <span>Trading Agent: <strong>{{ agentStatus.trading_agent.status }}</strong></span>
-      </div>
-      <div class="status-row">
-        <span class="status-dot" [class.active]="agentStatus.risk_manager.status === 'ACTIVE'"></span>
-        <span>Risk Manager: <strong>{{ agentStatus.risk_manager.status }}</strong></span>
-      </div>
+      <span class="kpi-sub" [class.at-profit]="totalPnl >= 0" [class.at-loss]="totalPnl < 0">
+        {{ (totalPnl / 100000 * 100) | number:'1.2-2' }}%
+      </span>
+    </div>
+    <div class="at-kpi-tile">
+      <span class="kpi-label">OPEN POSITIONS</span>
+      <span class="kpi-value at-mono">{{ openPositions.length }} / {{ maxPositions }}</span>
+      <span class="kpi-sub">slots used</span>
+    </div>
+    <div class="at-kpi-tile">
+      <span class="kpi-label">TODAY'S RECORD</span>
+      <span class="kpi-value at-mono">{{ agentStatus.trading_agent.daily_trade_count }} / {{ maxTrades }}</span>
+      <span class="kpi-sub">trades executed</span>
+    </div>
+    <div class="at-kpi-tile" [class.kpi-warn]="drawdownPct >= 50" [class.kpi-danger]="drawdownPct >= 80">
+      <span class="kpi-label">DRAWDOWN</span>
+      <span class="kpi-value at-mono" [class.at-loss]="drawdownPct >= 50">{{ drawdownPct | number:'1.1-1' }}%</span>
+      <span class="kpi-sub">of daily limit</span>
+    </div>
+  </div>
 
-      <div class="status-row halt-row" *ngIf="agentStatus.trading_agent.trading_halted">
-        <mat-icon color="warn">warning</mat-icon>
-        <span class="loss">&nbsp;TRADING HALTED</span>
-      </div>
+  <!-- â”€â”€ Dashboard grid â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ -->
+  <div class="dashboard-grid">
 
-      <!-- Drawdown bar -->
-      <div class="drawdown-section" *ngIf="agentStatus.risk_manager">
-        <div class="drawdown-label"
-             [matTooltip]="drawdownTooltip"
-             matTooltipClass="multiline-tooltip"
-             matTooltipPosition="above">
-          Daily Drawdown: {{ drawdownPct | number:'1.1-1' }}%
-          <mat-icon class="info-icon" inline>info_outline</mat-icon>
-          <span class="drawdown-loss"
-                *ngIf="agentStatus.risk_manager.daily_loss > 0">
-            (₹{{ agentStatus.risk_manager.daily_loss | number:'1.0-0' }} lost)
+    <!-- Agent Status -->
+    <mat-card class="status-card" [class.halted]="agentStatus.trading_agent.trading_halted">
+      <mat-card-header>
+        <mat-card-title>System Status</mat-card-title>
+        <span class="status-header-spacer"></span>
+        <span class="market-status-badge" [ngClass]="marketStatusClass">
+          <span class="market-dot at-pulse" *ngIf="agentStatus.market_status?.status === 'OPEN' || agentStatus.market_status?.status === 'PRE_OPEN'"></span>
+          <span class="market-dot" *ngIf="agentStatus.market_status?.status !== 'OPEN' && agentStatus.market_status?.status !== 'PRE_OPEN'"></span>
+          {{ marketStatusLabel }}
+        </span>
+      </mat-card-header>
+      <mat-card-content>
+
+        <!-- HALT banner -->
+        <div class="halt-banner" *ngIf="agentStatus.trading_agent.trading_halted">
+          <mat-icon>warning</mat-icon>
+          <span>TRADING HALTED â€” all new entries blocked</span>
+        </div>
+
+        <div class="status-row">
+          <span class="status-dot at-pulse" [class.active]="agentStatus.research_agent.status === 'ACTIVE'"
+                [class.inactive]="agentStatus.research_agent.status !== 'ACTIVE'"></span>
+          <span>Research Agent: <strong>{{ agentStatus.research_agent.status }}</strong></span>
+        </div>
+        <div class="status-row">
+          <span class="status-dot at-pulse" [class.active]="agentStatus.trading_agent.status === 'ACTIVE'"
+                [class.inactive]="agentStatus.trading_agent.status !== 'ACTIVE'"></span>
+          <span>Trading Agent: <strong>{{ agentStatus.trading_agent.status }}</strong></span>
+        </div>
+        <div class="status-row">
+          <span class="status-dot" [class.active]="agentStatus.risk_manager.status === 'ACTIVE'"
+                [class.inactive]="agentStatus.risk_manager.status !== 'ACTIVE'"></span>
+          <span>Risk Manager: <strong>{{ agentStatus.risk_manager.status }}</strong></span>
+        </div>
+
+        <!-- Drawdown bar with three-marker display -->
+        <div class="drawdown-section" *ngIf="agentStatus.risk_manager">
+          <div class="drawdown-header"
+               [matTooltip]="drawdownTooltip"
+               matTooltipClass="multiline-tooltip"
+               matTooltipPosition="above">
+            <span>Daily Drawdown</span>
+            <span class="drawdown-pct" [class.at-loss]="drawdownPct >= 50">
+              {{ drawdownPct | number:'1.1-1' }}%
+              <mat-icon class="info-icon" inline>info_outline</mat-icon>
+            </span>
+          </div>
+          <div class="drawdown-bar-track">
+            <div class="drawdown-bar-fill"
+                 [style.width.%]="drawdownPct"
+                 [class.fill-safe]="drawdownPct < 50"
+                 [class.fill-warn]="drawdownPct >= 50 && drawdownPct < 80"
+                 [class.fill-danger]="drawdownPct >= 80">
+            </div>
+            <span class="drawdown-marker" style="left:50%">50%</span>
+            <span class="drawdown-marker" style="left:80%">80%</span>
+          </div>
+          <div class="drawdown-loss" *ngIf="agentStatus.risk_manager.daily_loss > 0">
+            ₹{{ agentStatus.risk_manager.daily_loss | number:'1.0-0' }} realised loss today
+          </div>
+        </div>
+
+        <div class="halt-controls">
+          <button mat-stroked-button color="warn"
+                  (click)="halt()"
+                  [disabled]="agentStatus.trading_agent.trading_halted">
+            Halt Trades
+          </button>
+          <button mat-stroked-button color="primary"
+                  (click)="resume()"
+                  [disabled]="!agentStatus.trading_agent.trading_halted">
+            Resume Trades
+          </button>
+        </div>
+        <div class="agent-controls">
+          <button mat-flat-button color="primary"
+                  (click)="startAgent()"
+                  [disabled]="agentStatus.trading_agent.status === 'ACTIVE' || agentActionInProgress">
+            <mat-icon>play_arrow</mat-icon> Start Agent
+          </button>
+          <button mat-flat-button color="warn"
+                  (click)="stopAgent()"
+                  [disabled]="agentStatus.trading_agent.status !== 'ACTIVE' || agentActionInProgress">
+            <mat-icon>stop</mat-icon> Stop Agent
+          </button>
+        </div>
+      </mat-card-content>
+    </mat-card>
+
+    <!-- Live P&L Ticker -->
+    <mat-card class="pnl-card">
+      <mat-card-header>
+        <mat-card-title>Today's P&L</mat-card-title>
+      </mat-card-header>
+      <mat-card-content>
+        <div class="pnl-hero-row">
+          <span class="at-pnl-hero at-mono"
+                [class.at-profit]="totalPnl >= 0"
+                [class.at-loss]="totalPnl < 0">
+            ₹{{ totalPnl | number:'1.2-2' }}
           </span>
         </div>
-        <mat-progress-bar
-          [mode]="'determinate'"
-          [value]="drawdownPct"
-          [color]="drawdownColor">
-        </mat-progress-bar>
-      </div>
+        <div class="pnl-breakdown">
+          <div class="pnl-item">
+            <span class="pnl-item-label">REALISED</span>
+            <span class="pnl-item-value at-mono"
+                  [class.at-profit]="todayPnl >= 0"
+                  [class.at-loss]="todayPnl < 0">₹{{ todayPnl | number:'1.0-0' }}</span>
+          </div>
+          <div class="pnl-divider"></div>
+          <div class="pnl-item">
+            <span class="pnl-item-label">UNREALISED</span>
+            <span class="pnl-item-value at-mono"
+                  [class.at-profit]="unrealizedPnl >= 0"
+                  [class.at-loss]="unrealizedPnl < 0">₹{{ unrealizedPnl | number:'1.0-0' }}</span>
+          </div>
+          <div class="pnl-divider"></div>
+          <div class="pnl-item">
+            <span class="pnl-item-label">POSITIONS</span>
+            <span class="pnl-item-value at-mono">{{ openPositions.length }}/{{ maxPositions }}</span>
+          </div>
+        </div>
+      </mat-card-content>
+    </mat-card>
 
-      <div class="halt-controls">
-        <button mat-stroked-button color="warn"
-                (click)="halt()"
-                [disabled]="agentStatus.trading_agent.trading_halted">
-          Halt Trades
-        </button>
-        <button mat-stroked-button color="primary"
-                (click)="resume()"
-                [disabled]="!agentStatus.trading_agent.trading_halted">
-          Resume Trades
-        </button>
-      </div>
-      <div class="agent-controls">
-        <button mat-flat-button color="primary"
-                (click)="startAgent()"
-                [disabled]="agentStatus.trading_agent.status === 'ACTIVE' || agentActionInProgress">
-          <mat-icon>play_arrow</mat-icon> Start Agent
-        </button>
-        <button mat-flat-button color="warn"
-                (click)="stopAgent()"
-                [disabled]="agentStatus.trading_agent.status !== 'ACTIVE' || agentActionInProgress">
-          <mat-icon>stop</mat-icon> Stop Agent
-        </button>
-      </div>
-    </mat-card-content>
-  </mat-card>
-
-  <!-- Live P&L Ticker -->
-  <mat-card class="pnl-card">
-    <mat-card-header>
-      <mat-card-title>Today's P&L</mat-card-title>
-    </mat-card-header>
-    <mat-card-content>
-      <div class="pnl-value" [class.profit]="totalPnl >= 0" [class.loss]="totalPnl < 0">
-        ₹{{ totalPnl | number:'1.2-2' }}
-      </div>
-      <div class="pnl-breakdown">
-        <span>Realised: <span [class.profit]="todayPnl >= 0" [class.loss]="todayPnl < 0">₹{{ todayPnl | number:'1.0-0' }}</span></span>
-        <span>Unrealised: <span [class.profit]="unrealizedPnl >= 0" [class.loss]="unrealizedPnl < 0">₹{{ unrealizedPnl | number:'1.0-0' }}</span></span>
-      </div>
-      <div class="pnl-detail">
-        Open Positions: {{ openPositions.length }} / {{ maxPositions }}
-      </div>
-    </mat-card-content>
-  </mat-card>
-
-  <!-- Market Brief Summary -->
-  <mat-card class="brief-card">
-    <mat-card-header>
-      <mat-card-title>Market Brief</mat-card-title>
-      <mat-card-subtitle *ngIf="brief">{{ brief.generated_at.slice(0, 5) }} &mdash; {{ brief.date | date:'d MMM y' }}</mat-card-subtitle>
-      <span class="brief-header-spacer"></span>
-      <button mat-icon-button
-              [matTooltip]="brief ? 'Refresh market brief' : 'Generate market brief'"
-              (click)="runBrief()"
-              [disabled]="briefRunInProgress">
-        <mat-icon *ngIf="!briefRunInProgress">refresh</mat-icon>
-        <mat-spinner *ngIf="briefRunInProgress" diameter="20"></mat-spinner>
-      </button>
-    </mat-card-header>
-    <mat-card-content>
-      <!-- Empty state -->
-      <div class="brief-empty" *ngIf="!brief">
-        <mat-icon>wb_sunny</mat-icon>
-        <p>No market brief for today.</p>
-        <button mat-stroked-button color="primary"
+    <!-- Market Brief Summary -->
+    <mat-card class="brief-card">
+      <mat-card-header>
+        <mat-card-title>Market Brief</mat-card-title>
+        <mat-card-subtitle *ngIf="brief">{{ brief.generated_at.slice(0, 5) }} &mdash; {{ brief.date | date:'d MMM y' }}</mat-card-subtitle>
+        <span class="brief-header-spacer"></span>
+        <button mat-icon-button
+                [matTooltip]="brief ? 'Refresh market brief' : 'Generate market brief'"
                 (click)="runBrief()"
                 [disabled]="briefRunInProgress">
-          <mat-spinner *ngIf="briefRunInProgress" diameter="16" style="display:inline-block;margin-right:6px"></mat-spinner>
-          {{ briefRunInProgress ? 'Generating...' : 'Run Research Agent' }}
+          <mat-icon *ngIf="!briefRunInProgress">refresh</mat-icon>
+          <mat-spinner *ngIf="briefRunInProgress" diameter="20"></mat-spinner>
         </button>
-      </div>
-      <div class="brief-top-row" *ngIf="brief">
-        <div class="bias-badge" [ngClass]="brief.market_bias.toLowerCase()">
-          {{ brief.market_bias }} ({{ brief.bias_confidence }}%)
+      </mat-card-header>
+      <mat-card-content>
+        <!-- Empty state -->
+        <div class="brief-empty" *ngIf="!brief">
+          <mat-icon>wb_sunny</mat-icon>
+          <p>No market brief for today.</p>
+          <button mat-stroked-button color="primary"
+                  (click)="runBrief()"
+                  [disabled]="briefRunInProgress">
+            <mat-spinner *ngIf="briefRunInProgress" diameter="16" style="display:inline-block;margin-right:6px"></mat-spinner>
+            {{ briefRunInProgress ? 'Generating...' : 'Run Research Agent' }}
+          </button>
         </div>
-        <!-- VIX regime badge -->
-        <div *ngIf="vixValue !== null" class="vix-badge" [ngClass]="vixRegimeClass"
-             [matTooltip]="'India VIX: ' + (vixValue | number:'1.1-1')">
-          VIX {{ vixValue | number:'1.1-1' }}
-          <span class="vix-regime">{{ vixRegime }}</span>
-        </div>
-      </div>
 
-      <!-- Recommended stance -->
-      <div *ngIf="brief?.recommended_stance" class="stance-row">
-        <mat-icon class="stance-icon">policy</mat-icon>
-        <span class="stance-label">Stance:</span>
-        <span class="stance-value" [class.stance-avoid]="brief?.recommended_stance === 'AVOID_TRADING'"
-                                    [class.stance-half]="brief?.recommended_stance === 'HALF_SIZE_POSITIONS'">
-          {{ stanceLabel }}
-        </span>
-      </div>
+        <div *ngIf="brief">
+          <div class="brief-top-row">
+            <div class="bias-badge" [ngClass]="brief.market_bias.toLowerCase()">
+              {{ brief.market_bias }}
+            </div>
+            <!-- Confidence bar under bias badge -->
+            <div class="confidence-wrap">
+              <div class="confidence-bar-track">
+                <div class="confidence-bar-fill" [style.width.%]="brief.bias_confidence"
+                     [class.conf-high]="brief.bias_confidence >= 70"
+                     [class.conf-mid]="brief.bias_confidence >= 40 && brief.bias_confidence < 70"
+                     [class.conf-low]="brief.bias_confidence < 40"></div>
+              </div>
+              <span class="confidence-label at-mono">{{ brief.bias_confidence }}%</span>
+            </div>
+            <!-- VIX regime badge -->
+            <div *ngIf="vixValue !== null" class="vix-badge" [ngClass]="vixRegimeClass"
+                 [matTooltip]="'India VIX: ' + (vixValue | number:'1.1-1')">
+              VIX {{ vixValue | number:'1.1-1' }}
+              <span class="vix-regime">{{ vixRegime }}</span>
+            </div>
+          </div>
 
-      <div class="brief-signals" *ngIf="brief">
-        <div *ngIf="brief.fii_signal"><strong>FII/DII:</strong> {{ brief.fii_signal }}</div>
-        <div *ngIf="brief.sgx_nifty_signal"><strong>SGX Nifty:</strong> {{ brief.sgx_nifty_signal }}</div>
-        <div *ngIf="brief.dxy_signal"><strong>DXY:</strong> {{ brief.dxy_signal }}</div>
-        <div *ngIf="brief.us_markets_signal"><strong>US Markets:</strong> {{ brief.us_markets_signal }}</div>
-      </div>
-      <div class="watchlist" *ngIf="brief?.watchlist?.length">
-        <strong>Watchlist:</strong>
-        <mat-chip-set>
-          <mat-chip *ngFor="let s of brief!.watchlist" highlighted>{{ s }}</mat-chip>
-        </mat-chip-set>
-      </div>
-      <div class="avoid-list" *ngIf="brief?.avoid_list?.length">
-        <strong>Avoid:</strong>
-        <mat-chip-set>
-          <mat-chip *ngFor="let s of brief!.avoid_list" color="warn">{{ s }}</mat-chip>
-        </mat-chip-set>
-      </div>
-    </mat-card-content>
-  </mat-card>
+          <!-- Recommended stance -->
+          <div *ngIf="brief?.recommended_stance" class="stance-row">
+            <mat-icon class="stance-icon">policy</mat-icon>
+            <span class="stance-label">Stance:</span>
+            <span class="stance-badge"
+                  [class.stance-avoid]="brief.recommended_stance === 'AVOID_TRADING'"
+                  [class.stance-half]="brief.recommended_stance === 'HALF_SIZE_POSITIONS'"
+                  [class.stance-normal]="brief.recommended_stance !== 'AVOID_TRADING' && brief.recommended_stance !== 'HALF_SIZE_POSITIONS'">
+              {{ stanceLabel }}
+            </span>
+          </div>
 
-  <!-- Quick Stats -->
-  <mat-card class="stats-card">
-    <mat-card-header>
-      <mat-card-title>Quick Stats</mat-card-title>
-    </mat-card-header>
-    <mat-card-content>
-      <div class="stat-item">
-        <span class="stat-label">Trades Today</span>
-        <span class="stat-value" [class.loss]="agentStatus.trading_agent.daily_trade_count >= maxTrades">
-          {{ agentStatus.trading_agent.daily_trade_count }} / {{ maxTrades }}
-        </span>
-      </div>
-      <div class="stat-item">
-        <span class="stat-label">Win Rate (30d)</span>
-        <span class="stat-value">{{ winRate | number:'1.1-1' }}%</span>
-      </div>
-      <div class="stat-divider"></div>
-      <div class="stat-item"
-           [matTooltip]="buildAnthropicTooltip(agentStatus.anthropic)">
-        <span class="stat-label">Anthropic API (today)</span>
-        <span class="stat-value"
-              [class.loss]="(agentStatus.anthropic?.calls_total_today ?? 0) >= 40">
-          {{ agentStatus.anthropic?.calls_total_today ?? 0 }}
-          <span class="stat-sub">/ {{ agentStatus.anthropic?.calls_research_today ?? 0 }}R&nbsp;+&nbsp;{{ agentStatus.anthropic?.calls_decision_today ?? 0 }}D</span>
-        </span>
-      </div>
-    </mat-card-content>
-  </mat-card>
+          <!-- 2Ã—2 signal grid -->
+          <div class="signal-grid">
+            <div class="signal-cell" *ngIf="brief.fii_signal">
+              <span class="signal-key">FII/DII</span>
+              <span class="signal-val">{{ brief.fii_signal }}</span>
+            </div>
+            <div class="signal-cell" *ngIf="brief.sgx_nifty_signal">
+              <span class="signal-key">SGX Nifty</span>
+              <span class="signal-val">{{ brief.sgx_nifty_signal }}</span>
+            </div>
+            <div class="signal-cell" *ngIf="brief.dxy_signal">
+              <span class="signal-key">DXY</span>
+              <span class="signal-val">{{ brief.dxy_signal }}</span>
+            </div>
+            <div class="signal-cell" *ngIf="brief.us_markets_signal">
+              <span class="signal-key">US Mkts</span>
+              <span class="signal-val">{{ brief.us_markets_signal }}</span>
+            </div>
+          </div>
 
-  <!-- System Health -->
-  <mat-card class="health-card">
-    <mat-card-header>
-      <mat-card-title>System Health</mat-card-title>
-    </mat-card-header>
-    <mat-card-content>
-      <div *ngIf="health; else healthLoading">
-        <div class="health-row">
-          <mat-icon [ngClass]="healthStatusClass(health.database)">{{ healthIcon(health.database) }}</mat-icon>
-          <span>PostgreSQL</span>
-          <span class="health-label">{{ health.database }}</span>
+          <div class="watchlist" *ngIf="brief?.watchlist?.length">
+            <strong>Watchlist:</strong>
+            <mat-chip-set>
+              <mat-chip *ngFor="let s of brief!.watchlist" class="chip-watch">{{ s }}</mat-chip>
+            </mat-chip-set>
+          </div>
+          <div class="avoid-list" *ngIf="brief?.avoid_list?.length">
+            <strong>Avoid:</strong>
+            <mat-chip-set>
+              <mat-chip *ngFor="let s of brief!.avoid_list" class="chip-avoid">{{ s }}</mat-chip>
+            </mat-chip-set>
+          </div>
         </div>
-        <div class="health-row">
-          <mat-icon [ngClass]="healthStatusClass(health.redis)">{{ healthIcon(health.redis) }}</mat-icon>
-          <span>Redis</span>
-          <span class="health-label">{{ health.redis }}</span>
-        </div>
-        <div class="health-row">
-          <mat-icon [ngClass]="healthStatusClass(health.groww_api)">{{ healthIcon(health.groww_api) }}</mat-icon>
-          <span>Groww API</span>
-          <span class="health-label">{{ health.groww_api }}</span>
-        </div>
-      </div>
-      <ng-template #healthLoading>
-        <div class="health-loading">
-          <mat-spinner diameter="24"></mat-spinner>
-          <span>Checking...</span>
-        </div>
-      </ng-template>
-    </mat-card-content>
-  </mat-card>
+      </mat-card-content>
+    </mat-card>
 
-  <!-- System Alerts — spans full grid width -->
-  <div class="alerts-panel">
-    <app-system-alerts></app-system-alerts>
+    <!-- Quick Stats -->
+    <mat-card class="stats-card">
+      <mat-card-header>
+        <mat-card-title>Quick Stats</mat-card-title>
+      </mat-card-header>
+      <mat-card-content>
+        <div class="stat-item">
+          <span class="stat-label">Trades Today</span>
+          <span class="stat-value at-mono" [class.at-loss]="agentStatus.trading_agent.daily_trade_count >= maxTrades">
+            {{ agentStatus.trading_agent.daily_trade_count }} / {{ maxTrades }}
+          </span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-label">Win Rate (30d)</span>
+          <span class="stat-value at-mono">{{ winRate | number:'1.1-1' }}%</span>
+        </div>
+        <div class="stat-divider"></div>
+        <div class="stat-item"
+             [matTooltip]="buildAnthropicTooltip(agentStatus.anthropic)">
+          <span class="stat-label">Anthropic API (today)</span>
+          <span class="stat-value at-mono"
+                [class.at-loss]="(agentStatus.anthropic?.calls_total_today ?? 0) >= 40">
+            {{ agentStatus.anthropic?.calls_total_today ?? 0 }}
+            <span class="stat-sub">/ {{ agentStatus.anthropic?.calls_research_today ?? 0 }}R&nbsp;+&nbsp;{{ agentStatus.anthropic?.calls_decision_today ?? 0 }}D</span>
+          </span>
+        </div>
+      </mat-card-content>
+    </mat-card>
+
+    <!-- System Health -->
+    <mat-card class="health-card">
+      <mat-card-header>
+        <mat-card-title>System Health</mat-card-title>
+      </mat-card-header>
+      <mat-card-content>
+        <div *ngIf="health; else healthLoading">
+          <div class="health-row">
+            <mat-icon [ngClass]="healthStatusClass(health.database)">{{ healthIcon(health.database) }}</mat-icon>
+            <span>PostgreSQL</span>
+            <span class="health-label">{{ health.database }}</span>
+          </div>
+          <div class="health-row">
+            <mat-icon [ngClass]="healthStatusClass(health.redis)">{{ healthIcon(health.redis) }}</mat-icon>
+            <span>Redis</span>
+            <span class="health-label">{{ health.redis }}</span>
+          </div>
+          <div class="health-row">
+            <mat-icon [ngClass]="healthStatusClass(health.groww_api)">{{ healthIcon(health.groww_api) }}</mat-icon>
+            <span>Groww API</span>
+            <span class="health-label">{{ health.groww_api }}</span>
+          </div>
+        </div>
+        <ng-template #healthLoading>
+          <div class="health-loading">
+            <mat-spinner diameter="24"></mat-spinner>
+            <span>Checking...</span>
+          </div>
+        </ng-template>
+      </mat-card-content>
+    </mat-card>
+
+    <!-- Strategy Health â€” full width -->
+    <mat-card class="strategy-health-card">
+      <mat-card-header>
+        <mat-card-title>Strategy Health (30d)</mat-card-title>
+      </mat-card-header>
+      <mat-card-content>
+        <div class="sh-strip">
+          <div class="sh-tile">
+            <span class="sh-label">PROFIT FACTOR</span>
+            <span class="sh-value at-mono"
+                  [class.at-profit]="strategyProfitFactor !== null && strategyProfitFactor >= 1.5"
+                  [class.at-loss]="strategyProfitFactor !== null && strategyProfitFactor < 1">
+              {{ strategyProfitFactor !== null ? (strategyProfitFactor | number:'1.2-2') : 'â€”' }}
+            </span>
+          </div>
+          <div class="sh-tile">
+            <span class="sh-label">WIN RATE</span>
+            <span class="sh-value at-mono"
+                  [class.at-profit]="winRate >= 55"
+                  [class.at-loss]="winRate < 40">
+              {{ winRate | number:'1.1-1' }}%
+            </span>
+          </div>
+          <div class="sh-tile">
+            <span class="sh-label">AVG R:R</span>
+            <span class="sh-value at-mono"
+                  [class.at-profit]="strategyAvgRR !== null && strategyAvgRR >= 1.5"
+                  [class.at-loss]="strategyAvgRR !== null && strategyAvgRR < 1">
+              {{ strategyAvgRR !== null ? strategyAvgRR : 'â€”' }}
+            </span>
+          </div>
+          <div class="sh-tile">
+            <span class="sh-label">ROLLING SHARPE</span>
+            <span class="sh-value at-mono"
+                  [class.at-profit]="strategySharpe !== null && strategySharpe >= 1"
+                  [class.at-loss]="strategySharpe !== null && strategySharpe < 0">
+              {{ strategySharpe !== null ? (strategySharpe | number:'1.2-2') : 'â€”' }}
+            </span>
+          </div>
+          <div class="sh-tile sh-loss-dist">
+            <span class="sh-label">LOSS DISTRIBUTION</span>
+            <div class="sh-bars">
+              <div class="sh-bar-wrap" matTooltip="Before 10:30">
+                <span class="sh-bar-label">Early</span>
+                <div class="sh-bar-track">
+                  <div class="sh-bar-fill" [style.width.%]="lossDistPct(strategyLossEarly)"></div>
+                </div>
+                <span class="sh-bar-val at-mono">{{ strategyLossEarly }}</span>
+              </div>
+              <div class="sh-bar-wrap" matTooltip="10:30 â€” 13:30">
+                <span class="sh-bar-label">Mid</span>
+                <div class="sh-bar-track">
+                  <div class="sh-bar-fill" [style.width.%]="lossDistPct(strategyLossMid)"></div>
+                </div>
+                <span class="sh-bar-val at-mono">{{ strategyLossMid }}</span>
+              </div>
+              <div class="sh-bar-wrap" matTooltip="After 13:30">
+                <span class="sh-bar-label">Late</span>
+                <div class="sh-bar-track">
+                  <div class="sh-bar-fill" [style.width.%]="lossDistPct(strategyLossLate)"></div>
+                </div>
+                <span class="sh-bar-val at-mono">{{ strategyLossLate }}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </mat-card-content>
+    </mat-card>
+    <!-- Decision Feed widget — spans full grid width -->
+    <mat-card class="decision-feed-widget-card">
+      <mat-card-header>
+        <mat-card-title>Recent Decisions</mat-card-title>
+      </mat-card-header>
+      <mat-card-content>
+        <app-decision-feed mode="widget"></app-decision-feed>
+      </mat-card-content>
+    </mat-card>
+    <!-- System Alerts â€” spans full grid width -->
+    <div class="alerts-panel">
+      <app-system-alerts></app-system-alerts>
+    </div>
   </div>
 </div>

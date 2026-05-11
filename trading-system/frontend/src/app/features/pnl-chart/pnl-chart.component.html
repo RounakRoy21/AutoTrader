@@ -15,7 +15,8 @@
       [datasets]="chartData.datasets"
       [labels]="chartData.labels"
       [options]="chartOptions"
-      [type]="chartType">
+      [type]="chartType"
+      (chartClick)="onBarClick($event)">
     </canvas>
   </mat-card-content>
 </mat-card>

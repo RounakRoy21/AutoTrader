@@ -15,10 +15,9 @@ export class ThemeService {
   constructor(rendererFactory: RendererFactory2) {
     this.renderer = rendererFactory.createRenderer(null, null);
     const saved = localStorage.getItem('at-theme');
-    const prefersDark = window.matchMedia?.('(prefers-color-scheme: dark)').matches ?? false;
-    if (saved === 'dark' || (!saved && prefersDark)) {
-      this._apply(true);
-    }
+    // Default to dark; only go light when the user has explicitly saved 'light'.
+    const isDark = saved !== 'light';
+    this._apply(isDark);
   }
 
   toggle(): void {

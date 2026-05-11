@@ -18,6 +18,7 @@ import { MatTooltipModule } from '@angular/material/tooltip';
 import { MatDialogModule, MatDialog } from '@angular/material/dialog';
 import { MatSnackBar } from '@angular/material/snack-bar';
 import { MatSnackBarModule } from '@angular/material/snack-bar';
+import { BreakpointObserver } from '@angular/cdk/layout';
 
 import { StateService } from '../../core/services/state.service';
 import { ApiService } from '../../core/services/api.service';
@@ -45,18 +46,13 @@ export class OpenPositionsComponent implements OnInit, OnDestroy {
   maxPositions = 3;
   loading = true;
   closingId: number | null = null;
-  displayedColumns = [
-    'stock',
-    'direction',
-    'quantity',
-    'entry_price',
-    'ltp',
-    'unrealized_pnl',
-    'stop_loss_price',
-    'target_price',
-    'entry_time',
-    'close',
+
+  private readonly ALL_COLUMNS = [
+    'stock', 'direction', 'quantity', 'entry_price', 'ltp',
+    'unrealized_pnl', 'stop_loss_price', 'target_price', 'entry_time', 'close',
   ];
+  private readonly MOBILE_COLUMNS = ['stock', 'direction', 'ltp', 'unrealized_pnl', 'close'];
+  displayedColumns = this.ALL_COLUMNS;
 
   constructor(
     private state: StateService,
@@ -64,9 +60,16 @@ export class OpenPositionsComponent implements OnInit, OnDestroy {
     private dialog: MatDialog,
     private snackBar: MatSnackBar,
     private cdr: ChangeDetectorRef,
+    private bp: BreakpointObserver,
   ) {}
 
   ngOnInit(): void {
+    this.bp.observe(['(max-width: 768px)'])
+      .pipe(takeUntil(this.destroy$))
+      .subscribe(r => {
+        this.displayedColumns = r.matches ? this.MOBILE_COLUMNS : this.ALL_COLUMNS;
+        this.cdr.markForCheck();
+      });
     combineLatest([
       this.state.openPositions$,
       this.state.ltpMap$,
@@ -84,6 +87,18 @@ export class OpenPositionsComponent implements OnInit, OnDestroy {
         this.maxPositions = s.config?.max_open_positions ?? 3;
         this.cdr.markForCheck();
       });
+  }
+
+  slProximityPct(row: PositionRow): number {
+    const ltp = row.ltp ?? row.entry_price;
+    const sl = row.stop_loss_price;
+    if (!sl) return 0;
+    const range = Math.abs(row.entry_price - sl);
+    if (range === 0) return 0;
+    const used = row.direction === 'BUY'
+      ? row.entry_price - ltp
+      : ltp - row.entry_price;
+    return Math.max(0, Math.min(100, (used / range) * 100));
   }
 
   closePosition(row: PositionRow): void {

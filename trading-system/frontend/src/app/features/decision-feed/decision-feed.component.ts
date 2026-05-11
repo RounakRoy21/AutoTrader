@@ -2,6 +2,7 @@ import {
   ChangeDetectionStrategy,
   ChangeDetectorRef,
   Component,
+  Input,
   OnDestroy,
   OnInit,
 } from '@angular/core';
@@ -41,6 +42,9 @@ export class DecisionFeedComponent implements OnInit, OnDestroy {
   private static readonly FALLBACK_SYNC_MS = 300_000;
 
   private destroy$ = new Subject<void>();
+
+  /** 'page' = full routed view; 'widget' = compact embedded card */
+  @Input() mode: 'page' | 'widget' = 'page';
 
   decisions: DecisionEntry[] = [];
   loading = true;

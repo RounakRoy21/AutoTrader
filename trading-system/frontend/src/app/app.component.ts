@@ -1,8 +1,8 @@
-import { Component, OnInit, OnDestroy } from '@angular/core';
+﻿import { Component, OnInit, OnDestroy } from '@angular/core';
 import { RouterOutlet, RouterLink, RouterLinkActive, Router, NavigationStart, NavigationEnd, NavigationCancel, NavigationError } from '@angular/router';
 import { CommonModule, AsyncPipe } from '@angular/common';
-import { Subject } from 'rxjs';
-import { takeUntil } from 'rxjs/operators';
+import { Subject, Observable, interval } from 'rxjs';
+import { takeUntil, map, shareReplay } from 'rxjs/operators';
 
 import { MatToolbarModule } from '@angular/material/toolbar';
 import { MatSidenavModule } from '@angular/material/sidenav';
@@ -11,9 +11,9 @@ import { MatIconModule } from '@angular/material/icon';
 import { MatButtonModule } from '@angular/material/button';
 import { MatTooltipModule } from '@angular/material/tooltip';
 import { MatProgressBarModule } from '@angular/material/progress-bar';
+import { MatBadgeModule } from '@angular/material/badge';
+import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
 import { BreakpointObserver, Breakpoints } from '@angular/cdk/layout';
-import { Observable } from 'rxjs';
-import { map, shareReplay } from 'rxjs/operators';
 
 import { StateService } from './core/services/state.service';
 import { TradingWebSocketService, WsConnectionState } from './core/services/trading-websocket.service';
@@ -25,6 +25,7 @@ import { GrowwAuthBannerComponent } from './shared/groww-auth-banner/groww-auth-
   standalone: true,
   imports: [
     CommonModule,
+    AsyncPipe,
     RouterOutlet,
     RouterLink,
     RouterLinkActive,
@@ -35,6 +36,8 @@ import { GrowwAuthBannerComponent } from './shared/groww-auth-banner/groww-auth-
     MatButtonModule,
     MatTooltipModule,
     MatProgressBarModule,
+    MatBadgeModule,
+    MatSnackBarModule,
     GrowwAuthBannerComponent
 ],
   templateUrl: './app.component.html',
@@ -49,8 +52,10 @@ export class AppComponent implements OnInit, OnDestroy {
   paperTrading = false;
   routeLoading = false;
   isHandset = false;
+  decisionsUnread = 0;
+  currentTime$!: Observable<string>;
 
-  /** True when viewport ≤ 768px — drives sidenav mode + default open state. */
+  /** True when viewport â‰¤ 768px â€” drives sidenav mode + default open state. */
   isHandset$: Observable<boolean>;
 
   constructor(
@@ -59,6 +64,7 @@ export class AppComponent implements OnInit, OnDestroy {
     private router: Router,
     private breakpointObserver: BreakpointObserver,
     public themeService: ThemeService,
+    private snackBar: MatSnackBar,
   ) {
     this.isHandset$ = this.breakpointObserver
       .observe([Breakpoints.Handset, '(max-width: 768px)'])
@@ -82,10 +88,51 @@ export class AppComponent implements OnInit, OnDestroy {
       .pipe(takeUntil(this.destroy$))
       .subscribe((v) => (this.paperTrading = v));
 
-    // Route-level loading indicator
+    // Live IST clock
+    this.currentTime$ = interval(1000).pipe(
+      map(() => new Date().toLocaleTimeString('en-IN', {
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        timeZone: 'Asia/Kolkata', hour12: false,
+      })),
+      takeUntil(this.destroy$),
+      shareReplay(1),
+    );
+
+    // Unread decisions badge â€” increment on WS push, reset on navigation to /decisions
+    this.ws.decisions$
+      .pipe(takeUntil(this.destroy$))
+      .subscribe((entry) => {
+        if (!this.router.url.startsWith('/decisions')) {
+          this.decisionsUnread = Math.min(this.decisionsUnread + 1, 99);
+        }
+        // EXECUTE toasts
+        if (entry.decision === 'EXECUTE') {
+          const dir = (entry as any).direction ?? '';
+          const msg = `ðŸš€ EXECUTE â€” ${entry.stock}${dir ? ' ' + dir : ''}`;
+          this.snackBar.open(msg, 'Dismiss', {
+            duration: 6000,
+            panelClass: ['at-snackbar-profit'],
+          });
+        }
+      });
+
+    // Trade event toasts
+    this.ws.trades$
+      .pipe(takeUntil(this.destroy$))
+      .subscribe((trade: any) => {
+        const pnl: number = trade?.realized_pnl ?? 0;
+        const sign = pnl >= 0 ? '+' : '';
+        const msg = `Trade: ${trade?.stock ?? ''} â€” ₹${sign}${pnl.toFixed(2)}`;
+        const cls = pnl >= 0 ? 'at-snackbar-profit' : 'at-snackbar-loss';
+        this.snackBar.open(msg, 'OK', { duration: 5000, panelClass: [cls] });
+      });
+
     this.router.events
       .pipe(takeUntil(this.destroy$))
       .subscribe((event) => {
+        if (event instanceof NavigationEnd && event.urlAfterRedirects.startsWith('/decisions')) {
+          this.decisionsUnread = 0;
+        }
         if (event instanceof NavigationStart) {
           this.routeLoading = true;
         } else if (
