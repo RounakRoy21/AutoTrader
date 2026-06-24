@@ -9,6 +9,7 @@ from datetime import date, datetime, time
 from typing import Optional
 
 from sqlalchemy import (
+    Boolean,
     Date,
     DateTime,
     Float,
@@ -51,6 +52,18 @@ class Trade(Base):
     exit_time: Mapped[Optional[time]] = mapped_column(Time, nullable=True)
     decision_rationale: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     gtt_trigger_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # ── Partial profit-booking / scale-out ────────────────────────────────────
+    # original_quantity preserves the full entry size for auditing once `quantity`
+    # is reduced to the remaining position after a partial book.  partial_target_price
+    # is the (immutable) price at which the scale-out fires; partial_booked guards
+    # against booking more than once; booked_pnl accumulates the net realised P&L of
+    # the booked leg(s) and is folded into realized_pnl when the position fully closes.
+    original_quantity: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    partial_target_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    partial_booked: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    booked_pnl: Mapped[Optional[float]] = mapped_column(Float, nullable=True, default=0.0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

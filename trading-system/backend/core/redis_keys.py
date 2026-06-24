@@ -55,3 +55,12 @@ INSTRUMENT_MAP_KEY = "groww_instrument_map"
 ANTHROPIC_CALLS_RESEARCH_KEY = "anthropic_calls:today:research"
 ANTHROPIC_CALLS_DECISION_KEY = "anthropic_calls:today:decision"
 
+# ── Market-data API health ─────────────────────────────────────────────────────
+# Tracks whether the Groww Live-Data / Historical REST API groups are reachable.
+# Written by the scanner OHLCV poll loop; read by /api/health and /api/agent/status
+# so the dashboard can surface a "data feed forbidden — trading paused" banner
+# instead of silently producing zero signals.
+DATA_API_STATUS_KEY = "data_api:status"      # "OK" | "FORBIDDEN" | "DEGRADED"
+DATA_API_DETAIL_KEY = "data_api:detail"      # last error message (human readable)
+DATA_API_LAST_OK_KEY = "data_api:last_ok"    # ISO timestamp of last successful poll
+

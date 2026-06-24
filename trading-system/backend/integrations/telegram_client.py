@@ -194,6 +194,30 @@ async def send_halt_alert(
     return await send_telegram("\n".join(lines))
 
 
+async def send_data_api_alert(forbidden: bool, detail: str = "") -> bool:
+    """Notify when the Groww market-data API group becomes forbidden or recovers.
+
+    A 403 on Live-Data / Historical means the Trading API subscription no longer
+    grants data access — the scanner cannot build VWAP / volume and emits zero
+    signals.  Surfacing this immediately avoids a silent trading blackout.
+    """
+    if forbidden:
+        lines = [
+            "🛑 <b>MARKET DATA FEED FORBIDDEN</b>",
+            "Groww Live-Data / Historical API returned 403 — no quotes/volume.",
+            "Scanner cannot generate signals; trading is effectively paused.",
+            "Check the Trading API subscription (Live Data + Historical).",
+        ]
+        if detail:
+            lines.append(f"<i>{detail[:120]}</i>")
+    else:
+        lines = [
+            "✅ <b>MARKET DATA FEED RESTORED</b>",
+            "Groww Live-Data API is reachable again — scanner resuming normal operation.",
+        ]
+    return await send_telegram("\n".join(lines))
+
+
 async def send_intraday_close_alert(
     n_positions: int = 0,
     running_pnl: Optional[float] = None,

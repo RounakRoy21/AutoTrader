@@ -55,7 +55,7 @@ export class AppComponent implements OnInit, OnDestroy {
   decisionsUnread = 0;
   currentTime$!: Observable<string>;
 
-  /** True when viewport â‰¤ 768px â€” drives sidenav mode + default open state. */
+  /** True when viewport â‰¤ 768px drives sidenav mode + default open state. */
   isHandset$: Observable<boolean>;
 
   constructor(
@@ -98,7 +98,7 @@ export class AppComponent implements OnInit, OnDestroy {
       shareReplay(1),
     );
 
-    // Unread decisions badge â€” increment on WS push, reset on navigation to /decisions
+    // Unread decisions badge increment on WS push, reset on navigation to /decisions
     this.ws.decisions$
       .pipe(takeUntil(this.destroy$))
       .subscribe((entry) => {
@@ -108,7 +108,7 @@ export class AppComponent implements OnInit, OnDestroy {
         // EXECUTE toasts
         if (entry.decision === 'EXECUTE') {
           const dir = (entry as any).direction ?? '';
-          const msg = `ðŸš€ EXECUTE â€” ${entry.stock}${dir ? ' ' + dir : ''}`;
+          const msg = `EXECUTE ${entry.stock}${dir ? ' ' + dir : ''}`;
           this.snackBar.open(msg, 'Dismiss', {
             duration: 6000,
             panelClass: ['at-snackbar-profit'],
@@ -122,7 +122,7 @@ export class AppComponent implements OnInit, OnDestroy {
       .subscribe((trade: any) => {
         const pnl: number = trade?.realized_pnl ?? 0;
         const sign = pnl >= 0 ? '+' : '';
-        const msg = `Trade: ${trade?.stock ?? ''} â€” ₹${sign}${pnl.toFixed(2)}`;
+        const msg = `Trade: ${trade?.stock ?? ''} ₹${sign}${pnl.toFixed(2)}`;
         const cls = pnl >= 0 ? 'at-snackbar-profit' : 'at-snackbar-loss';
         this.snackBar.open(msg, 'OK', { duration: 5000, panelClass: [cls] });
       });

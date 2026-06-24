@@ -180,11 +180,16 @@ class DecisionEngine:
     then delegates to Claude for the final approve/reduce/reject decision.
     """
 
+    PRECHECK_FEED_DEDUPE_SECS = 180
+    _PRECHECK_DEDUPE_MAX_KEYS = 500
+
     def __init__(self, signal_queue: asyncio.Queue) -> None:
         self._signal_queue = signal_queue
         self._settings = get_settings()
         self._market_brief: Optional[MarketBriefLLMOutput] = None
         self._running = False
+        # (stock + rationale) -> last feed push timestamp (IST)
+        self._precheck_feed_last: dict[str, datetime] = {}
 
     def set_market_brief(self, brief: MarketBriefLLMOutput) -> None:
         """Update the current Market Brief (called when Research Agent publishes)."""
@@ -218,6 +223,36 @@ class DecisionEngine:
         """Return True if the API key looks like a placeholder value."""
         placeholders = {"placeholder", "your-key-here", "xxxx", "sk-ant-api03-placeholder"}
         return not key or any(p in key.lower() for p in placeholders)
+
+    def _should_push_precheck_feed_entry(
+        self,
+        stock: str,
+        reason: str,
+        now_ist: datetime,
+    ) -> bool:
+        """Return True when this pre-check reject should be added to decision_feed.
+
+        Collapses repeated rejects with the same stock+reason within a short
+        window so the feed stays readable during fast scanner loops.
+        """
+        reason_norm = " ".join(reason.lower().split())
+        key = f"{stock}|{reason_norm}"
+
+        # Opportunistic pruning so this in-memory map stays bounded.
+        if len(self._precheck_feed_last) > self._PRECHECK_DEDUPE_MAX_KEYS:
+            cutoff_secs = self.PRECHECK_FEED_DEDUPE_SECS * 3
+            self._precheck_feed_last = {
+                k: ts
+                for k, ts in self._precheck_feed_last.items()
+                if (now_ist - ts).total_seconds() <= cutoff_secs
+            }
+
+        last = self._precheck_feed_last.get(key)
+        if last and (now_ist - last).total_seconds() < self.PRECHECK_FEED_DEDUPE_SECS:
+            return False
+
+        self._precheck_feed_last[key] = now_ist
+        return True
 
     def _mock_decision(self, signal: ScannerSignal) -> DecisionOutput:
         """
@@ -498,6 +533,22 @@ class DecisionEngine:
                     signal,
                 )
 
+        # Volume hard gate: do not burn LLM calls for signals that are
+        # deterministically invalid on liquidity.
+        if signal.volume_ratio < VOLUME_RATIO_HARD_REJECT:
+            if signal.volume_ratio <= 0:
+                return (
+                    False,
+                    "Volume ratio unavailable/zero — skipping LLM until OHLCV volume is present",
+                    signal,
+                )
+            return (
+                False,
+                f"Volume ratio {signal.volume_ratio:.2f}× below hard minimum "
+                f"{VOLUME_RATIO_HARD_REJECT:.1f}×",
+                signal,
+            )
+
         return True, "Pre-checks passed", signal
 
     async def _call_llm(self, signal: ScannerSignal) -> Optional[DecisionOutput]:
@@ -530,7 +581,8 @@ class DecisionEngine:
                     if f.urgency.value == "HIGH"
                 ],
             }
-            brief_summary = json.dumps(brief_for_llm, default=str)
+            # Serialised once below with orjson (_fast_dumps) — no eager json.dumps
+            # here, which would just be thrown away when brief_summary is rebuilt.
 
         # Use orjson for the LLM payload (3–5× faster than stdlib json).
         # Falls back to stdlib if orjson is not yet installed (during image rebuild).
@@ -808,24 +860,32 @@ class DecisionEngine:
         passed, reason, signal = await self._pre_check(signal)
         if not passed:
             logger.info("[DIAG] process_signal PRE_CHECK REJECT: %s — %s", signal.stock, reason)
+            now_ist = datetime.now(IST)
             # Only publish to system_alerts when the rejection reason carries actionable
             # information (risk rules, pauses, avoid-list).  Watchlist-filter misses and
             # outside-hours rejections are expected and normal — suppress them to avoid
             # flooding the alerts feed with 24/7 noise during extended-hours testing.
             _silent_reasons = ("not in today's watchlist", "Outside")
-            # Always record pre-check rejects in decision_feed for operator visibility,
-            # even when the corresponding system alert is intentionally suppressed.
-            await self._push_feed_entry(
-                signal,
-                stage="PRE_CHECK",
-                decision="REJECT",
-                rationale=reason,
-            )
+            # Collapse repeated same stock+reason pre-check rejects within a short
+            # window so decision_feed remains readable during high-frequency loops.
+            if self._should_push_precheck_feed_entry(signal.stock, reason, now_ist):
+                await self._push_feed_entry(
+                    signal,
+                    stage="PRE_CHECK",
+                    decision="REJECT",
+                    rationale=reason,
+                )
+            else:
+                logger.debug(
+                    "[DIAG] PRE_CHECK feed deduped: %s — %s",
+                    signal.stock,
+                    reason,
+                )
             if not any(s in reason for s in _silent_reasons):
                 await publish("system_alerts", {
                     "type": "warning",
                     "message": f"Signal skipped ({signal.stock}): {reason}",
-                    "timestamp": datetime.now(IST).isoformat(),
+                    "timestamp": now_ist.isoformat(),
                 })
             return None
 

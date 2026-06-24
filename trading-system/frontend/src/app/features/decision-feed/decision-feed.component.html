@@ -1,85 +1,126 @@
-<mat-card class="feed-card">
-  <mat-card-header>
-    <mat-card-title>
-      <mat-icon class="title-icon">psychology</mat-icon>
-      Decision Engine Feed
-    </mat-card-title>
-    <mat-card-subtitle *ngIf="lastUpdated">
-      Last updated: {{ lastUpdated | date:'HH:mm:ss' }}
-    </mat-card-subtitle>
-  </mat-card-header>
+<ng-container *ngIf="mode === 'page'; else widgetShell">
+  <mat-card class="feed-card">
+    <mat-card-header>
+      <mat-card-title>
+        <mat-icon class="title-icon">psychology</mat-icon>
+        Decision Engine Feed
+      </mat-card-title>
+      <mat-card-subtitle *ngIf="lastUpdated">
+        Last updated: {{ lastUpdated | date:'HH:mm:ss' }}
+      </mat-card-subtitle>
+    </mat-card-header>
 
-  <mat-card-content>
-    <div *ngIf="loading" class="loading-state">
-      <mat-spinner diameter="32"></mat-spinner>
-      <span>Loading decisions…</span>
+    <mat-card-content>
+      <ng-container *ngTemplateOutlet="feedBody"></ng-container>
+    </mat-card-content>
+  </mat-card>
+</ng-container>
+
+<ng-template #widgetShell>
+  <div class="feed-widget-shell">
+    <div class="widget-header">
+      <span class="widget-title">
+        <mat-icon class="title-icon">psychology</mat-icon>
+        Recent Decisions
+      </span>
+      <span class="widget-updated at-mono" *ngIf="lastUpdated">{{ lastUpdated | date:'HH:mm:ss' }}</span>
     </div>
+    <ng-container *ngTemplateOutlet="feedBody"></ng-container>
+  </div>
+</ng-template>
 
-    <div *ngIf="!loading && decisions.length === 0" class="empty-state">
-      <mat-icon>hourglass_empty</mat-icon>
-      <p>No decisions yet today.</p>
-      <p class="hint">Signals are evaluated between 09:15 and 15:15 IST on trading days.</p>
-    </div>
+<ng-template #feedBody>
+  <div *ngIf="loading" class="loading-state">
+    <mat-spinner diameter="32"></mat-spinner>
+    <span>Loading decisions...</span>
+  </div>
 
-    <mat-tab-group *ngIf="!loading && decisions.length > 0" animationDuration="150ms">
+  <div *ngIf="!loading && decisions.length === 0" class="empty-state">
+    <mat-icon>hourglass_empty</mat-icon>
+    <p>No decisions yet today.</p>
+    <p class="hint">Signals are evaluated between 09:15 and 15:15 IST on trading days.</p>
+  </div>
 
-      <!-- ── Traded tab (EXECUTE + REDUCE) ──────────────────── -->
-      <mat-tab>
-        <ng-template mat-tab-label>
-          <mat-icon class="tab-icon traded-icon">check_circle</mat-icon>
-          Traded
-          <span class="tab-badge traded-badge" *ngIf="traded.length">{{ traded.length }}</span>
-        </ng-template>
+  <mat-tab-group *ngIf="!loading && decisions.length > 0" animationDuration="150ms">
 
-        <div class="tab-empty" *ngIf="traded.length === 0">
-          <mat-icon>pending_actions</mat-icon>
-          <p>No executions yet today.</p>
-        </div>
+    <mat-tab>
+      <ng-template mat-tab-label>
+        <mat-icon class="tab-icon traded-icon">check_circle</mat-icon>
+        Traded
+        <span class="tab-badge traded-badge" *ngIf="traded.length">{{ traded.length }}</span>
+      </ng-template>
 
-        <div class="feed-list" *ngIf="traded.length > 0">
-          <ng-container *ngFor="let d of traded">
-            <ng-container *ngTemplateOutlet="feedRow; context: {$implicit: d}"></ng-container>
-          </ng-container>
-        </div>
-      </mat-tab>
+      <div class="tab-empty" *ngIf="traded.length === 0">
+        <mat-icon>pending_actions</mat-icon>
+        <p>No executions yet today.</p>
+      </div>
 
-      <!-- ── Rejected tab ────────────────────────────────────── -->
-      <mat-tab>
-        <ng-template mat-tab-label>
-          <mat-icon class="tab-icon rejected-icon">cancel</mat-icon>
-          Rejected
-          <span class="tab-badge rejected-badge" *ngIf="rejected.length">{{ rejected.length }}</span>
-        </ng-template>
-
-        <div class="tab-empty" *ngIf="rejected.length === 0">
-          <mat-icon>check_circle_outline</mat-icon>
-          <p>No rejections today.</p>
-        </div>
-
-        <ng-container *ngIf="rejected.length > 0">
-          <!-- Summary bar showing pre-check vs LLM split -->
-          <div class="reject-summary">
-            <span>
-              <span class="stage-pill">Pre-check</span>
-              {{ rejectedPreCheckCount }} filtered without LLM call
-            </span>
-            <span *ngIf="rejectedLlmCount > 0">
-              <span class="stage-pill stage-llm">LLM</span>
-              {{ rejectedLlmCount }} reviewed &amp; rejected
-            </span>
-          </div>
-
-          <div class="feed-list">
-            <ng-container *ngFor="let d of rejected">
-              <ng-container *ngTemplateOutlet="feedRow; context: {$implicit: d}"></ng-container>
-            </ng-container>
-          </div>
+      <div class="feed-list" *ngIf="traded.length > 0">
+        <ng-container *ngFor="let d of traded">
+          <ng-container *ngTemplateOutlet="feedRow; context: {$implicit: d}"></ng-container>
         </ng-container>
-      </mat-tab>
+      </div>
+    </mat-tab>
 
-    </mat-tab-group>
-  </mat-card-content>
-</mat-card>
+    <mat-tab>
+      <ng-template mat-tab-label>
+        <mat-icon class="tab-icon rejected-icon">cancel</mat-icon>
+        Rejected
+        <span class="tab-badge rejected-badge" *ngIf="rejected.length">{{ rejected.length }}</span>
+      </ng-template>
+
+      <div class="tab-empty" *ngIf="rejected.length === 0">
+        <mat-icon>check_circle_outline</mat-icon>
+        <p>No rejections today.</p>
+      </div>
+
+      <ng-container *ngIf="rejected.length > 0">
+        <div class="reject-summary">
+          <span>
+            <span class="stage-pill">Pre-check</span>
+            {{ rejectedPreCheckCount }} filtered without LLM call
+          </span>
+          <span *ngIf="rejectedLlmCount > 0">
+            <span class="stage-pill stage-llm">LLM</span>
+            {{ rejectedLlmCount }} reviewed and rejected
+          </span>
+        </div>
+
+        <mat-accordion class="reject-accordion" multi>
+          <mat-expansion-panel *ngIf="rejectedPreCheckCount > 0" [expanded]="true">
+            <mat-expansion-panel-header>
+              <mat-panel-title>
+                <span class="stage-pill">Pre-check rejects</span>
+              </mat-panel-title>
+              <mat-panel-description>{{ rejectedPreCheckCount }}</mat-panel-description>
+            </mat-expansion-panel-header>
+
+            <div class="feed-list grouped-list">
+              <ng-container *ngFor="let d of rejectedPreCheck">
+                <ng-container *ngTemplateOutlet="feedRow; context: {$implicit: d}"></ng-container>
+              </ng-container>
+            </div>
+          </mat-expansion-panel>
+
+          <mat-expansion-panel *ngIf="rejectedLlmCount > 0" [expanded]="rejectedPreCheckCount === 0">
+            <mat-expansion-panel-header>
+              <mat-panel-title>
+                <span class="stage-pill stage-llm">LLM rejects</span>
+              </mat-panel-title>
+              <mat-panel-description>{{ rejectedLlmCount }}</mat-panel-description>
+            </mat-expansion-panel-header>
+
+            <div class="feed-list grouped-list">
+              <ng-container *ngFor="let d of rejectedLlm">
+                <ng-container *ngTemplateOutlet="feedRow; context: {$implicit: d}"></ng-container>
+              </ng-container>
+            </div>
+          </mat-expansion-panel>
+        </mat-accordion>
+      </ng-container>
+    </mat-tab>
+  </mat-tab-group>
+</ng-template>
 
 <!-- ── Shared row template ──────────────────────────────────── -->
 <ng-template #feedRow let-d>

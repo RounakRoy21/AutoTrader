@@ -556,5 +556,6 @@
 // Decision feed widget card
 .decision-feed-widget-card {
   grid-column: 1 / -1;
-  mat-card-content { padding-top: 0; }
+  padding: 10px 12px 8px;
+  overflow: hidden;
 }

@@ -85,6 +85,15 @@ class Settings(BaseSettings):
     consecutive_loss_pause_threshold: int = 3  # pause after N consecutive SL hits
     consecutive_loss_pause_minutes: int = 30   # pause duration in minutes
     roi_decay_enabled: bool = True             # reduce target over time if not hit
+    # ── Partial profit-booking / scale-out ────────
+    # Book a fraction of the position once price reaches a multiple of the initial
+    # risk (R = entry − initial stop).  Locks in profit on momentum spikes and,
+    # when move-to-breakeven is enabled, makes the remaining position risk-free —
+    # smoothing the equity curve without capping the upside on the runner.
+    partial_booking_enabled: bool = True
+    partial_booking_trigger_r: float = 1.0     # book when price reaches entry + R × this
+    partial_booking_fraction: float = 0.5      # fraction of qty to book (0 < f < 1)
+    partial_booking_move_sl_to_breakeven: bool = True  # raise SL to entry after booking
     max_open_positions: int = 3
     max_trades_per_day: int = 6
     daily_drawdown_soft_alert_pct: float = 0.02   # 2% soft warning tier (Telegram alert, no halt)

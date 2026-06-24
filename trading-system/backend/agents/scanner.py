@@ -53,6 +53,61 @@ _ohlc_last_ts: Dict[str, float] = {}
 OHLCV_POLL_INTERVAL_SECS: int = 60   # REST poll cadence (business logic — do not change)
 MAX_OHLCV_STALENESS_SECS: int = 90   # 1.5× poll interval; wider than poll to absorb one retry
 
+# Last reported market-data API health (None=unknown, True=forbidden, False=OK).
+# Used to fire the Telegram alert only on state transitions, never every poll.
+_data_api_forbidden: Optional[bool] = None
+
+
+async def _update_data_api_health(fetched: int, total: int, results: List[Any]) -> None:
+    """Publish Groww market-data API health to Redis and alert on transitions.
+
+    Sets DATA_API_STATUS_KEY to FORBIDDEN when every symbol failed with a
+    permanent 403 (subscription/entitlement gone), DEGRADED on partial failure,
+    or OK when data is flowing.  A Telegram alert is sent only when the
+    forbidden↔OK state changes, so a persistent outage is not spammed.
+    """
+    global _data_api_forbidden
+    from datetime import datetime, timezone
+    from core.redis_client import set_value
+    from core.redis_keys import (
+        DATA_API_STATUS_KEY, DATA_API_DETAIL_KEY, DATA_API_LAST_OK_KEY,
+    )
+    from integrations.groww_client import _is_permanent_groww_error
+    from integrations.telegram_client import send_data_api_alert
+
+    exceptions = [r for r in results if isinstance(r, Exception)]
+    all_forbidden = (
+        fetched == 0 and total > 0 and bool(exceptions)
+        and all(_is_permanent_groww_error(e) for e in exceptions)
+    )
+
+    if all_forbidden:
+        detail = str(exceptions[0]) if exceptions else "Access forbidden"
+        await set_value(DATA_API_STATUS_KEY, "FORBIDDEN")
+        await set_value(DATA_API_DETAIL_KEY, detail)
+        if _data_api_forbidden is not True:
+            logger.error("[Scanner] Market-data API FORBIDDEN (403) — trading effectively paused")
+            try:
+                await send_data_api_alert(forbidden=True, detail=detail)
+            except Exception:
+                pass
+        _data_api_forbidden = True
+        return
+
+    # Some (or all) symbols succeeded → data group is reachable.
+    status = "OK" if fetched == total else "DEGRADED"
+    await set_value(DATA_API_STATUS_KEY, status)
+    if fetched > 0:
+        await set_value(DATA_API_LAST_OK_KEY, datetime.now(timezone.utc).isoformat())
+    if _data_api_forbidden is True and fetched > 0:
+        logger.info("[Scanner] Market-data API recovered — data flowing again")
+        try:
+            await send_data_api_alert(forbidden=False)
+        except Exception:
+            pass
+    if fetched > 0:
+        _data_api_forbidden = False
+
 
 class CandleBuilder:
     """Aggregates raw ticks into OHLCV candles at a configurable interval.
@@ -759,6 +814,8 @@ class Scanner:
                     )
                 else:
                     logger.debug("[Scanner] OHLCV poll: all %d symbols updated", fetched)
+                # Publish market-data API health (alerts on forbidden↔OK transitions).
+                await _update_data_api_health(fetched, len(symbols), results)
             except Exception as exc:
                 logger.error("[Scanner] OHLCV poll loop exception: %s", exc, exc_info=True)
             await asyncio.sleep(OHLCV_POLL_INTERVAL_SECS)

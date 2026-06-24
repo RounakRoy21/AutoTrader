@@ -108,9 +108,16 @@ An automated NSE intraday equity trading system. Streams live tick data from Gro
 
 **API & Dashboard**
 - FastAPI REST + WebSocket backend
-- Angular 17 frontend: live P&L, open positions, trade log, decision feed (real-time LLM decision log), system alerts
+- Angular 17 frontend with Material M2 dark theme (light mode available):
+  - **Dashboard** — KPI strip (net P&L today, open positions count, strategy health over 30d), market brief card (bias, VIX, signal grid, stance), system status with drawdown tracker, real-time decisions widget, system health card (broker status, resource utilization)
+  - **Open Positions** — live table with entry/exit prices, unrealized P&L, SL proximity mini-bar, tradeable quantity
+  - **Trade Log** — historical trades with filtering by date (click P&L chart to drill down), expandable AI rationale
+  - **P&L Chart** — daily realized P&L (7d/30d/90d switchable, click bars to filter trade log)
+  - Responsive design: sticky table headers, mobile-optimized column visibility, touch-friendly controls
+  - Live IST clock, paper trading badge, WebSocket connection status chip, theme toggle
 - In-browser Groww TOTP authentication page (`/auth/groww`)
 - TOTP-based Groww authentication (no daily re-login needed)
+- Real-time WebSocket feed: live tick updates, decisions, trade events, market briefs
 
 **Infrastructure**
 - Docker Compose: PostgreSQL 16 + Redis 7 + FastAPI + nginx/Angular

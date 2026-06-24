@@ -4,11 +4,27 @@ Tests for the Risk Manager — SL/target detection, trailing SL, drawdown, EOD.
 
 from datetime import date, datetime, time as dt_time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from agents.risk_manager import RiskManager
+
+
+def _fake_db_context(*args, **kwargs):
+    """A drop-in async context manager whose session.execute is a no-op AsyncMock.
+
+    Used to exercise RiskManager DB-writing paths without a real database."""
+    class _Ctx:
+        async def __aenter__(self):
+            session = MagicMock()
+            session.execute = AsyncMock()
+            return session
+
+        async def __aexit__(self, *exc):
+            return False
+
+    return _Ctx()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -625,3 +641,169 @@ class TestAtrRoiDecayFloor:
                 atr_floor_pct = max(0.005, 0.4 * atr_val / entry)
         decayed = round(entry * (1 + atr_floor_pct), 2)
         assert decayed == round(entry * 1.005, 2)   # 2512.50
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Partial Profit-Booking / Scale-Out
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestPartialBookingLogic:
+    """Pure-logic checks for the scale-out trigger, sizing, and P&L math."""
+
+    def test_partial_target_at_1r(self):
+        """Partial target = entry + R (R = entry − stop), and below the full target."""
+        entry, sl, target = 2500.0, 2475.0, 2550.0
+        risk = entry - sl                                   # 25
+        candidate = round(entry + risk * 1.0, 2)            # 2525.0
+        assert candidate == 2525.0
+        assert candidate < target
+
+    def test_partial_target_skipped_when_not_below_target(self):
+        """If the 1R level is not strictly below the full target, no partial is set."""
+        entry, sl, target = 2500.0, 2475.0, 2510.0          # narrow target
+        risk = entry - sl
+        candidate = round(entry + risk * 2.0, 2)            # 2550.0 > target
+        partial = candidate if candidate < target else None
+        assert partial is None
+
+    def test_no_partial_when_qty_below_2(self):
+        """A 1-share position cannot be split while leaving a runner."""
+        qty = 1
+        assert not (qty >= 2)
+
+    def test_book_qty_and_remaining_even(self):
+        qty, frac = 100, 0.5
+        book = max(1, int(qty * frac))
+        remaining = qty - book
+        assert book == 50
+        assert remaining == 50
+
+    def test_book_qty_and_remaining_odd(self):
+        """Odd quantities floor the booked leg, leaving the larger runner."""
+        qty, frac = 101, 0.5
+        book = max(1, int(qty * frac))
+        remaining = qty - book
+        assert book == 50
+        assert remaining == 51
+        assert book + remaining == qty
+
+    def test_remaining_never_below_one(self):
+        """A 2-share position books 1 and keeps 1 — never a zero runner."""
+        qty, frac = 2, 0.5
+        book = max(1, int(qty * frac))
+        remaining = qty - book
+        assert book == 1
+        assert remaining == 1
+
+    def test_leg_pnl_positive_on_scale_out(self):
+        """The booked leg realises a gain (price is above entry at the partial)."""
+        entry, ltp, book_qty = 2500.0, 2525.0, 50
+        leg_pnl = (ltp - entry) * book_qty                  # 1250
+        assert leg_pnl == pytest.approx(1250.0)
+
+    def test_sl_moves_to_breakeven(self):
+        """With move-to-breakeven, the runner's stop is raised to the entry price."""
+        entry, sl = 2500.0, 2475.0
+        new_sl = entry if (True and entry > sl) else sl
+        assert new_sl == 2500.0
+
+    def test_final_pnl_includes_booked_leg(self):
+        """Final realized P&L = booked leg + remaining leg (less costs)."""
+        booked = 1250.0                                     # earlier scale-out leg
+        remaining_gross = (2540.0 - 2500.0) * 50            # 2000
+        costs = 0.0
+        final = round(remaining_gross - costs + booked, 2)
+        assert final == 3250.0
+
+    def test_runner_can_close_at_breakeven_with_net_profit(self):
+        """If the runner later stops out at breakeven, the trade is still net-positive
+        because the booked leg is preserved in realized_pnl."""
+        booked = 1250.0
+        remaining_gross = (2500.0 - 2500.0) * 50            # 0 at breakeven
+        final = round(remaining_gross + booked, 2)
+        assert final == 1250.0
+        assert final > 0
+
+
+class TestPartialBookingExecution:
+    """Async behaviour of RiskManager._book_partial in paper mode."""
+
+    @pytest.mark.asyncio
+    async def test_book_partial_paper_reduces_qty_and_books_pnl(self, open_trade):
+        rm = RiskManager()
+        rm._settings = SimpleNamespace(
+            paper_trading=True,
+            partial_booking_enabled=True,
+            partial_booking_fraction=0.5,
+            partial_booking_move_sl_to_breakeven=True,
+        )
+        # open_trade: entry 2500, sl 2475, qty 100, product MIS
+        with patch("agents.risk_manager.get_db_context", _fake_db_context), \
+             patch("agents.risk_manager.send_telegram", new=AsyncMock()) as tel, \
+             patch("agents.risk_manager.publish", new=AsyncMock()) as pub, \
+             patch("agents.risk_manager._transaction_costs", return_value=0.0):
+            await rm._book_partial(open_trade, 2525.0)
+
+        assert open_trade.quantity == 50                    # half booked
+        assert open_trade.partial_booked is True
+        assert open_trade.stop_loss_price == 2500.0         # raised to breakeven
+        assert open_trade.booked_pnl == pytest.approx(1250.0)  # (2525-2500)*50
+        tel.assert_awaited_once()
+        pub.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_book_partial_no_breakeven_keeps_stop(self, open_trade):
+        rm = RiskManager()
+        rm._settings = SimpleNamespace(
+            paper_trading=True,
+            partial_booking_enabled=True,
+            partial_booking_fraction=0.5,
+            partial_booking_move_sl_to_breakeven=False,
+        )
+        with patch("agents.risk_manager.get_db_context", _fake_db_context), \
+             patch("agents.risk_manager.send_telegram", new=AsyncMock()), \
+             patch("agents.risk_manager.publish", new=AsyncMock()), \
+             patch("agents.risk_manager._transaction_costs", return_value=0.0):
+            await rm._book_partial(open_trade, 2525.0)
+
+        assert open_trade.quantity == 50
+        assert open_trade.stop_loss_price == 2475.0         # unchanged
+
+    @pytest.mark.asyncio
+    async def test_book_partial_accumulates_existing_booked(self, open_trade):
+        rm = RiskManager()
+        rm._settings = SimpleNamespace(
+            paper_trading=True,
+            partial_booking_enabled=True,
+            partial_booking_fraction=0.5,
+            partial_booking_move_sl_to_breakeven=True,
+        )
+        open_trade.booked_pnl = 300.0                       # a prior leg
+        with patch("agents.risk_manager.get_db_context", _fake_db_context), \
+             patch("agents.risk_manager.send_telegram", new=AsyncMock()), \
+             patch("agents.risk_manager.publish", new=AsyncMock()), \
+             patch("agents.risk_manager._transaction_costs", return_value=0.0):
+            await rm._book_partial(open_trade, 2525.0)
+
+        assert open_trade.booked_pnl == pytest.approx(1550.0)  # 300 + 1250
+
+    @pytest.mark.asyncio
+    async def test_book_partial_skips_when_qty_too_small(self, open_trade):
+        rm = RiskManager()
+        rm._settings = SimpleNamespace(
+            paper_trading=True,
+            partial_booking_enabled=True,
+            partial_booking_fraction=0.5,
+            partial_booking_move_sl_to_breakeven=True,
+        )
+        open_trade.quantity = 1                             # cannot split
+        with patch("agents.risk_manager.get_db_context", _fake_db_context), \
+             patch("agents.risk_manager.send_telegram", new=AsyncMock()) as tel, \
+             patch("agents.risk_manager.publish", new=AsyncMock()), \
+             patch("agents.risk_manager._transaction_costs", return_value=0.0):
+            await rm._book_partial(open_trade, 2525.0)
+
+        assert open_trade.quantity == 1                    # unchanged
+        assert open_trade.partial_booked is False
+        tel.assert_not_awaited()

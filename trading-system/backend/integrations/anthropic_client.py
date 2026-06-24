@@ -100,6 +100,21 @@ class AnthropicClient:
             "name": _TOOL_NAME,
             "description": "Submit your structured response matching the required schema exactly.",
             "input_schema": response_model.model_json_schema(),
+            # Prompt caching: the tool schema + system prompt form a large, static
+            # prefix that is byte-identical on every call for a given model (the
+            # Decision Engine fires Haiku repeatedly with the same prompt during a
+            # signal burst).  Marking the end of the tools block with an ephemeral
+            # cache breakpoint caches system + tools, so subsequent calls within the
+            # 5-min TTL bill cached input at ~0.1× instead of full price — no loss of
+            # information richness since the cached content is unchanged.
+            "cache_control": {"type": "ephemeral"},
+        }]
+
+        # System prompt as a cacheable block (shares the breakpoint above).
+        system_blocks = [{
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"},
         }]
 
         for attempt in range(1, MAX_LLM_RETRIES + 1):
@@ -107,7 +122,7 @@ class AnthropicClient:
                 message = await self._client.messages.create(
                     model=active_model,
                     max_tokens=max_tokens,
-                    system=system_prompt,
+                    system=system_blocks,
                     tools=tools,
                     tool_choice={"type": "tool", "name": _TOOL_NAME},
                     messages=[{"role": "user", "content": user_content}],
@@ -120,10 +135,13 @@ class AnthropicClient:
                 # Log token usage from the response — no extra API call needed;
                 # message.usage is always populated by the Anthropic SDK.
                 logger.info(
-                    "LLM usage: model=%s input_tokens=%d output_tokens=%d stop_reason=%s",
+                    "LLM usage: model=%s input_tokens=%d output_tokens=%d "
+                    "cache_read=%s cache_write=%s stop_reason=%s",
                     active_model,
                     message.usage.input_tokens,
                     message.usage.output_tokens,
+                    getattr(message.usage, "cache_read_input_tokens", None),
+                    getattr(message.usage, "cache_creation_input_tokens", None),
                     message.stop_reason,
                 )
 

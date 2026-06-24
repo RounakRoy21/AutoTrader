@@ -33,6 +33,7 @@ from integrations.telegram_client import (
     send_intraday_close_alert,
     send_stop_loss_alert,
     send_target_hit_alert,
+    send_telegram,
 )
 from models.daily_pnl import DailyPnl
 from models.trade import Trade
@@ -98,7 +99,8 @@ class RiskManager:
       - Stop-loss exit: ATR-based (entry − ATR × multiplier) or fixed % fallback
       - Target exit: ATR-based (entry + ATR × multiplier) or fixed % fallback
       - Trailing stop-loss activates once price moves above activation threshold
-      - ROI decay: target reduced over time (15m→0.8%, 25m→0.3%, 35m→0.1%)
+      - Partial profit-booking: scale out a fraction at entry + R (move SL to breakeven)
+      - ROI decay: target reduced over time (>20m→1.5%, >35m→1.0%, >50m→0.5%/ATR-floor)
       - Per-stock lock after SL hit (expires after ~8h, before next market open)
       - Consecutive loss pause after N SL hits
       - Max 3 open positions (enforced by Decision Engine)
@@ -274,6 +276,23 @@ class RiskManager:
                     "timestamp": now_ist.isoformat(),
                 })
                 continue
+
+            # ── Partial Profit-Booking / Scale-Out ──
+            # Evaluated AFTER the SL check (a position at its stop exits in full,
+            # never scales out) and BEFORE ROI-decay / target so the booked leg is
+            # locked in on the way up.  Deliberately does NOT `continue`: the
+            # remaining position is re-evaluated for trailing-SL / target in the
+            # same cycle.  `_book_partial` reduces `trade.quantity` in place, so
+            # every downstream rule (target, trailing, MTM, drawdown, final close)
+            # automatically operates on the remainder.
+            if (
+                settings.partial_booking_enabled
+                and not trade.partial_booked
+                and trade.partial_target_price
+                and trade.quantity >= 2
+                and ltp >= trade.partial_target_price
+            ):
+                await self._book_partial(trade, ltp)
 
             # ── ROI Decay (time-based target reduction) ──
             # Evaluated BEFORE target check so the reduced target takes effect
@@ -454,9 +473,12 @@ class RiskManager:
             return
 
         # Phase 3 — Calculate net P&L (gross less transaction costs) and finalise as CLOSED
+        # `booked_pnl` carries the net realised P&L of any earlier partial scale-out
+        # leg(s); fold it in so realized_pnl reflects the entire entry/exit cycle.
         gross_pnl = (exit_price - trade.entry_price) * trade.quantity
         costs = _transaction_costs(trade.entry_price, exit_price, trade.quantity, trade.product_type)
-        pnl = round(gross_pnl - costs, 2)
+        booked = getattr(trade, "booked_pnl", 0.0) or 0.0
+        pnl = round(gross_pnl - costs + booked, 2)
 
         async with get_db_context() as session:
             await session.execute(
@@ -472,8 +494,8 @@ class RiskManager:
             )
 
         logger.info(
-            "%s: %s @ ₹%.2f → gross P&L: ₹%.2f | costs: ₹%.2f | net P&L: ₹%.2f",
-            reason, trade.stock, exit_price, gross_pnl, costs, pnl,
+            "%s: %s @ ₹%.2f → gross P&L: ₹%.2f | costs: ₹%.2f | booked: ₹%.2f | net P&L: ₹%.2f",
+            reason, trade.stock, exit_price, gross_pnl, costs, booked, pnl,
         )
 
         # Publish event to Redis
@@ -540,6 +562,184 @@ class RiskManager:
                 await set_value("consecutive_losses", "0")
             except Exception:
                 pass  # Non-critical; streak resets naturally from next SL-hit DB count
+
+    async def _book_partial(self, trade: Trade, ltp: float) -> None:
+        """Scale out a fraction of the position once price reaches the partial target.
+
+        Books ``partial_booking_fraction`` of the *current* quantity at market,
+        accumulates the net realised P&L of the leg into ``booked_pnl``, reduces
+        ``trade.quantity`` to the remainder (so every downstream rule — target,
+        trailing SL, MTM, drawdown and the final close — automatically operates on
+        the smaller size), and optionally raises the stop to breakeven.
+
+        Safety invariants for live trading:
+          * The server-side GTT is cancelled BEFORE the partial SELL, so it can
+            never fire on the remaining shares mid-operation.  If the cancel fails
+            the scale-out is aborted with the position left fully intact.
+          * If the SELL fails after the GTT was cancelled, a full-size GTT is
+            re-placed to restore the stop before returning.
+          * A fresh GTT for the remaining quantity is placed after the SELL.
+        """
+        settings = self._settings
+        now_ist = datetime.now(IST)
+
+        qty = trade.quantity
+        book_qty = max(1, int(qty * settings.partial_booking_fraction))
+        remaining = qty - book_qty
+        if remaining < 1:
+            # Position too small to split while leaving a runner — skip silently.
+            return
+
+        # Breakeven stop for the remaining position (only ever raised, never lowered).
+        new_sl = trade.stop_loss_price
+        if (
+            settings.partial_booking_move_sl_to_breakeven
+            and trade.entry_price > trade.stop_loss_price
+        ):
+            new_sl = trade.entry_price
+
+        new_gtt_id = getattr(trade, "gtt_trigger_id", None)
+
+        if not settings.paper_trading:
+            groww = get_groww_client()
+
+            # 1) Cancel the existing full-size GTT first.  Abort if this fails so
+            #    we never end up holding fewer shares than the GTT would sell.
+            if getattr(trade, "gtt_trigger_id", None):
+                try:
+                    await groww.delete_gtt(trade.gtt_trigger_id)
+                except Exception as exc:
+                    logger.warning(
+                        "Partial book: GTT cancel failed for %s: %s — aborting scale-out",
+                        trade.stock, exc,
+                    )
+                    return
+                new_gtt_id = None
+
+            # 2) Sell the booked leg.
+            try:
+                await groww.place_order(
+                    tradingsymbol=trade.stock,
+                    transaction_type="SELL",
+                    quantity=book_qty,
+                    product=trade.product_type,
+                    order_type="MARKET",
+                )
+            except Exception as exc:
+                logger.error(
+                    "Partial book: SELL failed for %s: %s — restoring full-size stop",
+                    trade.stock, exc,
+                )
+                # Re-place a GTT for the full original quantity to restore the stop.
+                try:
+                    restored = await groww.place_gtt(
+                        tradingsymbol=trade.stock,
+                        exchange=trade.exchange,
+                        trigger_type="single",
+                        trigger_values=[trade.stop_loss_price],
+                        last_price=ltp,
+                        orders=[{
+                            "exchange": trade.exchange,
+                            "tradingsymbol": trade.stock,
+                            "transaction_type": "SELL",
+                            "quantity": qty,
+                            "order_type": "MARKET",
+                            "product": trade.product_type,
+                        }],
+                    )
+                    await self._set_gtt_id(trade, int(restored) if restored else None)
+                except Exception as restore_exc:
+                    logger.error(
+                        "Partial book: failed to restore GTT for %s: %s — RiskManager poll "
+                        "will enforce the stop",
+                        trade.stock, restore_exc,
+                    )
+                    await self._set_gtt_id(trade, None)
+                return
+
+            # 3) Place a fresh GTT for the remaining quantity at the (possibly raised) stop.
+            try:
+                placed = await groww.place_gtt(
+                    tradingsymbol=trade.stock,
+                    exchange=trade.exchange,
+                    trigger_type="single",
+                    trigger_values=[new_sl],
+                    last_price=ltp,
+                    orders=[{
+                        "exchange": trade.exchange,
+                        "tradingsymbol": trade.stock,
+                        "transaction_type": "SELL",
+                        "quantity": remaining,
+                        "order_type": "MARKET",
+                        "product": trade.product_type,
+                    }],
+                )
+                new_gtt_id = int(placed) if placed else None
+            except Exception as exc:
+                logger.error(
+                    "Partial book: failed to place resized GTT for %s: %s — RiskManager poll "
+                    "will enforce the stop",
+                    trade.stock, exc,
+                )
+                new_gtt_id = None
+
+        # ── Net P&L of the booked leg (gross less transaction costs) ──
+        gross = (ltp - trade.entry_price) * book_qty
+        costs = _transaction_costs(trade.entry_price, ltp, book_qty, trade.product_type)
+        leg_pnl = round(gross - costs, 2)
+        new_booked = round((getattr(trade, "booked_pnl", 0.0) or 0.0) + leg_pnl, 2)
+
+        # ── Persist: reduce quantity, accumulate booked P&L, mark booked, raise stop ──
+        async with get_db_context() as session:
+            await session.execute(
+                update(Trade)
+                .where(Trade.id == trade.id)
+                .values(
+                    quantity=remaining,
+                    booked_pnl=new_booked,
+                    partial_booked=True,
+                    stop_loss_price=new_sl,
+                    gtt_trigger_id=new_gtt_id,
+                )
+            )
+
+        # Update in-memory so the rest of this poll cycle sees the new state.
+        trade.quantity = remaining
+        trade.booked_pnl = new_booked
+        trade.partial_booked = True
+        trade.stop_loss_price = new_sl
+        trade.gtt_trigger_id = new_gtt_id
+
+        logger.info(
+            "Partial book: %s sold %d/%d @ ₹%.2f | leg P&L: ₹%.2f | runner: %d @ SL ₹%.2f",
+            trade.stock, book_qty, qty, ltp, leg_pnl, remaining, new_sl,
+        )
+
+        await send_telegram(
+            f"\U0001f4b0 Partial book: {trade.stock}\n"
+            f"Sold {book_qty}/{qty} @ ₹{ltp:.2f} | Leg P&L: ₹{leg_pnl:.2f}\n"
+            f"Runner: {remaining} @ SL ₹{new_sl:.2f}"
+            + ("" if not settings.paper_trading else " (paper)")
+        )
+
+        await publish("trade_events", {
+            "type": "PARTIAL_BOOKED",
+            "stock": trade.stock,
+            "booked_qty": book_qty,
+            "remaining_qty": remaining,
+            "price": ltp,
+            "leg_pnl": leg_pnl,
+            "new_stop_loss": new_sl,
+            "timestamp": now_ist.isoformat(),
+        })
+
+    async def _set_gtt_id(self, trade: Trade, gtt_id: Optional[int]) -> None:
+        """Persist and mirror a new GTT trigger id on the trade (best-effort helper)."""
+        async with get_db_context() as session:
+            await session.execute(
+                update(Trade).where(Trade.id == trade.id).values(gtt_trigger_id=gtt_id)
+            )
+        trade.gtt_trigger_id = gtt_id
 
     async def _update_stop_loss(self, trade: Trade, new_sl: float) -> None:
         """Update the stop-loss price for a trade in the database (trailing SL)."""

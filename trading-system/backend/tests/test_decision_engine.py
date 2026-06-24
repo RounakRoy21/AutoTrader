@@ -6,7 +6,7 @@ _validate_decision is pure logic and needs no mocking.
 """
 
 import asyncio
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytz
@@ -336,6 +336,38 @@ class TestPreCheck:
 
     @pytest.mark.asyncio
     @patch("agents.decision_engine.datetime")
+    @patch("agents.decision_engine.get_value", return_value=None)
+    async def test_precheck_rejects_zero_volume_ratio(self, mock_get_value, mock_dt, engine, signal):
+        mock_dt.now.return_value = _MARKET_DT
+        engine._market_brief = None
+        engine._count_open_positions = AsyncMock(return_value=0)
+
+        low_vol_signal = signal.model_copy(update={"volume_ratio": 0.0})
+
+        with patch("agents.decision_engine.get_db_context", return_value=_mock_db_context(0)):
+            passed, reason, _ = await engine._pre_check(low_vol_signal)
+
+        assert not passed
+        assert "volume ratio" in reason.lower()
+
+    @pytest.mark.asyncio
+    @patch("agents.decision_engine.datetime")
+    @patch("agents.decision_engine.get_value", return_value=None)
+    async def test_precheck_rejects_sub_hard_min_volume_ratio(self, mock_get_value, mock_dt, engine, signal):
+        mock_dt.now.return_value = _MARKET_DT
+        engine._market_brief = None
+        engine._count_open_positions = AsyncMock(return_value=0)
+
+        low_vol_signal = signal.model_copy(update={"volume_ratio": 1.1})
+
+        with patch("agents.decision_engine.get_db_context", return_value=_mock_db_context(0)):
+            passed, reason, _ = await engine._pre_check(low_vol_signal)
+
+        assert not passed
+        assert "hard minimum" in reason.lower()
+
+    @pytest.mark.asyncio
+    @patch("agents.decision_engine.datetime")
     @patch("agents.decision_engine.get_redis", side_effect=ConnectionError("Redis unavailable in unit tests"))
     @patch("agents.decision_engine.get_value")
     async def test_max_daily_trades_rejects(self, mock_get_value, mock_get_redis, mock_dt, engine, signal):
@@ -359,7 +391,7 @@ class TestPreCheck:
 
 
 class TestProcessSignalFeedVisibility:
-    """process_signal should always persist pre-check rejects to decision feed."""
+    """process_signal pre-check rejects should be visible but deduped when repeated."""
 
     @pytest.mark.asyncio
     @patch("agents.decision_engine.datetime")
@@ -424,6 +456,38 @@ class TestProcessSignalFeedVisibility:
         assert result is None
         engine._push_feed_entry.assert_awaited_once()
         mock_publish.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch("agents.decision_engine.publish", new_callable=AsyncMock)
+    async def test_repeated_same_precheck_reject_is_deduped_in_feed(
+        self,
+        mock_publish,
+        engine,
+        signal,
+    ):
+        engine._pre_check = AsyncMock(return_value=(False, "Trading is halted", signal))
+        engine._push_feed_entry = AsyncMock()
+
+        await engine.process_signal(signal)
+        await engine.process_signal(signal)
+
+        # Same stock+reason within dedupe window should be collapsed in decision_feed.
+        assert engine._push_feed_entry.await_count == 1
+        # Alerts are intentionally kept actionable and are not deduped here.
+        assert mock_publish.await_count == 2
+
+    def test_precheck_feed_dedupe_window_expires(self, engine):
+        reason = "Volume ratio unavailable/zero — skipping LLM until OHLCV volume is present"
+
+        assert engine._should_push_precheck_feed_entry("RELIANCE", reason, _MARKET_DT)
+        assert not engine._should_push_precheck_feed_entry(
+            "RELIANCE",
+            "Volume   ratio unavailable/zero — skipping LLM until OHLCV volume is present",
+            _MARKET_DT,
+        )
+
+        later = _MARKET_DT + timedelta(seconds=DecisionEngine.PRECHECK_FEED_DEDUPE_SECS + 1)
+        assert engine._should_push_precheck_feed_entry("RELIANCE", reason, later)
 
     @pytest.mark.asyncio
     @patch("agents.decision_engine.datetime")

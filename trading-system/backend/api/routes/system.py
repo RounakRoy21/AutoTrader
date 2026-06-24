@@ -32,6 +32,9 @@ from core.redis_keys import (
     ANTHROPIC_CALLS_RESEARCH_KEY,
     ANTHROPIC_CALLS_DECISION_KEY,
     DECISION_FEED_KEY,
+    DATA_API_STATUS_KEY,
+    DATA_API_DETAIL_KEY,
+    DATA_API_LAST_OK_KEY,
 )
 from core.nse_calendar import get_market_status
 from agents.trading_agent_manager import get_trading_agent_manager
@@ -84,6 +87,8 @@ async def get_agent_status():
         RISK_DRAWDOWN_PCT_KEY,          # 12
         ANTHROPIC_CALLS_RESEARCH_KEY,   # 13
         ANTHROPIC_CALLS_DECISION_KEY,   # 14
+        DATA_API_STATUS_KEY,            # 15
+        DATA_API_DETAIL_KEY,            # 16
     ]
     try:
         r = await get_redis()
@@ -119,6 +124,13 @@ async def get_agent_status():
             "calls_research_today": calls_research,
             "calls_decision_today": calls_decision,
             "calls_total_today": calls_research + calls_decision,
+        },
+        "data_api": {
+            # OK | DEGRADED | FORBIDDEN | UNKNOWN — FORBIDDEN means the Groww
+            # Live-Data/Historical subscription is inactive and the scanner
+            # cannot generate signals (silent trading blackout).
+            "status": values[15] or "UNKNOWN",
+            "detail": values[16],
         },
         "market_status": get_market_status(),
         "config": {
@@ -232,6 +244,9 @@ async def health_check():
     groww_token = await get_value(GROWW_TOKEN_KEY)
     groww_ok = groww_token is not None and len(groww_token) > 0
 
+    # Market-data feed health (set by the scanner OHLCV poll loop).
+    data_api_status = await get_value(DATA_API_STATUS_KEY) or "UNKNOWN"
+
     all_ok = db_ok and redis_ok
     return _envelope(
         success=all_ok,
@@ -239,5 +254,6 @@ async def health_check():
             "database": "healthy" if db_ok else "unhealthy",
             "redis": "healthy" if redis_ok else "unhealthy",
             "groww_api": "authenticated" if groww_ok else "no_token",
+            "market_data": data_api_status,
         },
     )

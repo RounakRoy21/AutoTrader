@@ -51,7 +51,13 @@
         <!-- HALT banner -->
         <div class="halt-banner" *ngIf="agentStatus.trading_agent.trading_halted">
           <mat-icon>warning</mat-icon>
-          <span>TRADING HALTED â€” all new entries blocked</span>
+          <span>TRADING HALTED all new entries blocked</span>
+        </div>
+
+        <!-- Market-data feed forbidden banner (Groww data subscription inactive) -->
+        <div class="halt-banner" *ngIf="agentStatus.data_api?.status === 'FORBIDDEN'">
+          <mat-icon>cloud_off</mat-icon>
+          <span>MARKET DATA FORBIDDEN — no quotes/volume, scanner cannot signal. Check Groww data subscription.</span>
         </div>
 
         <div class="status-row">
@@ -319,7 +325,7 @@
       </mat-card-content>
     </mat-card>
 
-    <!-- Strategy Health â€” full width -->
+    <!-- Strategy Health full width -->
     <mat-card class="strategy-health-card">
       <mat-card-header>
         <mat-card-title>Strategy Health (30d)</mat-card-title>
@@ -387,16 +393,11 @@
         </div>
       </mat-card-content>
     </mat-card>
-    <!-- Decision Feed widget — spans full grid width -->
+    <!-- Decision Feed widget - spans full grid width -->
     <mat-card class="decision-feed-widget-card">
-      <mat-card-header>
-        <mat-card-title>Recent Decisions</mat-card-title>
-      </mat-card-header>
-      <mat-card-content>
-        <app-decision-feed mode="widget"></app-decision-feed>
-      </mat-card-content>
+      <app-decision-feed mode="widget"></app-decision-feed>
     </mat-card>
-    <!-- System Alerts â€” spans full grid width -->
+    <!-- System Alerts spans full grid width -->
     <div class="alerts-panel">
       <app-system-alerts></app-system-alerts>
     </div>

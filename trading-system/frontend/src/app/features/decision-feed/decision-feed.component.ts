@@ -16,6 +16,7 @@ import { MatTooltipModule } from '@angular/material/tooltip';
 import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
 import { MatChipsModule } from '@angular/material/chips';
 import { MatTabsModule } from '@angular/material/tabs';
+import { MatExpansionModule } from '@angular/material/expansion';
 
 import { ApiService } from '../../core/services/api.service';
 import { DecisionEntry } from '../../core/models';
@@ -33,6 +34,7 @@ import { TradingWebSocketService } from '../../core/services/trading-websocket.s
     MatProgressSpinnerModule,
     MatChipsModule,
     MatTabsModule,
+    MatExpansionModule,
   ],
   templateUrl: './decision-feed.component.html',
   styleUrls: ['./decision-feed.component.scss'],
@@ -101,11 +103,21 @@ export class DecisionFeedComponent implements OnInit, OnDestroy {
   get rejected(): DecisionEntry[] {
     return this.decisions.filter(d => d.decision === 'REJECT');
   }
-  get rejectedPreCheckCount(): number {
-    return this.decisions.filter(d => d.decision === 'REJECT' && d.stage === 'PRE_CHECK').length;
+
+  get rejectedPreCheck(): DecisionEntry[] {
+    return this.rejected.filter((d) => d.stage === 'PRE_CHECK');
   }
+
+  get rejectedLlm(): DecisionEntry[] {
+    return this.rejected.filter((d) => d.stage === 'LLM');
+  }
+
+  get rejectedPreCheckCount(): number {
+    return this.rejectedPreCheck.length;
+  }
+
   get rejectedLlmCount(): number {
-    return this.decisions.filter(d => d.decision === 'REJECT' && d.stage === 'LLM').length;
+    return this.rejectedLlm.length;
   }
 
   decisionClass(d: DecisionEntry): string {

@@ -98,6 +98,10 @@ export interface AgentStatus {
     is_open: boolean;
     label: string;
   };
+  data_api?: {
+    status: 'OK' | 'DEGRADED' | 'FORBIDDEN' | 'UNKNOWN';
+    detail: string | null;
+  };
   config?: {
     paper_trading: boolean;
     max_trades_per_day: number;
@@ -130,6 +134,7 @@ export interface HealthCheck {
   database: string;
   redis: string;
   groww_api: string;
+  market_data?: string;
 }
 
 export interface GrowwAuthStatus {

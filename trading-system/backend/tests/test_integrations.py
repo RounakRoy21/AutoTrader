@@ -58,8 +58,130 @@ class TestGrowwClientDeleteGtt:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  GrowwClient — fail-fast on permanent 403 / auth errors
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestPermanentErrorFailFast:
+    """A 403 'Access forbidden' (missing data-API entitlement) must NOT be
+    retried — retrying only wastes ~14s/call and floods the logs."""
+
+    def test_is_permanent_error_detects_403_code(self):
+        from integrations.groww_client import _is_permanent_groww_error
+
+        exc = Exception("Access forbidden for this request.")
+        exc.code = "403"  # type: ignore[attr-defined]
+        assert _is_permanent_groww_error(exc) is True
+
+    def test_is_permanent_error_detects_forbidden_message(self):
+        from integrations.groww_client import _is_permanent_groww_error
+
+        assert _is_permanent_groww_error(Exception("Access forbidden for this request.")) is True
+
+    def test_is_permanent_error_ignores_transient(self):
+        from integrations.groww_client import _is_permanent_groww_error
+
+        assert _is_permanent_groww_error(Exception("Connection reset by peer")) is False
+
+    def test_retry_sync_does_not_retry_permanent_error(self):
+        """The retry decorator must call the wrapped fn exactly once on a 403."""
+        from integrations.groww_client import _retry_sync
+
+        calls = {"n": 0}
+
+        @_retry_sync
+        def _always_forbidden():
+            calls["n"] += 1
+            exc = Exception("Access forbidden for this request.")
+            exc.code = "403"  # type: ignore[attr-defined]
+            raise exc
+
+        with pytest.raises(Exception):
+            _always_forbidden()
+        assert calls["n"] == 1  # no retries
+
+    def test_retry_sync_still_retries_transient_error(self):
+        """Transient errors must still be retried up to MAX_RETRIES times."""
+        from integrations.groww_client import _retry_sync, MAX_RETRIES
+
+        calls = {"n": 0}
+
+        @_retry_sync
+        def _always_flaky():
+            calls["n"] += 1
+            raise Exception("Connection reset by peer")
+
+        with patch("integrations.groww_client.time.sleep", return_value=None):
+            with pytest.raises(Exception):
+                _always_flaky()
+        assert calls["n"] == MAX_RETRIES
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  GrowwClient — Circuit Breaker Telegram Alert
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestDataApiHealth:
+    """The scanner OHLCV poll loop publishes market-data API health and alerts
+    on forbidden↔OK transitions (so a silent trading blackout is surfaced)."""
+
+    @pytest.mark.asyncio
+    async def test_all_forbidden_sets_status_and_alerts_once(self):
+        import agents.scanner as scanner
+
+        scanner._data_api_forbidden = None  # reset transition state
+        forbidden = Exception("Access forbidden for this request.")
+        forbidden.code = "403"  # type: ignore[attr-defined]
+        sets: dict = {}
+
+        async def _fake_set(k, v, *a, **kw):
+            sets[k] = v
+
+        alert = AsyncMock()
+        with patch("core.redis_client.set_value", new=_fake_set), \
+             patch("integrations.telegram_client.send_data_api_alert", new=alert):
+            # First poll: every symbol 403 → FORBIDDEN + one alert
+            await scanner._update_data_api_health(0, 2, [forbidden, forbidden])
+            assert sets["data_api:status"] == "FORBIDDEN"
+            assert alert.await_count == 1
+            # Second consecutive forbidden poll: status stays, NO duplicate alert
+            await scanner._update_data_api_health(0, 2, [forbidden, forbidden])
+            assert alert.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_recovery_sets_ok_and_alerts(self):
+        import agents.scanner as scanner
+
+        scanner._data_api_forbidden = True  # was forbidden
+        sets: dict = {}
+
+        async def _fake_set(k, v, *a, **kw):
+            sets[k] = v
+
+        alert = AsyncMock()
+        with patch("core.redis_client.set_value", new=_fake_set), \
+             patch("integrations.telegram_client.send_data_api_alert", new=alert):
+            await scanner._update_data_api_health(2, 2, [{"close": 1}, {"close": 2}])
+            assert sets["data_api:status"] == "OK"
+            alert.assert_awaited_once_with(forbidden=False)
+
+    @pytest.mark.asyncio
+    async def test_partial_success_is_degraded_no_alert(self):
+        import agents.scanner as scanner
+
+        scanner._data_api_forbidden = False
+        sets: dict = {}
+
+        async def _fake_set(k, v, *a, **kw):
+            sets[k] = v
+
+        alert = AsyncMock()
+        with patch("core.redis_client.set_value", new=_fake_set), \
+             patch("integrations.telegram_client.send_data_api_alert", new=alert):
+            await scanner._update_data_api_health(1, 2, [Exception("net blip")])
+            assert sets["data_api:status"] == "DEGRADED"
+            alert.assert_not_awaited()
 
 
 class TestCircuitBreakerAlert:

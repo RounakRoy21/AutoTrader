@@ -261,6 +261,66 @@
   }
 }
 
+/* Widget mode: remove nested-card feel and reclaim horizontal space */
+.feed-widget-shell {
+  padding: 0;
+}
+
+.widget-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 0 8px;
+}
+
+.widget-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.widget-updated {
+  font-size: 0.72rem;
+  color: var(--at-text-muted);
+}
+
+.feed-widget-shell ::ng-deep .mat-mdc-tab-body-content {
+  padding: 0;
+}
+
+.feed-widget-shell .feed-list {
+  max-height: 440px;
+}
+
+/* Group rejected entries to avoid long flooded lists */
+.reject-accordion {
+  display: block;
+}
+
+.reject-accordion .mat-expansion-panel {
+  background: transparent;
+  box-shadow: none;
+  border: 1px solid var(--at-border-subtle);
+  border-radius: 8px;
+  margin-bottom: 8px;
+}
+
+.reject-accordion .mat-expansion-panel-header {
+  padding: 0 12px;
+  min-height: 44px;
+}
+
+.reject-accordion .mat-expansion-panel-body {
+  padding: 0 10px 10px;
+}
+
+.grouped-list {
+  max-height: 360px;
+}
+
 // ── Dark theme overrides ───────────────────────────────────────
 :host-context(.dark-theme) {
   .loading-state, .empty-state { color: var(--at-text-secondary); }

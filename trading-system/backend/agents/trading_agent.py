@@ -378,6 +378,25 @@ class TradingAgent:
             logger.error("Order placement failed for %s: %s", signal.stock, exc)
             return
 
+        # ── Partial profit-booking target ──────────────────────────────────────
+        # Compute the (immutable) price at which a fraction of the position is
+        # scaled out: entry + R × trigger_multiple, where R = entry − initial stop.
+        # Only set when enabled, the size is splittable (>= 2), and the level sits
+        # strictly below the full target (otherwise the partial would never fire
+        # before the position closes on target).
+        partial_target_price = None
+        risk_per_share = fill_price - decision.stop_loss_price
+        if (
+            settings.partial_booking_enabled
+            and decision.adjusted_qty >= 2
+            and risk_per_share > 0
+        ):
+            candidate = round(
+                fill_price + risk_per_share * settings.partial_booking_trigger_r, 2
+            )
+            if candidate < decision.target_price:
+                partial_target_price = candidate
+
         # Persist trade to DB
         async with get_db_context() as session:
             trade = Trade(
@@ -387,9 +406,11 @@ class TradingAgent:
                 direction="BUY",
                 product_type=decision.product_type.value,
                 quantity=decision.adjusted_qty,
+                original_quantity=decision.adjusted_qty,
                 entry_price=fill_price,
                 stop_loss_price=decision.stop_loss_price,
                 target_price=decision.target_price,
+                partial_target_price=partial_target_price,
                 status="OPEN",
                 trade_date=now_ist.date(),
                 entry_time=now_ist.time(),

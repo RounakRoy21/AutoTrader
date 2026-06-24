@@ -1,5 +1,5 @@
 ﻿# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# AutoTrader â€” single launch script (Windows / local dev)
+# AutoTrader single launch script (Windows / local dev)
 #
 # Usage:
 #   .\start.ps1           # start all services (no image rebuild)
@@ -79,7 +79,7 @@ Write-Ok "Docker is running"
 
 # â”€â”€ 2. Start containers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # depends_on: condition: service_healthy ensures postgres and redis are ready
-# before the backend starts â€” no manual health-wait loops needed.
+# before the backend starts no manual health-wait loops needed.
 Write-Info "Starting containers$(if ($Build) { ' (with image rebuild)' })..."
 if ($Build) {
     docker-compose up -d --build

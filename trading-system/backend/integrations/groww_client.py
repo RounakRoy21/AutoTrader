@@ -52,6 +52,22 @@ MAX_RETRIES = 3
 CIRCUIT_BREAKER_SECONDS = 60
 
 
+def _is_permanent_groww_error(exc: Exception) -> bool:
+    """Return True for errors that retrying cannot fix (HTTP 4xx auth/permission).
+
+    A 403 "Access forbidden" means the account's Trading API subscription does
+    not include the requested API group (e.g. Live Data / Historical Data) — it
+    is not a transient network blip.  Retrying such calls 3× with exponential
+    backoff only wastes ~14s per call and floods the logs.  We surface the
+    failure immediately instead.
+    """
+    code = str(getattr(exc, "code", "") or "")
+    if code in ("401", "403"):
+        return True
+    msg = str(exc).lower()
+    return "access forbidden" in msg or "unauthori" in msg
+
+
 def _retry_sync(func: Callable) -> Callable:
     """Decorator: retry a synchronous Groww SDK call with exponential backoff."""
     @functools.wraps(func)
@@ -62,6 +78,17 @@ def _retry_sync(func: Callable) -> Callable:
                 return func(*args, **kwargs)
             except Exception as exc:
                 last_exc = exc
+                # Permanent 4xx (forbidden / unauthorised) — retrying is futile.
+                # Fail fast so the real cause (missing data-API entitlement) is
+                # obvious and startup is not delayed by backoff sleeps.
+                if _is_permanent_groww_error(exc):
+                    logger.error(
+                        "Groww API call %s rejected with a permanent error "
+                        "(%s) — not retrying. This usually means the Trading API "
+                        "subscription does not grant access to this endpoint.",
+                        func.__name__, exc,
+                    )
+                    raise
                 wait = 2 ** attempt
                 logger.warning(
                     "Groww API call %s failed (attempt %d/%d): %s — retrying in %ds",
@@ -337,6 +364,55 @@ class GrowwClient:
         self._groww: Optional["_GrowwAPI"] = None  # type: ignore[type-arg]
         self._last_failure: float = 0.0
         self._cached_token: Optional[str] = None
+        self._zero_volume_warned_symbols: set[str] = set()
+
+    @staticmethod
+    def _extract_quote_volume(raw: Dict[str, Any]) -> int:
+        """Extract cumulative traded volume from heterogeneous Groww quote payloads.
+
+        Groww SDK payload keys are not fully stable across versions/environments.
+        Try common aliases first, then inspect nested dicts used by some releases.
+        Returns 0 when no usable volume field is present.
+        """
+        candidate_keys = (
+            "volume",
+            "total_volume",
+            "volume_traded",
+            "traded_volume",
+            "volumeTraded",
+            "volumeTradedToday",
+            "totalTradedVolume",
+            "todayVolume",
+            "dayVolume",
+            "v",
+        )
+
+        for key in candidate_keys:
+            val = raw.get(key)
+            if val is not None:
+                try:
+                    iv = int(float(val))
+                    if iv >= 0:
+                        return iv
+                except (TypeError, ValueError):
+                    pass
+
+        # Some payloads nest quote stats under one of these objects.
+        for nested_key in ("quote", "quote_data", "market_data", "stats", "market_stats"):
+            nested = raw.get(nested_key)
+            if not isinstance(nested, dict):
+                continue
+            for key in candidate_keys:
+                val = nested.get(key)
+                if val is not None:
+                    try:
+                        iv = int(float(val))
+                        if iv >= 0:
+                            return iv
+                    except (TypeError, ValueError):
+                        pass
+
+        return 0
 
     def invalidate_token(self) -> None:
         """Evict the in-memory token so the next call re-reads from Redis."""
@@ -763,17 +839,28 @@ class GrowwClient:
             logger.warning("get_ohlcv_snapshot failed for %s: %s", symbol, exc)
             return {}
 
-        # Response structure: {"ohlc": {"open": ..., "high": ..., "low": ..., "close": ...},
-        #                       "volume": ..., "last_price": ..., ...}
+        # Response structure typically contains:
+        #   {"ohlc": {"open": ..., "high": ..., "low": ..., "close": ...},
+        #    "volume"|"volumeTradedToday"|..., "last_price": ..., ...}
         # The "ohlc.close" is the PREVIOUS day's settlement price.  "last_price" is the
         # current LTP, which is the better intraday "close" for indicator calculation.
         ohlc = raw.get("ohlc", {})
+        volume = self._extract_quote_volume(raw)
+        last_price = float(raw.get("last_price") or ohlc.get("close") or 0)
+        if volume == 0 and last_price > 0 and symbol not in self._zero_volume_warned_symbols:
+            self._zero_volume_warned_symbols.add(symbol)
+            logger.warning(
+                "get_ohlcv_snapshot: %s quote had LTP but no usable volume field. "
+                "Observed keys: %s",
+                symbol,
+                sorted(list(raw.keys())),
+            )
         return {
             "open":   float(ohlc.get("open")  or 0),
             "high":   float(ohlc.get("high")  or 0),
             "low":    float(ohlc.get("low")   or 0),
-            "close":  float(raw.get("last_price") or ohlc.get("close") or 0),
-            "volume": int(  raw.get("volume") or raw.get("total_volume") or 0),
+            "close":  last_price,
+            "volume": volume,
         }
 
     async def get_historical_data(
