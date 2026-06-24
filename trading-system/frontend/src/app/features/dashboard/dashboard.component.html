@@ -60,6 +60,22 @@
           <span>MARKET DATA FORBIDDEN — no quotes/volume, scanner cannot signal. Check Groww data subscription.</span>
         </div>
 
+        <!-- Scanner candle warmup banner -->
+        <div class="warmup-banner" *ngIf="isWarmingUp">
+          <div class="warmup-header">
+            <mat-icon>hourglass_top</mat-icon>
+            <span>Building candles — signals available in ~{{ warmupRemainingMin | number:'1.0-0' }} min</span>
+          </div>
+          <mat-progress-bar
+            mode="determinate"
+            [value]="warmupPct"
+            class="warmup-bar">
+          </mat-progress-bar>
+          <div class="warmup-sub">
+            {{ warmupPct | number:'1.0-0' }}% complete ({{ agentStatus.scanner_warmup?.required_candles }} × 1-min candles needed before signals fire)
+          </div>
+        </div>
+
         <div class="status-row">
           <span class="status-dot at-pulse" [class.active]="agentStatus.research_agent.status === 'ACTIVE'"
                 [class.inactive]="agentStatus.research_agent.status !== 'ACTIVE'"></span>

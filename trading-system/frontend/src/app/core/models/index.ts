@@ -102,6 +102,13 @@ export interface AgentStatus {
     status: 'OK' | 'DEGRADED' | 'FORBIDDEN' | 'UNKNOWN';
     detail: string | null;
   };
+  scanner_warmup?: {
+    complete: boolean;
+    pct: number;
+    elapsed_min: number;
+    remaining_min: number;
+    required_candles: number;
+  };
   config?: {
     paper_trading: boolean;
     max_trades_per_day: number;

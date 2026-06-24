@@ -818,10 +818,12 @@ class RiskManager:
         total_loss = total_realised_loss + unrealised_loss
         limit = self._settings.daily_drawdown_limit
 
-        # Always track current drawdown in Redis so the dashboard can read it
+        # Always track current drawdown in Redis so the dashboard can read it.
+        # TTL = 28 hours so stale values from a prior trading session never
+        # bleed into the next day when the agent hasn't started yet.
         drawdown_pct = round((total_loss / limit) * 100, 2) if limit > 0 else 0.0
-        await set_value("agent:risk:daily_loss", str(round(total_loss, 2)))
-        await set_value("agent:risk:drawdown_pct", str(drawdown_pct))
+        await set_value("agent:risk:daily_loss", str(round(total_loss, 2)), ttl=100800)
+        await set_value("agent:risk:drawdown_pct", str(drawdown_pct), ttl=100800)
 
         # ── Soft alert at 2% (warn once — no halt) ────────────────────────────
         soft_limit = self._settings.total_capital * self._settings.daily_drawdown_soft_alert_pct

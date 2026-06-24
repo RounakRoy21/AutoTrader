@@ -35,6 +35,7 @@ from core.redis_keys import (
     DATA_API_STATUS_KEY,
     DATA_API_DETAIL_KEY,
     DATA_API_LAST_OK_KEY,
+    SCANNER_FEED_CONNECTED_AT_KEY,
 )
 from core.nse_calendar import get_market_status
 from agents.trading_agent_manager import get_trading_agent_manager
@@ -89,6 +90,7 @@ async def get_agent_status():
         ANTHROPIC_CALLS_DECISION_KEY,   # 14
         DATA_API_STATUS_KEY,            # 15
         DATA_API_DETAIL_KEY,            # 16
+        SCANNER_FEED_CONNECTED_AT_KEY,  # 17
     ]
     try:
         r = await get_redis()
@@ -99,6 +101,30 @@ async def get_agent_status():
     settings = get_settings()
     calls_research = int(values[13]) if values[13] else 0
     calls_decision = int(values[14]) if values[14] else 0
+
+    # ── Scanner candle warmup ──────────────────────────────────────────────────
+    # Signal generation requires MIN_CANDLES_FOR_INDICATORS (15) completed 1m
+    # candles. The indicator is only meaningful when the trading agent is ACTIVE
+    # and GrowwFeed has connected (feed_connected_at is set).
+    WARMUP_CANDLES = 15  # mirrors scanner.MIN_CANDLES_FOR_INDICATORS
+    warmup_complete = True
+    warmup_pct = 100.0
+    warmup_elapsed_min = 0.0
+    warmup_remaining_min = 0.0
+    feed_connected_at_str = values[17].decode() if isinstance(values[17], bytes) else (values[17] or "")
+    trading_active = (values[1].decode() if isinstance(values[1], bytes) else (values[1] or "")) == "ACTIVE"
+    if trading_active and feed_connected_at_str:
+        try:
+            from datetime import datetime, timezone
+            connected_at = datetime.fromisoformat(feed_connected_at_str)
+            elapsed_min = (datetime.now(timezone.utc) - connected_at).total_seconds() / 60.0
+            warmup_elapsed_min = round(elapsed_min, 1)
+            pct = min(100.0, (elapsed_min / WARMUP_CANDLES) * 100.0)
+            warmup_pct = round(pct, 1)
+            warmup_complete = elapsed_min >= WARMUP_CANDLES
+            warmup_remaining_min = round(max(0.0, WARMUP_CANDLES - elapsed_min), 1)
+        except Exception:
+            pass  # non-critical — leave defaults (complete=True = no false banner)
 
     return _envelope(True, {
         "research_agent": {
@@ -126,11 +152,18 @@ async def get_agent_status():
             "calls_total_today": calls_research + calls_decision,
         },
         "data_api": {
-            # OK | DEGRADED | FORBIDDEN | UNKNOWN — FORBIDDEN means the Groww
-            # Live-Data/Historical subscription is inactive and the scanner
-            # cannot generate signals (silent trading blackout).
             "status": values[15] or "UNKNOWN",
             "detail": values[16],
+        },
+        "scanner_warmup": {
+            # complete=False means signals are not yet possible; the frontend
+            # should show a progress bar rather than making the user think the
+            # system is broken.
+            "complete": warmup_complete,
+            "pct": warmup_pct,
+            "elapsed_min": warmup_elapsed_min,
+            "remaining_min": warmup_remaining_min,
+            "required_candles": WARMUP_CANDLES,
         },
         "market_status": get_market_status(),
         "config": {

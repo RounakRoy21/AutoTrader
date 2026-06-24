@@ -82,6 +82,39 @@
   mat-icon { font-size: 18px; width: 18px; height: 18px; }
 }
 
+.warmup-banner {
+  background: rgba(234, 179, 8, 0.08);
+  border: 1px solid rgba(234, 179, 8, 0.3);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+
+  .warmup-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: #ca8a04;
+    margin-bottom: 8px;
+    mat-icon { font-size: 18px; width: 18px; height: 18px; }
+  }
+
+  .warmup-bar {
+    border-radius: 4px;
+    height: 6px;
+    margin-bottom: 6px;
+    // Override the Material accent colour to amber
+    --mdc-linear-progress-active-indicator-color: #ca8a04;
+    --mdc-linear-progress-track-color: rgba(234, 179, 8, 0.15);
+  }
+
+  .warmup-sub {
+    font-size: 0.75rem;
+    color: rgba(202, 138, 4, 0.75);
+  }
+}
+
 .status-header-spacer { flex: 1 1 auto; }
 
 .status-row {

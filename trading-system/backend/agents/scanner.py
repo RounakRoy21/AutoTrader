@@ -904,6 +904,22 @@ class Scanner:
                 len(tokens), ", ".join(token_labels),
             )
 
+        # Record the feed-connected timestamp in Redis so the dashboard can
+        # compute candle warmup progress (15 candles ≈ 15 min from this point).
+        try:
+            from datetime import datetime, timezone
+            from core.redis_client import set_value
+            from core.redis_keys import SCANNER_FEED_CONNECTED_AT_KEY
+            ts = datetime.now(timezone.utc).isoformat()
+            if self._loop is not None:
+                import asyncio
+                asyncio.run_coroutine_threadsafe(
+                    set_value(SCANNER_FEED_CONNECTED_AT_KEY, ts, ttl=86400),
+                    self._loop,
+                )
+        except Exception:
+            pass  # non-critical — warmup indicator is informational only
+
     def _on_close(self, ws, code, reason) -> None:
         logger.warning(
             "[Scanner] GrowwFeed connection closed: code=%s reason=%s",

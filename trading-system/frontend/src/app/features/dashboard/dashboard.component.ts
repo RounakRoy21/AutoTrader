@@ -210,6 +210,20 @@ export class DashboardComponent implements OnInit, OnDestroy {
     return this.agentStatus.risk_manager?.drawdown_pct ?? 0;
   }
 
+  /** True while the scanner is building its first 15 candles after connecting. */
+  get isWarmingUp(): boolean {
+    const w = this.agentStatus.scanner_warmup;
+    return this.agentStatus.trading_agent.status === 'ACTIVE' && !!w && !w.complete;
+  }
+
+  get warmupPct(): number {
+    return this.agentStatus.scanner_warmup?.pct ?? 100;
+  }
+
+  get warmupRemainingMin(): number {
+    return this.agentStatus.scanner_warmup?.remaining_min ?? 0;
+  }
+
   get drawdownColor(): string {
     if (this.drawdownPct >= 80) return 'warn';
     if (this.drawdownPct >= 50) return 'accent';

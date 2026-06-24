@@ -64,3 +64,10 @@ DATA_API_STATUS_KEY = "data_api:status"      # "OK" | "FORBIDDEN" | "DEGRADED"
 DATA_API_DETAIL_KEY = "data_api:detail"      # last error message (human readable)
 DATA_API_LAST_OK_KEY = "data_api:last_ok"    # ISO timestamp of last successful poll
 
+# ── Scanner warmup ────────────────────────────────────────────────────────────
+# Written by the scanner the moment GrowwFeed connects.  The dashboard derives a
+# progress percentage from now − feed_connected_at so the user can see how many
+# of the required 15 candles have accumulated instead of seeing "no signals" and
+# assuming something is broken.  TTL = 86400 s (auto-expires at midnight).
+SCANNER_FEED_CONNECTED_AT_KEY = "scanner:feed_connected_at"  # ISO-8601 UTC string
+
