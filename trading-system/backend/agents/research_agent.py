@@ -37,10 +37,14 @@ from integrations.news_aggregator import HybridNewsAggregator
 from integrations.nse_client import (
     fetch_bulk_deals,
     fetch_corporate_actions_today,
+    fetch_corporate_announcements,
     fetch_delivery_data,
+    fetch_event_calendar,
     fetch_fii_dii_data,
+    fetch_gift_nifty,
     fetch_nse_indices,
 )
+from integrations.rbi_client import fetch_rbi_updates
 from models.market_brief import MarketBrief
 from schemas.market_brief import (
     DxySchema,
@@ -67,7 +71,7 @@ IST = pytz.timezone("Asia/Kolkata")
 
 RESEARCH_SYSTEM_PROMPT = (
     "You are a pre-market analyst for Indian equity markets. Synthesise the RAW DATA into a "
-    "structured market brief. Be conservative on bias scoring. "
+    "structured market brief. Apply the BIAS_CONFIDENCE CALIBRATION section for all scoring. "
     "Return ONLY valid JSON — no preamble, no markdown. "
     "Global rule: for any field where available=False or the list/object is empty, skip that "
     "section and rely on the remaining signals.\n\n"
@@ -88,8 +92,10 @@ RESEARCH_SYSTEM_PROMPT = (
     "• earnings_drift_candidates[]: {stock, beat_pct (null for upcoming results — never fabricate)}\n"
     "• recommended_stance: FULL_SIZE_POSITIONS|HALF_SIZE_POSITIONS|AVOID_TRADING\n"
     "• position_size_override: null unless warranted (e.g. 'REDUCE_50PCT' at VIX STRESS)\n"
-    "• sgx_nifty sourced from S&P 500 futures (ES=F) × 0.65 Nifty/SPX beta — estimated "
-    "Nifty opening gap, not GIFT Nifty.\n\n"
+    "• sgx_nifty: when source='nse_gift_nifty' this is the REAL GIFT Nifty (NSE IX) "
+    "overnight futures — an actual tradeable Nifty opening-gap indicator. When "
+    "source='es_futures' it is an estimate from S&P 500 futures (ES=F) × 0.65 "
+    "Nifty/SPX beta, not GIFT Nifty.\n\n"
 
     "NEWS RULES:\n"
     "• age_minutes <180: HIGH relevance (fresh overnight catalyst, not yet priced in). "
@@ -151,6 +157,32 @@ RESEARCH_SYSTEM_PROMPT = (
     "(upcoming, unconfirmed — never fabricate). Empty calendar → earnings_drift_candidates=[].\n"
     "• Upcoming results + VIX ELEVATED/STRESS: doubly uncertain → lean avoid_today.\n\n"
 
+    "CORPORATE ANNOUNCEMENTS (corporate_announcements — recent NSE filings, watchlist stocks):\n"
+    "• Each entry: {symbol, category, summary, time, industry}. These are exchange-filed\n"
+    "  overnight catalysts — higher confidence than press/news because they are official.\n"
+    "• POSITIVE catalysts (large order wins, capex, fundraising at premium, buyback, "
+    "strong pre-results guidance, credit-rating upgrade): → watchlist_today; may raise "
+    "bias_confidence ≤0.05 when aligned with overall bias. Emit a news_flag "
+    "(type SECTOR_NEWS/EARNINGS_BEAT as appropriate, sentiment POSITIVE).\n"
+    "• NEGATIVE catalysts (SEBI/regulatory action, resignation of CEO/CFO/auditor, "
+    "rating downgrade, fundraising at steep discount, pledge invocation): → avoid_today. "
+    "Emit a news_flag (type REGULATORY_ACTION, sentiment NEGATIVE, urgency HIGH).\n"
+    "• Routine/administrative filings (record date, AGM notice, trading-window closure, "
+    "investor-meet schedule) carry NO directional signal — ignore for bias.\n"
+    "• Only reason about symbols actually present in corporate_announcements.\n\n"
+
+    "RBI / MACRO POLICY (rbi_updates — recent RBI press releases & notifications):\n"
+    "• Each entry: {title, category, published, age_hours}. Macro context only — never "
+    "set a single-stock bias from these.\n"
+    "• Repo-rate CUT or surprise liquidity injection (OMO/VRR): BULLISH for rate-sensitives "
+    "— banks, NBFCs (BAJFINANCE), autos, realty → may add BULLISH conviction.\n"
+    "• Repo-rate HIKE or liquidity tightening (CRR hike, VRRR): BEARISH for the same set; "
+    "compress bias_confidence ~10%.\n"
+    "• Regulatory penalty / business restriction on a specific bank/NBFC: stock-specific "
+    "NEGATIVE → avoid_today for that name if it is in the watchlist.\n"
+    "• Status-quo policy / routine auctions / administrative circulars: no directional signal.\n"
+    "• age_hours >48 → background only.\n\n"
+
     "BULK / BLOCK DEALS (bulk_deals — previous session, watchlist stocks only):\n"
     "• Institutional BUY (mutual fund, FPI, insurance co): accumulation signal → prefer for "
     "watchlist_today; may raise bias_confidence ≤0.05 when aligned with overall bias.\n"
@@ -161,8 +193,42 @@ RESEARCH_SYSTEM_PROMPT = (
     "DELIVERY % (delivery_pct — previous session, watchlist stocks only):\n"
     "• >60%: conviction positioning (real delivery, not intraday churn) → prefer in watchlist_today.\n"
     "• <25%: speculative churn → down-weight breakout/momentum conviction.\n"
-    "• Quality filter only — never use to set market_bias direction."
+    "• Quality filter only — never use to set market_bias direction.\n\n"
+
+    "BIAS_CONFIDENCE CALIBRATION (err toward the lower end of each band):\n"
+    "• 0.25–0.35: Conflicted or data missing. Default floor. Budget eve, election day, "
+    "global shock openings.\n"
+    "• 0.40–0.50: 1–2 signals agree, ≥1 material contra-signal. Most Indian sessions.\n"
+    "• 0.55–0.65: 3–4 signals agree, no significant contradiction "
+    "(e.g. GAP_UP + US positive + FII buying + NORMAL VIX).\n"
+    "• 0.65–0.75: 4–5 signals including ≥2 of {GIFT Nifty, FII, VIX, sector breadth} "
+    "aligned. ~1–2 sessions/week.\n"
+    "• 0.75–0.85: 5+ signals fully aligned, no contradiction. ~1–2 sessions/fortnight.\n"
+    "• >0.85: Major surprise only — RBI off-cycle cut/hike, Budget shock, "
+    "circuit-breaker morning. Genuinely rare.\n"
+    "Hard caps: never >0.70 at VIX ELEVATED; never >0.50 when any HIGH-urgency negative "
+    "flag present. FII flows and pre-market RBI/SEBI circulars can reverse any setup."
 )
+
+
+async def _fetch_earnings_calendar(symbols: list[str] | None) -> list[dict]:
+    """Upcoming earnings dates, preferring NSE's authoritative event-calendar.
+
+    Non-regression strategy: the NSE event-calendar is the source companies file
+    their board-meeting dates with, so it is preferred when it returns data.  If
+    NSE is empty (genuinely quiet week, or a silent block) or raises, we fall back
+    to the existing Yahoo Finance calendar.  Both return the identical
+    {"stock", "earnings_date"} schema, so downstream earnings_drift logic is
+    unchanged and the worst case is exactly today's behaviour.
+    """
+    try:
+        nse_events = await fetch_event_calendar(symbols)
+        if nse_events:
+            return nse_events
+        logger.info("NSE event-calendar empty — falling back to Yahoo earnings calendar")
+    except Exception as exc:
+        logger.warning("NSE event-calendar failed (%s) — falling back to Yahoo", exc)
+    return await fetch_earnings_calendar(symbols)
 
 
 async def collect_pre_market_data() -> dict:
@@ -197,6 +263,7 @@ async def collect_pre_market_data() -> dict:
         fii_dii, us_markets, dxy, sgx_nifty, india_vix,
         crude_oil, gold, earnings_cal, news_items, corp_actions,
         nse_indices, usdinr, nikkei, bulk_deals, delivery_data,
+        gift_nifty, corp_announcements, rbi_updates,
     ) = await asyncio.gather(
         fetch_fii_dii_data(),
         fetch_us_market_close(),
@@ -205,7 +272,7 @@ async def collect_pre_market_data() -> dict:
         fetch_india_vix(),
         fetch_crude_oil(),
         fetch_gold(),
-        fetch_earnings_calendar(prior_watchlist),
+        _fetch_earnings_calendar(prior_watchlist),
         _aggregator.fetch_all(watchlist=prior_watchlist),
         fetch_corporate_actions_today(),
         fetch_nse_indices(),
@@ -213,6 +280,9 @@ async def collect_pre_market_data() -> dict:
         fetch_nikkei(),
         fetch_bulk_deals(prior_watchlist),
         fetch_delivery_data(prior_watchlist),
+        fetch_gift_nifty(),
+        fetch_corporate_announcements(prior_watchlist),
+        fetch_rbi_updates(),
         return_exceptions=True,
     )
 
@@ -243,6 +313,24 @@ async def collect_pre_market_data() -> dict:
                 "Nifty50 overridden from NSE: %.2f (%.3f%%)",
                 nse_n50["current"], pct,
             )
+
+    # ── GIFT Nifty override (authoritative pre-market gap) ────────────────────
+    # GIFT Nifty (NSE IX) trades overnight and is the single best free indicator
+    # of the Nifty 50 opening gap at 6 AM IST — strictly better than both the
+    # ES=F × 0.65 synthetic proxy (fetch_sgx_nifty) and the stale NSE cash close.
+    # When available it takes precedence; the proxy remains the fallback.
+    if not isinstance(gift_nifty, Exception) and gift_nifty.get("available"):
+        sgx_nifty = {
+            "value": gift_nifty["value"],
+            "change_pct": gift_nifty["change_pct"],
+            "signal": gift_nifty["signal"],
+            "source": "nse_gift_nifty",
+            "expiry": gift_nifty.get("expiry"),
+        }
+        logger.info(
+            "Nifty gap overridden from GIFT Nifty: %.2f (%.3f%%) signal=%s",
+            gift_nifty["value"], gift_nifty["change_pct"], gift_nifty["signal"],
+        )
 
     # Handle any failures gracefully
     # mode='json' gives ISO-8601 datetimes; exclude 'link' because URLs
@@ -301,6 +389,14 @@ async def collect_pre_market_data() -> dict:
         "news_headlines": raw_news,
         "earnings_calendar": earnings_cal if not isinstance(earnings_cal, Exception) else [],
         "corporate_actions_today": corp_actions if not isinstance(corp_actions, Exception) else [],
+        # corporate_announcements: recent NSE filings for watchlist stocks (overnight
+        # catalysts — order wins, fundraising, regulatory actions).  Interpretation
+        # rules are in RESEARCH_SYSTEM_PROMPT under "CORPORATE ANNOUNCEMENTS".
+        "corporate_announcements": corp_announcements if not isinstance(corp_announcements, Exception) else [],
+        # rbi_updates: recent RBI press releases / notifications for macro-policy
+        # context.  Interpretation rules are in RESEARCH_SYSTEM_PROMPT under
+        # "RBI / MACRO POLICY".
+        "rbi_updates": rbi_updates if not isinstance(rbi_updates, Exception) else [],
         # bulk_deals: previous-session institutional bulk/block deals filtered to
         # the watchlist.  Interpretation rules are in RESEARCH_SYSTEM_PROMPT under
         # "BULK / BLOCK DEAL INTERPRETATION RULES".
@@ -359,7 +455,8 @@ def _parse_news_flags(headlines: list) -> list[NewsFlagSchema]:
         "AXISBANK":   ["axis bank", "axisbank"],
         "BAJFINANCE": ["bajaj finance"],
         "BAJAJFINSV": ["bajaj finserv"],
-        "INDUSINDBK": ["indusind bank"],
+        "JIOFIN":     ["jio financial", "jio finance"],
+        "SHRIRAMFIN": ["shriram finance"],
         "HDFCLIFE":   ["hdfc life"],
         "SBILIFE":    ["sbi life"],
         # ── Information Technology ────────────────────────────────────────────
@@ -368,48 +465,46 @@ def _parse_news_flags(headlines: list) -> list[NewsFlagSchema]:
         "WIPRO":      ["wipro"],
         "HCLTECH":    ["hcl tech", "hcl technologies"],
         "TECHM":      ["tech mahindra"],
-        "LTIM":       ["ltimindtree", "lti mindtree"],
-        # ── Consumer / FMCG ──────────────────────────────────────────────────
+        # ── Consumer / FMCG & Retail ─────────────────────────────────────────
         "RELIANCE":   ["reliance industries", "reliance jio", "reliance retail", "reliance"],
         "HINDUNILVR": ["hindustan unilever", " hul "],
         "NESTLEIND":  ["nestle india"],
         "ITC":        ["itc limited", "itc ltd", " itc "],
-        "BRITANNIA":  ["britannia"],
         "TATACONSUM": ["tata consumer"],
-        "DABUR":      ["dabur"],
+        "TRENT":      ["trent limited", "zudio", "westside"],
+        "ETERNAL":    ["zomato", "eternal limited", "blinkit"],
         # ── Automobiles ──────────────────────────────────────────────────────
         "MARUTI":     ["maruti suzuki", "maruti"],
-        # TATAMOTORS demerged: news mentioning "tata motors" can apply to both entities.
-        "TMPV":  ["tata motors", "tata passenger vehicles", "jaguar land rover", "jlr"],
-        "TMCV":  ["tata motors commercial", "tata commercial vehicles", "tmcv"],
+        # TATAMOTORS demerged: news mentioning "tata motors" is tagged to the passenger-vehicle entity.
+        "TMPV":       ["tata motors", "tata passenger vehicles", "jaguar land rover", "jlr"],
         "M&M":        ["mahindra & mahindra", "mahindra and mahindra"],
         "BAJAJ-AUTO": ["bajaj auto"],
-        "HEROMOTOCO": ["hero motocorp", "hero moto"],
         "EICHERMOT":  ["eicher motors", "royal enfield"],
+        # ── Aviation ─────────────────────────────────────────────────────────
+        "INDIGO":     ["indigo airlines", "interglobe aviation"],
         # ── Metals & Mining ───────────────────────────────────────────────────
         "TATASTEEL":  ["tata steel"],
         "JSWSTEEL":   ["jsw steel"],
         "HINDALCO":   ["hindalco"],
         "COALINDIA":  ["coal india"],
-        "VEDL":       ["vedanta"],
         # ── Energy & Utilities ────────────────────────────────────────────────
         "ONGC":       ["oil and natural gas corporation", "ongc"],
-        "BPCL":       ["bharat petroleum", "bpcl"],
         "NTPC":       ["ntpc"],
         "POWERGRID":  ["power grid corporation", "powergrid"],
-        # ── Pharmaceuticals ───────────────────────────────────────────────────
+        # ── Healthcare & Pharmaceuticals ──────────────────────────────────────
         "SUNPHARMA":  ["sun pharma", "sun pharmaceutical"],
         "DRREDDY":    ["dr. reddy", "dr reddy"],
         "CIPLA":      ["cipla"],
-        "DIVISLAB":   ["divi's lab", "divi laboratories"],
+        "MAXHEALTH":  ["max healthcare"],
         # ── Cement & Construction ─────────────────────────────────────────────
         "ULTRACEMCO": ["ultratech cement"],
         "GRASIM":     ["grasim"],
         "LT":         ["larsen & toubro", "larsen and toubro", "l&t"],
+        # ── Defence & Industrials ─────────────────────────────────────────────
+        "BEL":        ["bharat electronics", " bel "],
         # ── Diversified / Others ─────────────────────────────────────────────
         "TITAN":      ["titan company"],
         "ASIANPAINT": ["asian paints"],
-        "PIDILITIND": ["pidilite"],
         "APOLLOHOSP": ["apollo hospitals"],
         "BHARTIARTL": ["bharti airtel", "airtel"],
         "ADANIPORTS": ["adani ports"],
@@ -725,6 +820,10 @@ async def generate_market_brief(raw_data: dict) -> MarketBriefLLMOutput | None:
         response_model=MarketBriefLLMOutput,
         max_tokens=6000,   # Sonnet on the research prompt needs ~3000–5000 tokens;
                            # 4096 (the default) causes truncation → retry → double call.
+        thinking_budget=1500,  # Extended thinking: Claude reasons through signal
+                               # contradictions before committing to the JSON output.
+                               # Billed as output tokens (~$0.022/call extra at $15/MTok).
+                               # Requires temperature=1 (set automatically in the client).
     )
     if brief is None:
         logger.warning("LLM failed — falling back to mock brief")

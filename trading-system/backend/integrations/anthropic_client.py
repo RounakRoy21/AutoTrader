@@ -80,6 +80,7 @@ class AnthropicClient:
         response_model: Type[T],
         max_tokens: int = 4096,
         model: Optional[str] = None,
+        thinking_budget: Optional[int] = None,
     ) -> Optional[T]:
         """
         Send a prompt to Claude and validate the response against *response_model*.
@@ -117,6 +118,15 @@ class AnthropicClient:
             "cache_control": {"type": "ephemeral"},
         }]
 
+        # Extended thinking: when a budget is supplied Claude reasons internally
+        # before filling the tool schema.  Improves contradiction resolution on
+        # complex multi-signal days.  Requires temperature=1 (Anthropic constraint).
+        # max_tokens must exceed budget_tokens (6000 > 1500 ✓).
+        extra_kwargs: dict = {}
+        if thinking_budget is not None:
+            extra_kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
+            extra_kwargs["temperature"] = 1  # mandatory when thinking is enabled
+
         for attempt in range(1, MAX_LLM_RETRIES + 1):
             try:
                 message = await self._client.messages.create(
@@ -126,6 +136,7 @@ class AnthropicClient:
                     tools=tools,
                     tool_choice={"type": "tool", "name": _TOOL_NAME},
                     messages=[{"role": "user", "content": user_content}],
+                    **extra_kwargs,
                 )
                 # Increment daily call counter immediately after a successful HTTP
                 # response — before validation — so we count every billed API call

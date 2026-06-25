@@ -62,8 +62,8 @@ FALLBACK_TOKEN_MAP: Dict[str, int] = {
     "NTPC":        11630,
     "TECHM":       13538,
     "BAJAJFINSV":  16675,
-    "TMPV":  3456,    # Tata Motors Passenger Vehicles (successor to TATAMOTORS; same NSE token)
-    "TMCV":  759782,  # Tata Motors Commercial Vehicles (new entity post-demerger)
+    "TMPV":        3456,    # Tata Motors Passenger Vehicles (successor to TATAMOTORS; same NSE token)
+    "TMCV":        759782,  # Tata Motors Commercial Vehicles (new entity post-demerger)
     "TATASTEEL":   3499,
     "JSWSTEEL":    11723,
     "ADANIENT":    25,

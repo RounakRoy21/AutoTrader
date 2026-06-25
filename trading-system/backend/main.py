@@ -31,6 +31,7 @@ from core.redis_keys import (
 )
 from core.scheduler import (
     schedule_cron,
+    schedule_monthly,
     shutdown_scheduler,
     start_scheduler,
 )
@@ -258,7 +259,21 @@ async def lifespan(app: FastAPI):
         kwargs={"source": "scheduler"},
     )
 
-    # 7. Research catch-up: if backend starts during market hours and no research
+    # 7. NIFTY 50 constituent monitor — runs on the 1st of every month at 05:30 IST.
+    #    Detects companies entering/leaving the index and demergers/splits (e.g.
+    #    TATAMOTORS → TMPV + TMCV) and alerts the operator to refresh the hardcoded
+    #    ticker maps.  Monthly (not strictly quarterly) so off-cycle corporate
+    #    actions are caught within ~30 days; the check is a single cheap HTTP call.
+    from agents.nifty50_monitor import check_nifty50_drift
+    schedule_monthly(
+        func=check_nifty50_drift,
+        job_id="nifty50_constituent_check",
+        day=1,
+        hour=5,
+        minute=30,
+    )
+
+    # 8. Research catch-up: if backend starts during market hours and no research
     #    run has completed today, trigger one immediate run.
     #
     #    This prevents an entire day from running without a market brief when the
@@ -289,7 +304,7 @@ async def lifespan(app: FastAPI):
     start_scheduler()
     logger.info("✅ Scheduler started")
 
-    # 8. Catch-up: if backend starts during market hours (09:15–15:29 IST on a
+    # 9. Catch-up: if backend starts during market hours (09:15–15:29 IST on a
     #    non-holiday weekday), the 09:15 APScheduler job was already missed.
     #    Auto-start the trading session so paper trades can fire today.
     _should_autostart = (
@@ -308,7 +323,7 @@ async def lifespan(app: FastAPI):
         )
         asyncio.create_task(trading_manager.start_session(source="startup"))
 
-    # 9. Start WebSocket background tasks (Redis relay + LTP broadcaster)
+    # 10. Start WebSocket background tasks (Redis relay + LTP broadcaster)
     #    These must start after the event loop is running, hence here not at import time.
     start_ws_background_tasks()
 

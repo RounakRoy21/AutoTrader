@@ -9,9 +9,10 @@ in and acted on it.
 Sources used here are all free, require no authentication, have no rate
 limits, and update within 1–3 minutes of publication:
 
-    • 5 Indian financial media RSS feeds:
+    • 7 Indian financial media RSS feeds:
         Economic Times Markets, Hindu BusinessLine Markets,
-        Livemint, Business Standard, Hindu BusinessLine Economy
+        Livemint, Business Standard, Hindu BusinessLine Economy,
+        CNBC-TV18 Markets, NDTV Profit
 
     • Google News RSS per-stock queries (one per watchlist symbol)
 
@@ -74,6 +75,8 @@ _SOURCE_PRIORITY = [
     "livemint",
     "business_standard",
     "hindu_businessline_economy",
+    "cnbc_tv18",
+    "ndtv_profit",
     "google_news",
 ]
 
@@ -100,6 +103,8 @@ class HybridNewsAggregator:
         "livemint":                "https://www.livemint.com/rss/markets",
         "business_standard":       "https://www.business-standard.com/rss/markets-106.rss",
         "hindu_businessline_economy": "https://www.thehindubusinessline.com/economy/?service=rss",
+        "cnbc_tv18":               "https://www.cnbctv18.com/commonfeeds/v1/cne/rss/market.xml",
+        "ndtv_profit":             "https://www.ndtvprofit.com/stories.rss",
     }
 
     # NIFTY 50 symbol → human-readable Google News search term.
@@ -114,7 +119,8 @@ class HybridNewsAggregator:
         "AXISBANK":   "Axis Bank NSE",
         "BAJFINANCE": "Bajaj Finance NSE",
         "BAJAJFINSV": "Bajaj Finserv NSE",
-        "INDUSINDBK": "IndusInd Bank NSE",
+        "JIOFIN":     "Jio Financial Services NSE",
+        "SHRIRAMFIN": "Shriram Finance NSE",
         "HDFCLIFE":   "HDFC Life Insurance NSE",
         "SBILIFE":    "SBI Life Insurance NSE",
         # ── Information Technology ────────────────────────────────────────────
@@ -123,47 +129,45 @@ class HybridNewsAggregator:
         "WIPRO":      "Wipro NSE",
         "HCLTECH":    "HCL Technologies NSE",
         "TECHM":      "Tech Mahindra NSE",
-        "LTIM":       "LTIMindtree NSE",
-        # ── Consumer / FMCG ──────────────────────────────────────────────────
+        # ── Consumer / FMCG & Retail ─────────────────────────────────────────
         "RELIANCE":   "Reliance Industries NSE",
         "HINDUNILVR": "Hindustan Unilever HUL NSE",
         "NESTLEIND":  "Nestle India NSE",
         "ITC":        "ITC Limited NSE stock",
-        "BRITANNIA":  "Britannia Industries NSE",
         "TATACONSUM": "Tata Consumer Products NSE",
-        "DABUR":      "Dabur India NSE",
+        "TRENT":      "Trent Zudio Westside Tata NSE",
+        "ETERNAL":    "Eternal Zomato Blinkit NSE",
         # ── Automobiles ──────────────────────────────────────────────────────
         "MARUTI":     "Maruti Suzuki NSE",
-        "TMPV":  "Tata Motors Passenger Vehicles NSE TMPV",
-        "TMCV":  "Tata Motors Commercial Vehicles NSE TMCV",
+        "TMPV":       "Tata Motors Passenger Vehicles NSE TMPV",
         "M&M":        "Mahindra Mahindra NSE",
         "BAJAJ-AUTO": "Bajaj Auto NSE",
-        "HEROMOTOCO": "Hero MotoCorp NSE",
         "EICHERMOT":  "Eicher Motors Royal Enfield NSE",
+        # ── Aviation ─────────────────────────────────────────────────────────
+        "INDIGO":     "IndiGo Airlines InterGlobe Aviation NSE",
         # ── Metals & Mining ───────────────────────────────────────────────────
         "TATASTEEL":  "Tata Steel NSE",
         "JSWSTEEL":   "JSW Steel NSE",
         "HINDALCO":   "Hindalco Industries NSE",
         "COALINDIA":  "Coal India NSE",
-        "VEDL":       "Vedanta NSE",
         # ── Energy & Utilities ────────────────────────────────────────────────
         "ONGC":       "ONGC Oil Natural Gas Corporation NSE",
-        "BPCL":       "Bharat Petroleum BPCL NSE",
         "NTPC":       "NTPC NSE",
         "POWERGRID":  "Power Grid Corporation NSE",
-        # ── Pharmaceuticals ───────────────────────────────────────────────────
+        # ── Healthcare & Pharmaceuticals ──────────────────────────────────────
         "SUNPHARMA":  "Sun Pharmaceutical NSE",
         "DRREDDY":    "Dr Reddy Laboratories NSE",
         "CIPLA":      "Cipla NSE",
-        "DIVISLAB":   "Divis Laboratories NSE",
+        "MAXHEALTH":  "Max Healthcare NSE",
         # ── Cement & Construction ─────────────────────────────────────────────
         "ULTRACEMCO": "Ultratech Cement NSE",
         "GRASIM":     "Grasim Industries NSE",
         "LT":         "Larsen Toubro NSE",
+        # ── Defence & Industrials ─────────────────────────────────────────────
+        "BEL":        "Bharat Electronics BEL NSE",
         # ── Diversified / Others ─────────────────────────────────────────────
         "TITAN":      "Titan Company NSE",
         "ASIANPAINT": "Asian Paints NSE",
-        "PIDILITIND": "Pidilite Industries NSE",
         "APOLLOHOSP": "Apollo Hospitals NSE",
         "BHARTIARTL": "Bharti Airtel NSE",
         "ADANIPORTS": "Adani Ports NSE",

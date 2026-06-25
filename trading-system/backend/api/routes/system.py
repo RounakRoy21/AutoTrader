@@ -37,6 +37,9 @@ from core.redis_keys import (
     DATA_API_LAST_OK_KEY,
     SCANNER_FEED_CONNECTED_AT_KEY,
     LATEST_MARKET_BRIEF_KEY,
+    NIFTY50_CONSTITUENTS_KEY,
+    NIFTY50_DRIFT_KEY,
+    NIFTY50_LAST_CHECK_KEY,
 )
 from core.nse_calendar import get_market_status
 from agents.trading_agent_manager import get_trading_agent_manager
@@ -263,6 +266,61 @@ async def get_decision_feed(limit: int = 50):
     except Exception as exc:
         logger.error("Failed to read decision feed: %s", exc)
         return _envelope(False, {"decisions": [], "count": 0}, error=str(exc))
+
+
+@router.get("/api/system/nifty50")
+async def get_nifty50_status():
+    """Return the latest NIFTY 50 constituent-drift report and last-seen snapshot.
+
+    Surfaces whether the index membership has changed since the app's ticker maps
+    were last updated — i.e. which symbols to add/remove and which files to edit.
+    Returns the persisted report from the monthly monitor without making a network
+    call.  Use POST /api/system/nifty50/check to force a fresh fetch.
+    """
+    import json as _json
+    try:
+        r = await get_redis()
+        report_raw, snapshot_raw, last_check = await asyncio.gather(
+            r.get(NIFTY50_DRIFT_KEY),
+            r.get(NIFTY50_CONSTITUENTS_KEY),
+            r.get(NIFTY50_LAST_CHECK_KEY),
+        )
+    except Exception as exc:
+        return _envelope(False, error=str(exc))
+
+    def _load(raw):
+        if not raw:
+            return None
+        try:
+            return _json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception:
+            return None
+
+    last_check_val = last_check.decode() if isinstance(last_check, bytes) else last_check
+    return _envelope(True, {
+        "last_check": last_check_val,
+        "report": _load(report_raw),
+        "snapshot": _load(snapshot_raw),
+        "checked": last_check_val is not None,
+    })
+
+
+@router.post("/api/system/nifty50/check", dependencies=[Depends(_require_api_key)])
+async def run_nifty50_check():
+    """Run the NIFTY 50 constituent-drift check on demand and return the report.
+
+    Performs a live fetch of the official constituents, diffs against the app's
+    coverage registry, persists the result, and raises a system alert if drift is
+    detected.  Lets the operator refresh on demand instead of waiting for the
+    monthly job.
+    """
+    from agents.nifty50_monitor import check_nifty50_drift
+    try:
+        report = await check_nifty50_drift(trigger="manual")
+        return _envelope(bool(report.get("available")), report)
+    except Exception as exc:
+        logger.error("Manual NIFTY 50 check failed: %s", exc)
+        return _envelope(False, error=str(exc))
 
 
 @router.get("/api/agent/scanner-debug")

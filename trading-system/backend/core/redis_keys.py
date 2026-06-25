@@ -71,3 +71,13 @@ DATA_API_LAST_OK_KEY = "data_api:last_ok"    # ISO timestamp of last successful 
 # assuming something is broken.  TTL = 86400 s (auto-expires at midnight).
 SCANNER_FEED_CONNECTED_AT_KEY = "scanner:feed_connected_at"  # ISO-8601 UTC string
 
+# ── NIFTY 50 constituent monitor ──────────────────────────────────────────────
+# Written by agents/nifty50_monitor.check_nifty50_drift() (monthly job).  Tracks
+# the official index membership so the operator is alerted when stocks enter/leave
+# the NIFTY 50 or a demerger/split occurs and the hardcoded ticker maps need a
+# refresh.  No TTL — these persist across restarts so drift is detected against
+# the last-seen snapshot.
+NIFTY50_CONSTITUENTS_KEY = "nifty50:constituents"   # JSON: last-seen live symbols + companies + ts
+NIFTY50_DRIFT_KEY = "nifty50:drift_report"          # JSON: latest diff report
+NIFTY50_LAST_CHECK_KEY = "nifty50:last_check"       # ISO-8601 IST timestamp of last check
+

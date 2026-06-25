@@ -65,6 +65,28 @@ def schedule_interval(
     logger.info("Scheduled interval job '%s' every %ds", job_id, seconds)
 
 
+def schedule_monthly(
+    func: Callable,
+    job_id: str,
+    day: int = 1,
+    hour: int = 5,
+    minute: int = 30,
+    **kwargs,
+) -> None:
+    """Register a job that runs once a month (e.g. NIFTY 50 constituent check).
+
+    Fires on *day* of every month at HH:MM IST, on any weekday.  Used for
+    low-frequency maintenance tasks that do not need to align with trading hours.
+    """
+    scheduler = get_scheduler()
+    trigger = CronTrigger(day=day, hour=hour, minute=minute, timezone=IST)
+    scheduler.add_job(func, trigger, id=job_id, replace_existing=True, **kwargs)
+    logger.info(
+        "Scheduled monthly job '%s' on day %d at %02d:%02d IST",
+        job_id, day, hour, minute,
+    )
+
+
 def start_scheduler() -> None:
     """Start the scheduler if it is not already running."""
     scheduler = get_scheduler()

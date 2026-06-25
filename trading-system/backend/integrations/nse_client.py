@@ -27,10 +27,16 @@ IST = pytz.timezone("Asia/Kolkata")
 NSE_FII_DII_URL = "https://www.nseindia.com/api/fiidiiTradeReact"
 NSE_CORP_ACTIONS_URL = "https://www.nseindia.com/api/corporates-corporateActions"
 NSE_ALL_INDICES_URL = "https://www.nseindia.com/api/allIndices"
+NSE_MARKET_STATUS_URL = "https://www.nseindia.com/api/marketStatus"
+NSE_EVENT_CALENDAR_URL = "https://www.nseindia.com/api/event-calendar"
+NSE_CORP_ANNOUNCEMENTS_URL = "https://www.nseindia.com/api/corporate-announcements"
 NSE_LARGE_DEAL_URL = "https://www.nseindia.com/api/snapshot-capital-market-largedeal"
 # Security-wise full bhavcopy (includes DELIV_PER column).  Date is appended as DDMMYYYY.
 NSE_BHAVCOPY_BASE = "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_"
 TIMEOUT = 10
+
+# Hard cap on corporate-announcement items returned (keeps the LLM prompt bounded).
+_ANNOUNCEMENTS_CAP = 25
 
 # NSE requires specific headers to avoid 403
 HEADERS = {
@@ -292,6 +298,294 @@ async def fetch_nse_indices() -> Dict[str, Any]:
         logger.error("NSE allIndices HTTP error: %s", exc)
     except Exception as exc:
         logger.error("NSE allIndices fetch failed: %s", exc)
+
+    return result
+
+
+async def fetch_gift_nifty() -> Dict[str, Any]:
+    """
+    Fetch real GIFT Nifty (NSE IX) overnight futures from NSE's marketStatus API.
+
+    GIFT Nifty trades on NSE International Exchange (GIFT City, Gandhinagar) almost
+    around the clock and is the single best free pre-market indicator of the Nifty 50
+    opening gap.  Unlike the ES=F × 0.65 synthetic proxy, this is the actual Nifty
+    futures contract that Indian institutional desks watch at 6 AM IST.
+
+    The marketStatus endpoint returns a `giftnifty` object alongside the cash-market
+    open/close states:
+        {"INSTRUMENTTYPE": "GIFT NIFTY", "LASTPRICE": 23456.5, "DAYCHANGE": "+85.00",
+         "PERCHANGE": "+0.36", "EXPIRYDATE": "26-Jun-2026", ...}
+
+    Returns the same schema shape as fetch_sgx_nifty() (value, change_pct, signal)
+    for backward compatibility with the LLM prompt and database, plus `expiry` and
+    `available`.
+    """
+    result: Dict[str, Any] = {
+        "value": 0.0,
+        "change_pct": 0.0,
+        "day_change": 0.0,
+        "expiry": None,
+        "signal": "FLAT",
+        "source": "nse_gift_nifty",
+        "available": False,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT, headers=HEADERS) as client:
+            # Establish session cookie — NSE blocks unauthenticated API calls.
+            await client.get("https://www.nseindia.com/")
+            resp = await client.get(NSE_MARKET_STATUS_URL)
+            resp.raise_for_status()
+            data = resp.json()
+
+        gift = data.get("giftnifty") or {}
+        last_price = _safe_float(gift.get("LASTPRICE"))
+        pct_change = _safe_float(gift.get("PERCHANGE"))
+        day_change = _safe_float(gift.get("DAYCHANGE"))
+
+        if last_price > 0:
+            result["available"] = True
+            result["value"] = last_price
+            result["change_pct"] = round(pct_change, 3)
+            result["day_change"] = round(day_change, 2)
+            result["expiry"] = gift.get("EXPIRYDATE")
+            if pct_change > 0.2:
+                result["signal"] = "GAP_UP"
+            elif pct_change < -0.2:
+                result["signal"] = "GAP_DOWN"
+            logger.info(
+                "GIFT Nifty via NSE: %.2f (%.3f%%) signal=%s expiry=%s",
+                last_price, pct_change, result["signal"], result["expiry"],
+            )
+        else:
+            logger.warning("NSE marketStatus returned no usable giftnifty data")
+
+    except httpx.HTTPStatusError as exc:
+        logger.error("NSE GIFT Nifty HTTP error: %s", exc)
+    except Exception as exc:
+        logger.error("NSE GIFT Nifty fetch failed: %s", exc)
+
+    return result
+
+
+# Watchlist applied to the NSE event calendar so it mirrors the Yahoo Finance
+# earnings-calendar fallback exactly and never floods the watchlist with
+# whole-market board meetings.  Mirrors alpha_vantage_client._EARNINGS_DEFAULT_SYMBOLS.
+_EVENT_CALENDAR_DEFAULT_SYMBOLS = [
+    "RELIANCE", "HDFCBANK", "INFY", "ICICIBANK", "TCS",
+    "WIPRO", "AXISBANK", "KOTAKBANK", "SBIN", "BAJFINANCE",
+    "HINDUNILVR", "ITC", "LT", "ONGC", "NTPC",
+    "TMPV", "TATASTEEL", "SUNPHARMA", "MARUTI", "TITAN",
+    "JIOFIN", "SHRIRAMFIN", "TRENT", "ETERNAL", "INDIGO", "BEL", "MAXHEALTH",
+]
+
+
+async def fetch_event_calendar(
+    symbols: Optional[List[str]] = None,
+    lookahead_days: int = 7,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch upcoming NSE earnings dates from the NSE event-calendar API.
+
+    This is the authoritative source for Indian board-meeting / results dates —
+    it is the same data companies file with the exchange.  It returns the WHOLE
+    market, so results are filtered to *symbols* (the watchlist) and to board
+    meetings whose `purpose` includes "Financial Results" (the purpose field can
+    be compound, e.g. "Financial Results/Dividend").
+
+    Returns the SAME schema as alpha_vantage_client.fetch_earnings_calendar():
+        [{"stock": "INFY", "earnings_date": "2026-07-23"}, ...]
+    so it is a drop-in replacement.  Returns [] on any failure or no match — the
+    caller falls back to the Yahoo Finance calendar so behaviour never regresses.
+    """
+    target = {s.strip().upper() for s in (symbols or _EVENT_CALENDAR_DEFAULT_SYMBOLS)}
+    today = ist_today()
+    cutoff = today + timedelta(days=lookahead_days)
+
+    results: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT, headers=HEADERS) as client:
+            # Establish session cookie — NSE blocks unauthenticated API calls.
+            await client.get("https://www.nseindia.com/")
+            resp = await client.get(NSE_EVENT_CALENDAR_URL)
+            resp.raise_for_status()
+            data = resp.json()
+
+        for entry in data if isinstance(data, list) else []:
+            purpose = (entry.get("purpose") or "")
+            if "financial results" not in purpose.lower():
+                continue
+            symbol = (entry.get("symbol") or "").strip().upper()
+            if symbol not in target or symbol in seen:
+                continue
+            date_str = (entry.get("date") or "").strip()
+            try:
+                ev_date = datetime.strptime(date_str, "%d-%b-%Y").date()
+            except ValueError:
+                logger.debug("Could not parse event-calendar date '%s' for %s", date_str, symbol)
+                continue
+            if today <= ev_date <= cutoff:
+                results.append({"stock": symbol, "earnings_date": ev_date.isoformat()})
+                seen.add(symbol)
+
+        logger.info(
+            "NSE event-calendar: %d watchlist results in next %d days",
+            len(results), lookahead_days,
+        )
+
+    except httpx.HTTPStatusError as exc:
+        logger.error("NSE event-calendar HTTP error: %s", exc)
+    except Exception as exc:
+        logger.error("NSE event-calendar fetch failed: %s", exc)
+
+    return results
+
+
+async def fetch_corporate_announcements(
+    symbols: Optional[List[str]] = None,
+    lookback_hours: int = 20,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch recent NSE corporate announcements — overnight catalysts that move stocks
+    at the open (order wins, fundraising, board changes, regulatory filings, etc.).
+
+    When *symbols* is provided the feed is filtered to those stocks (keeps the LLM
+    prompt focused on the watchlist).  When omitted (cold start) the whole-market
+    feed is returned, capped at _ANNOUNCEMENTS_CAP.
+
+    Returns a list of:
+        {"symbol", "category", "summary", "time", "industry"}
+    Returns [] on any failure.
+    """
+    now = datetime.now(IST)
+    cutoff = now - timedelta(hours=lookback_hours)
+    target = {s.strip().upper() for s in symbols} if symbols else None
+
+    out: List[Dict[str, Any]] = []
+
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT, headers=HEADERS) as client:
+            # Establish session cookie — NSE blocks unauthenticated API calls.
+            await client.get("https://www.nseindia.com/")
+            resp = await client.get(f"{NSE_CORP_ANNOUNCEMENTS_URL}?index=equities")
+            resp.raise_for_status()
+            data = resp.json()
+
+        for entry in data if isinstance(data, list) else []:
+            symbol = (entry.get("symbol") or "").strip().upper()
+            if not symbol:
+                continue
+            if target is not None and symbol not in target:
+                continue
+
+            an_dt = (entry.get("an_dt") or "").strip()  # e.g. "26-Jun-2026 08:15:30"
+            ann_time = None
+            try:
+                ann_time = IST.localize(datetime.strptime(an_dt, "%d-%b-%Y %H:%M:%S"))
+            except (ValueError, TypeError):
+                ann_time = None  # keep undated items rather than silently dropping
+            # Only drop items we can date AND that are older than the window.
+            if ann_time is not None and ann_time < cutoff:
+                continue
+
+            summary = (entry.get("attchmntText") or entry.get("desc") or "").strip()
+            if len(summary) > 240:
+                summary = summary[:237] + "..."
+
+            out.append({
+                "symbol": symbol,
+                "category": (entry.get("desc") or "").strip(),
+                "summary": summary,
+                "time": an_dt or None,
+                "industry": (entry.get("smIndustry") or "").strip() or None,
+            })
+
+        out = out[:_ANNOUNCEMENTS_CAP]
+        logger.info(
+            "NSE corporate announcements: %d items (watchlist filter=%s)",
+            len(out), target is not None,
+        )
+
+    except httpx.HTTPStatusError as exc:
+        logger.error("NSE corp announcements HTTP error: %s", exc)
+    except Exception as exc:
+        logger.error("NSE corp announcements fetch failed: %s", exc)
+
+    return out
+
+
+# Official NSE index-constituents CSV.  Stable URL, columns:
+#   Company Name, Industry, Symbol, Series, ISIN Code
+# Preferred over the equity-stockIndices JSON API, which is frequently 403/404
+# for unauthenticated clients.  This static archive file is reliably reachable.
+NSE_NIFTY50_LIST_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty50list.csv"
+
+
+async def fetch_nifty50_constituents() -> Dict[str, Any]:
+    """
+    Fetch the current official NIFTY 50 index constituents from NSE.
+
+    Source: the authoritative ind_nifty50list.csv archive file (the same list NSE
+    publishes on every index reconstitution).  Used by the quarterly constituent
+    monitor to detect companies entering/leaving the index and demergers/splits
+    (e.g. TATAMOTORS → TMPV + TMCV) so the app's hardcoded ticker maps can be
+    refreshed.
+
+    Returns:
+        {
+            "available": bool,         # False if the fetch/parse failed
+            "count": int,              # number of constituents (normally 50)
+            "symbols": [str, ...],     # NSE trading symbols, upper-cased
+            "companies": {sym: name},  # symbol → company name
+            "isins": {sym: isin},      # symbol → ISIN (useful to spot demergers)
+            "source": "nse_csv",
+        }
+    Never raises — returns available=False on any failure.
+    """
+    result: Dict[str, Any] = {
+        "available": False,
+        "count": 0,
+        "symbols": [],
+        "companies": {},
+        "isins": {},
+        "source": "nse_csv",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT, headers=HEADERS, follow_redirects=True) as client:
+            resp = await client.get(NSE_NIFTY50_LIST_URL)
+            resp.raise_for_status()
+            text = resp.text
+
+        symbols: List[str] = []
+        companies: Dict[str, str] = {}
+        isins: Dict[str, str] = {}
+        for row in csv.DictReader(io.StringIO(text)):
+            symbol = (row.get("Symbol") or "").strip().upper()
+            if not symbol:
+                continue
+            symbols.append(symbol)
+            companies[symbol] = (row.get("Company Name") or "").strip()
+            isins[symbol] = (row.get("ISIN Code") or "").strip()
+
+        if symbols:
+            result.update(
+                available=True,
+                count=len(symbols),
+                symbols=symbols,
+                companies=companies,
+                isins=isins,
+            )
+            logger.info("NIFTY 50 constituents fetched: %d symbols", len(symbols))
+        else:
+            logger.warning("NIFTY 50 constituents CSV parsed but contained no rows")
+
+    except httpx.HTTPStatusError as exc:
+        logger.error("NSE NIFTY 50 constituents HTTP error: %s", exc)
+    except Exception as exc:
+        logger.error("NSE NIFTY 50 constituents fetch failed: %s", exc)
 
     return result
 
