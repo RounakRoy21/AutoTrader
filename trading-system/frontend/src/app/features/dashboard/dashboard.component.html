@@ -233,7 +233,7 @@
           </div>
 
           <!-- Recommended stance -->
-          <div *ngIf="brief?.recommended_stance" class="stance-row">
+          <div *ngIf="brief.recommended_stance" class="stance-row">
             <mat-icon class="stance-icon">policy</mat-icon>
             <span class="stance-label">Stance:</span>
             <span class="stance-badge"
@@ -264,13 +264,13 @@
             </div>
           </div>
 
-          <div class="watchlist" *ngIf="brief?.watchlist?.length">
+          <div class="watchlist" *ngIf="brief.watchlist.length">
             <strong>Watchlist:</strong>
             <mat-chip-set>
               <mat-chip *ngFor="let s of brief!.watchlist" class="chip-watch">{{ s }}</mat-chip>
             </mat-chip-set>
           </div>
-          <div class="avoid-list" *ngIf="brief?.avoid_list?.length">
+          <div class="avoid-list" *ngIf="brief.avoid_list.length">
             <strong>Avoid:</strong>
             <mat-chip-set>
               <mat-chip *ngFor="let s of brief!.avoid_list" class="chip-avoid">{{ s }}</mat-chip>

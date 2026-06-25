@@ -56,7 +56,8 @@ SEED_PRICES: Dict[str, float] = {
     "TITAN":       3400.0,
     "WIPRO":        550.0,
     "HCLTECH":    1650.0,
-    "TATAMOTORS":   950.0,
+    "TMPV":         350.0,  # Tata Motors Passenger Vehicles (post-demerger; ~₹300-400 range)
+    "TMCV":         500.0,  # Tata Motors Commercial Vehicles (post-demerger)
     "TATASTEEL":    155.0,
 }
 

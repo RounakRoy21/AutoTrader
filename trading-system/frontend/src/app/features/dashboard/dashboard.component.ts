@@ -247,11 +247,15 @@ export class DashboardComponent implements OnInit, OnDestroy {
   }
 
   get maxTrades(): number {
-    return this.agentStatus.config?.max_trades_per_day ?? 6;
+    return this.agentStatus.config?.effective_max_trades_per_day
+      ?? this.agentStatus.config?.max_trades_per_day
+      ?? 6;
   }
 
   get maxPositions(): number {
-    return this.agentStatus.config?.max_open_positions ?? 3;
+    return this.agentStatus.config?.effective_max_open_positions
+      ?? this.agentStatus.config?.max_open_positions
+      ?? 3;
   }
 
   get drawdownTooltip(): string {

@@ -9,12 +9,16 @@ JS calls the same JSON endpoints we use here.
 
 from __future__ import annotations
 
+import csv
+import io
 import logging
-from datetime import datetime
-from typing import Any, Dict, List
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, List, Optional
 
 import httpx
 import pytz
+
+from core.nse_calendar import is_nse_holiday, ist_today
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +27,9 @@ IST = pytz.timezone("Asia/Kolkata")
 NSE_FII_DII_URL = "https://www.nseindia.com/api/fiidiiTradeReact"
 NSE_CORP_ACTIONS_URL = "https://www.nseindia.com/api/corporates-corporateActions"
 NSE_ALL_INDICES_URL = "https://www.nseindia.com/api/allIndices"
+NSE_LARGE_DEAL_URL = "https://www.nseindia.com/api/snapshot-capital-market-largedeal"
+# Security-wise full bhavcopy (includes DELIV_PER column).  Date is appended as DDMMYYYY.
+NSE_BHAVCOPY_BASE = "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_"
 TIMEOUT = 10
 
 # NSE requires specific headers to avoid 403
@@ -230,7 +237,8 @@ async def fetch_nse_indices() -> Dict[str, Any]:
             if name not in _KEY_INDICES:
                 continue
 
-            current = _safe_float(entry.get("current"))
+            # NSE allIndices uses "last" for the current value, not "current".
+            current = _safe_float(entry.get("last"))
             prev_close = _safe_float(entry.get("previousClose"))
             pct_change = _safe_float(entry.get("percentChange"))
 
@@ -284,5 +292,194 @@ async def fetch_nse_indices() -> Dict[str, Any]:
         logger.error("NSE allIndices HTTP error: %s", exc)
     except Exception as exc:
         logger.error("NSE allIndices fetch failed: %s", exc)
+
+    return result
+
+
+def _last_trading_day(reference: date | None = None) -> date:
+    """Return the most recent NSE trading day strictly before *reference*.
+
+    Walks backwards skipping weekends and exchange holidays.  Used to locate the
+    previous session's end-of-day data (delivery bhavcopy) when the research
+    agent runs pre-market (~6 AM IST, before today's session has any EOD data).
+    """
+    d = (reference or ist_today()) - timedelta(days=1)
+    # Cap the walk-back at 10 days so a calendar gap can never loop forever.
+    for _ in range(10):
+        if d.weekday() < 5 and not is_nse_holiday(d):
+            return d
+        d -= timedelta(days=1)
+    return d
+
+
+def _norm_side(raw: Any) -> str:
+    """Normalise NSE's buy/sell field to 'BUY' | 'SELL' | 'UNKNOWN'."""
+    s = str(raw or "").strip().upper()
+    if s in ("BUY", "B", "P"):  # P = purchase in some legacy feeds
+        return "BUY"
+    if s in ("SELL", "S"):
+        return "SELL"
+    return "UNKNOWN"
+
+
+async def fetch_bulk_deals(watchlist: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Fetch the latest session's bulk & block deals from the NSE largedeal API.
+
+    Bulk/block deals reveal institutional accumulation or distribution: a large
+    buy by a known fund in a watchlist stock is a conviction signal, while heavy
+    selling is a caution flag.  The research agent runs pre-market, so the
+    "latest" snapshot is the previous session's deals — exactly the context we
+    want before today's open.
+
+    Parameters
+    ----------
+    watchlist : list[str] | None
+        If provided, only deals in these symbols are returned (keeps the LLM
+        payload small and focuses the signal on tradeable stocks).  Matching is
+        case-insensitive.  If None, all deals are returned.
+
+    Returns
+    -------
+    dict with keys:
+        available (bool)        — False if the request failed
+        as_on_date (str | None) — session date the deals belong to
+        deals (list[dict])      — each: {symbol, side, qty, price, client}
+    """
+    result: Dict[str, Any] = {"available": False, "as_on_date": None, "deals": []}
+    wl = {s.strip().upper() for s in watchlist} if watchlist else None
+
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT, headers=HEADERS) as client:
+            # Homepage first so NSE sets the session cookie, else 403.
+            await client.get("https://www.nseindia.com/")
+            resp = await client.get(NSE_LARGE_DEAL_URL)
+            resp.raise_for_status()
+            data = resp.json()
+
+        result["available"] = True
+        result["as_on_date"] = data.get("as_on_date")
+
+        # The snapshot bundles bulk, block and short-sell deals under separate
+        # keys.  Bulk + block are the institutional-footprint signals we care
+        # about; short deals are excluded (noisy, intraday).
+        raw_deals: List[dict] = []
+        for key in ("BULK_DEALS_DATA", "BLOCK_DEALS_DATA"):
+            entries = data.get(key)
+            if isinstance(entries, list):
+                raw_deals.extend(entries)
+
+        for entry in raw_deals:
+            symbol = str(entry.get("symbol", "")).strip().upper()
+            if not symbol:
+                continue
+            if wl is not None and symbol not in wl:
+                continue
+            client_name = str(entry.get("clientName") or entry.get("name") or "").strip()
+            result["deals"].append({
+                "symbol": symbol,
+                "side": _norm_side(entry.get("buySell") or entry.get("buyOrSell")),
+                "qty": int(_safe_float(entry.get("qty"))),
+                "price": round(_safe_float(entry.get("watp") or entry.get("price")), 2),
+                # Truncate long fund names to keep the prompt compact.
+                "client": client_name[:60],
+            })
+
+        # Cap at 25 entries so an unusually active session cannot bloat the
+        # prompt.  Watchlist filtering already keeps this small in practice.
+        result["deals"] = result["deals"][:25]
+
+        logger.info(
+            "NSE bulk/block deals (as_on=%s): %d relevant deal(s)",
+            result["as_on_date"], len(result["deals"]),
+        )
+
+    except httpx.HTTPStatusError as exc:
+        logger.error("NSE bulk deals HTTP error: %s", exc)
+    except Exception as exc:
+        logger.error("NSE bulk deals fetch failed: %s", exc)
+
+    return result
+
+
+async def fetch_delivery_data(watchlist: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Fetch previous-session delivery percentages for watchlist stocks.
+
+    Delivery % = the fraction of traded volume that resulted in actual delivery
+    (settled to demat) rather than intraday squaring-off.  High delivery % means
+    buyers took genuine ownership — a sign of conviction/accumulation rather than
+    speculative churn.  It is a useful signal-quality filter for watchlist stocks.
+
+    Source: NSE's security-wise full bhavcopy
+    (``sec_bhavdata_full_DDMMYYYY.csv``), published end-of-day.  We resolve the
+    previous trading day and fall back to a couple of earlier sessions in case
+    the most recent file is not yet posted (e.g. very early morning).
+
+    Parameters
+    ----------
+    watchlist : list[str] | None
+        Symbols to extract delivery % for.  If None, returns an empty mapping
+        (downloading delivery for the whole market is wasteful for the brief).
+
+    Returns
+    -------
+    dict with keys:
+        available (bool)            — False if no bhavcopy could be fetched
+        as_on_date (str | None)     — session the data belongs to (DD-Mon-YYYY)
+        delivery_pct (dict[str,float]) — {symbol: delivery_percent}
+    """
+    result: Dict[str, Any] = {"available": False, "as_on_date": None, "delivery_pct": {}}
+
+    if not watchlist:
+        # No targets — nothing worth downloading a full bhavcopy for.
+        return result
+
+    wl = {s.strip().upper() for s in watchlist}
+
+    # Try the last trading day, then step back up to 3 more sessions if that
+    # file isn't posted yet (NSE occasionally publishes the EOD file late).
+    candidate = _last_trading_day()
+    for _ in range(4):
+        ddmmyyyy = candidate.strftime("%d%m%Y")
+        url = f"{NSE_BHAVCOPY_BASE}{ddmmyyyy}.csv"
+        try:
+            async with httpx.AsyncClient(timeout=TIMEOUT, headers=HEADERS) as client:
+                # The bhavcopy CSV is a static public file on nsearchives — no
+                # session cookie is required.  The nsearchives homepage itself
+                # returns 404, so we go straight to the file URL.
+                resp = await client.get(url)
+            if resp.status_code != 200 or not resp.content:
+                candidate = _last_trading_day(candidate)
+                continue
+
+            reader = csv.DictReader(io.StringIO(resp.text))
+            for row in reader:
+                # NSE prefixes many CSV column names with a leading space.
+                clean = {k.strip().upper(): (v.strip() if isinstance(v, str) else v)
+                         for k, v in row.items()}
+                symbol = str(clean.get("SYMBOL", "")).upper()
+                if symbol not in wl:
+                    continue
+                # Only the cash-market equity series carry meaningful delivery %.
+                series = str(clean.get("SERIES", "")).upper()
+                if series and series not in ("EQ", "BE", "BZ"):
+                    continue
+                deliv = _safe_float(clean.get("DELIV_PER"))
+                if deliv > 0:
+                    result["delivery_pct"][symbol] = round(deliv, 2)
+
+            result["available"] = True
+            result["as_on_date"] = candidate.strftime("%d-%b-%Y")
+            logger.info(
+                "NSE delivery data (as_on=%s): %d/%d watchlist symbols matched",
+                result["as_on_date"], len(result["delivery_pct"]), len(wl),
+            )
+            return result
+
+        except httpx.HTTPStatusError as exc:
+            logger.error("NSE delivery bhavcopy HTTP error (%s): %s", ddmmyyyy, exc)
+            candidate = _last_trading_day(candidate)
+        except Exception as exc:
+            logger.error("NSE delivery bhavcopy fetch failed (%s): %s", ddmmyyyy, exc)
+            candidate = _last_trading_day(candidate)
 
     return result

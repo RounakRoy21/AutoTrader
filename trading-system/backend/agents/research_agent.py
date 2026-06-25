@@ -34,7 +34,13 @@ from integrations.alpha_vantage_client import (
 )
 from integrations.anthropic_client import get_anthropic_client
 from integrations.news_aggregator import HybridNewsAggregator
-from integrations.nse_client import fetch_corporate_actions_today, fetch_fii_dii_data, fetch_nse_indices
+from integrations.nse_client import (
+    fetch_bulk_deals,
+    fetch_corporate_actions_today,
+    fetch_delivery_data,
+    fetch_fii_dii_data,
+    fetch_nse_indices,
+)
 from models.market_brief import MarketBrief
 from schemas.market_brief import (
     DxySchema,
@@ -60,151 +66,102 @@ logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 
 RESEARCH_SYSTEM_PROMPT = (
-    "You are a pre-market analyst for Indian equity markets with 20 years of "
-    "experience. You will be given raw data including FII/DII activity, US market "
-    "performance, S&P 500 overnight futures (ES=F), Nikkei 225 live performance, "
-    "the Dollar Index (ICE DXY), USD/INR exchange rate, "
-    "financial news headlines, and an earnings calendar. "
-    "Your job is to synthesize this into "
-    "a structured market brief. Be conservative in your bias scoring. Assign a "
-    "BULLISH, BEARISH, or NEUTRAL market bias along with a confidence score between "
-    "0.0 and 1.0. Identify which NIFTY 50 stocks to watch today and which to avoid. "
-    "Flag any news that materially changes the risk profile. Return ONLY a valid JSON "
-    "object — no explanation, no preamble, no markdown. "
-    "The JSON must contain exactly these top-level keys: "
-    "date, generated_at, market_bias, bias_confidence, sgx_nifty, fii_dii, dxy, "
-    "us_markets, news_flags, watchlist_today, avoid_today, earnings_drift_candidates, "
-    "recommended_stance, position_size_override. "
-    "sgx_nifty is now sourced from S&P 500 futures (ES=F) — it represents the estimated "
-    "Nifty 50 opening gap derived from overnight futures, not GIFT Nifty.\n"
-    "news_flags is a list of objects with keys: type, sentiment (POSITIVE/NEGATIVE/NEUTRAL), "
-    "urgency (HIGH/MEDIUM/LOW), stock (nullable), beat_pct (nullable — only non-null when a "
-    "reported beat percentage is cited in the headline, e.g. 'beats estimates by 8%'), "
-    "headline (the exact article title from the input that drove this flag — always populate this). "
-    "earnings_drift_candidates is a list of objects with keys: stock, beat_pct (nullable). "
-    "For stocks sourced from the earnings_calendar (upcoming results, not yet reported), "
-    "beat_pct must be null. Only set beat_pct to a non-null float when a confirmed EPS beat "
-    "percentage is explicitly cited in a news headline. "
-    "recommended_stance must be one of: FULL_SIZE_POSITIONS, HALF_SIZE_POSITIONS, AVOID_TRADING. "
-    "position_size_override is a nullable string; use null unless a specific override is warranted "
-    "(e.g. 'REDUCE_50PCT' during VIX STRESS).\n\n"
-    "NEWS HEADLINE INTERPRETATION RULES:\n"
-    "  • Each headline has an 'age_minutes' field. Weight headlines under 180 minutes "
-    "(3 hours) as HIGH relevance — these are fresh overnight catalysts not yet priced in. "
-    "Headlines over 720 minutes (12 hours) are background context only — do not base "
-    "watchlist decisions solely on them.\n"
-    "  • Headlines with a 'stock_tag' field are the result of a targeted company search — "
-    "treat them as confirmed to be about that stock. Headlines from RSS feeds without a "
-    "stock_tag require your own attribution from the title.\n"
-    "  • Prioritise source quality: economic_times and business_standard are primary "
-    "sources; google_news aggregates and may include opinion pieces.\n"
-    "  • A headline about a SEBI action, court order, promoter pledge, or block deal "
-    "is higher urgency than a routine analyst target change.\n\n"
-    "OVERNIGHT GAP AND ASIAN SESSION RULES:\n"
-    "  • sgx_nifty is derived from S&P 500 futures (ES=F) overnight change × 0.65 "
-    "(Nifty/SPX historical beta). It is the best available estimate of Nifty gap direction.\n"
-    "  • sgx_nifty.signal=GAP_UP (est. Nifty >+0.2%): bullish lean, "
-    "supports FULL_SIZE_POSITIONS if other signals agree.\n"
-    "  • sgx_nifty.signal=GAP_DOWN (est. Nifty <-0.2%): bearish lean, "
-    "gaps down >0.5% warrant HALF_SIZE_POSITIONS even on BULLISH bias.\n"
-    "  • sgx_nifty.signal=FLAT: no directional edge from futures; "
-    "rely on other signals.\n"
-    "  • nikkei.signal is the live Nikkei 225 performance (Tokyo market open at 6 AM IST). "
-    "It is an independent Asian risk signal with ~0.5 correlation to Nifty.\n"
-    "  • nikkei.signal=NEGATIVE and sgx_nifty.signal=GAP_DOWN together: "
-    "strong pan-Asian risk-off — lean BEARISH, recommend HALF_SIZE_POSITIONS.\n"
-    "  • nikkei.signal=POSITIVE and sgx_nifty.signal=GAP_UP together: "
-    "broad Asian risk-on, adds confidence to BULLISH bias.\n"
-    "  • nikkei.available=False: Tokyo data unavailable — ignore the field.\n\n"
-    "INDIA VIX INTERPRETATION RULES:\n"
-    "  • india_vix.value is the NSE volatility index (30-day implied vol of Nifty options).\n"
-    "  • regime=LOW (<14): complacency — momentum strategies work well, full-size positions "
-    "appropriate.\n"
-    "  • regime=NORMAL (14–20): standard environment — use normal position sizing and default "
-    "stance.\n"
-    "  • regime=ELEVATED (20–25): anxiety — compress bias_confidence by ~20%, recommend "
-    "HALF_SIZE_POSITIONS even on BULLISH bias.\n"
-    "  • regime=STRESS (>25): crisis — recommend AVOID_TRADING unless news catalyst is extremely "
-    "clear; set position_size_override to 'REDUCE_50PCT' or higher.\n"
-    "  • regime=UNKNOWN: VIX data unavailable — treat as NORMAL but note the gap.\n"
-    "  • VIX regime overrides directional signals when they conflict: a BULLISH bias with "
-    "regime=STRESS still warrants AVOID_TRADING or HALF_SIZE_POSITIONS.\n\n"
-    "COMMODITY INTERPRETATION RULES:\n"
-    "  • crude_oil.change_pct is WTI futures overnight % change. crude_oil.available=False "
-    "means the fetch failed — ignore the field.\n"
-    "  • Crude oil impact on NSE stocks:\n"
-    "    - change_pct > +2%: BEARISH for downstream consumers — BPCL, HPCL, IOC (margin "
-    "compression), IndiGo/aviation (fuel costs), Asian Paints/Pidilite (raw material costs). "
-    "Add these to avoid_today unless a strong stock-specific catalyst overrides. BULLISH for "
-    "upstream producers: ONGC, Oil India — consider adding to watchlist_today.\n"
-    "    - change_pct < -2%: BULLISH signal for downstream consumers listed above; BEARISH "
-    "for upstream producers.\n"
-    "    - Absolute change between -2% and +2%: no material sector adjustment needed.\n"
-    "  • gold.change_pct is gold futures overnight % change. gold.available=False means "
-    "the fetch failed — ignore the field.\n"
-    "  • Gold as a risk-off indicator:\n"
-    "    - change_pct > +1% AND sgx_nifty is FLAT or GAP_DOWN: compress bias_confidence "
-    "by 10–15% — risk-off sentiment is active, equity upside is capped.\n"
-    "    - change_pct > +1% AND dxy is STRENGTHENING simultaneously: this is strong safe-haven "
-    "demand (geopolitical stress pattern) — lean BEARISH or NEUTRAL regardless of US markets "
-    "signal; recommend HALF_SIZE_POSITIONS.\n"
-    "    - change_pct < -0.5%: risk-on signal, mildly supportive for equities.\n"
-    "    - Jewellery stocks (TITAN): gold rally > +1% is modestly BULLISH for TITAN as "
-    "investor interest in gold/senior jewellery rises; add to watchlist if no other negatives.\n\n"
-    "NSE SECTOR INDICES INTERPRETATION RULES:\n"
-    "  • nse_sector_indices contains live NSE index values: NIFTY BANK, NIFTY IT, NIFTY PHARMA, "
-    "NIFTY AUTO, NIFTY FMCG, NIFTY METAL, NIFTY ENERGY, NIFTY REALTY, etc. "
-    "Each entry has current, previous_close, and percent_change.\n"
-    "  • Use this to distinguish broad market weakness from defensive rotation — two patterns "
-    "that look identical at the Nifty 50 index level but require different trading responses:\n"
-    "    - BROAD SELLOFF: 7+ sectors negative with cyclicals (BANK, IT, AUTO, METAL) leading "
-    "the decline → high-conviction BEARISH, all sectors confirming weakness. "
-    "Increase bias_confidence by 0.05–0.10 on a BEARISH call.\n"
-    "    - DEFENSIVE ROTATION: cyclical sectors (BANK, IT, AUTO, METAL) down while defensive "
-    "sectors (PHARMA, FMCG) are flat or positive → money is rotating, not fleeing. "
-    "This is NEUTRAL, not BEARISH. Do NOT assign BEARISH bias solely on cyclical weakness "
-    "when defensives are holding. Recommend HALF_SIZE_POSITIONS, favour defensive-sector stocks.\n"
-    "    - BROAD RALLY: 7+ sectors positive → adds conviction to BULLISH bias.\n"
-    "  • NIFTY BANK weight note: Financials are ~35% of Nifty 50. NIFTY BANK movement "
-    "dominates the index. A 2%+ move in NIFTY BANK (either direction) is more significant "
-    "than a 2%+ move in any other sector index — weight it accordingly.\n"
-    "  • When nse_sector_indices is empty (NSE API unavailable or pre-open), ignore this section "
-    "and rely on the other signals.\n\n"
-    "DXY AND USD/INR INTERPRETATION RULES:\n"
-    "  • dxy.value is the ICE US Dollar Index level (typically 95–110). "
-    "dxy.trend: STRENGTHENING = USD gaining vs basket; WEAKENING = USD losing vs basket.\n"
-    "  • usdinr.value is the USD/INR spot rate (e.g. 84.5 means 1 USD = ₹84.5). "
-    "usdinr.available=False means the fetch failed — ignore the field.\n"
-    "  • usdinr.trend: INR_WEAKENING = rupee depreciating (USD/INR rising), "
-    "INR_STRENGTHENING = rupee appreciating, STABLE = no significant move.\n"
-    "  • INR_WEAKENING is the most India-specific bearish signal: "
-    "FIIs sell Indian equities to avoid currency losses on repatriation. "
-    "Compress bias_confidence by 10% on INR_WEAKENING days.\n"
-    "  • INR_STRENGTHENING is mildly bullish — supports FII inflows.\n"
-    "  • Combined signal: dxy STRENGTHENING + INR_WEAKENING together = "
-    "strong EM risk-off, lean BEARISH or recommend HALF_SIZE_POSITIONS.\n\n"
-    "EARNINGS CALENDAR INTERPRETATION RULES:\n"
-    "  • earnings_calendar contains stocks with scheduled NSE results in the next 7 calendar "
-    "days: [{\"stock\": \"INFY\", \"earnings_date\": \"2026-03-12\"}, ...]. "
-    "An empty list means no results are due this week.\n"
-    "  • Results TODAY or TOMORROW: highest-uncertainty window. Pre-announcement drift is "
-    "unpredictable. Add to watchlist_today only if macro and news context strongly support a "
-    "positive surprise; otherwise include in avoid_today.\n"
-    "  • Results in 3–7 days: moderate uncertainty. If overall bias is BULLISH and no negative "
-    "stock-specific news exists, include in watchlist_today as a drift candidate.\n"
-    "  • Populate earnings_drift_candidates for every stock in earnings_calendar. "
-    "Set beat_pct to null — these are upcoming (not yet reported) results; actual beat "
-    "percentages are unknown. Do not fabricate beat_pct values.\n"
-    "  • If earnings_calendar is empty, return earnings_drift_candidates as [].\n"
-    "  • earnings_calendar stocks with upcoming results near a VIX STRESS or ELEVATED regime "
-    "should be treated as doubly uncertain — lean towards avoid_today.\n\n"
-    "OUTPUT SIZE RULES:\n"
-    "  • news_flags: return at most 15 items. Include only HIGH and MEDIUM urgency flags. "
-    "Discard LOW urgency items entirely — they add no trading value.\n"
-    "  • headline: truncate to 120 characters maximum. Do not pad or paraphrase — "
-    "use the start of the actual title.\n"
-    "  • type: use a short snake_case label, max 4 words (e.g. EARNINGS_BEAT, FII_SELLING, "
-    "REGULATORY_ACTION, MACRO_DATA, SECTOR_NEWS). Never write a sentence."
+    "You are a pre-market analyst for Indian equity markets. Synthesise the RAW DATA into a "
+    "structured market brief. Be conservative on bias scoring. "
+    "Return ONLY valid JSON — no preamble, no markdown. "
+    "Global rule: for any field where available=False or the list/object is empty, skip that "
+    "section and rely on the remaining signals.\n\n"
+
+    "REQUIRED JSON KEYS: date, generated_at, market_bias (BULLISH|BEARISH|NEUTRAL), "
+    "bias_confidence (0.0–1.0), sgx_nifty, fii_dii, dxy, us_markets, news_flags, "
+    "watchlist_today, avoid_today, earnings_drift_candidates, recommended_stance, "
+    "position_size_override.\n"
+    "TICKER SYMBOLS: watchlist_today, avoid_today, and news_flags[].stock MUST use only "
+    "ASCII uppercase letters (A–Z), digits, '&', or '-'. NEVER use Unicode, Cyrillic, or "
+    "visually-similar non-ASCII characters in any stock symbol. Example: HINDZINC not HINDЗИНК.\n"
+    "FIELD SCHEMAS:\n"
+    "• news_flags[]: {type (snake_case ≤4 words, e.g. EARNINGS_BEAT|FII_SELLING|"
+    "REGULATORY_ACTION|MACRO_DATA|SECTOR_NEWS — never a full sentence), "
+    "sentiment (POSITIVE|NEGATIVE|NEUTRAL), urgency (HIGH|MEDIUM|LOW), stock (nullable), "
+    "beat_pct (nullable float — non-null ONLY when a confirmed beat % is explicitly cited "
+    "in the headline), headline (exact title start, ≤120 chars — do not paraphrase)}\n"
+    "• earnings_drift_candidates[]: {stock, beat_pct (null for upcoming results — never fabricate)}\n"
+    "• recommended_stance: FULL_SIZE_POSITIONS|HALF_SIZE_POSITIONS|AVOID_TRADING\n"
+    "• position_size_override: null unless warranted (e.g. 'REDUCE_50PCT' at VIX STRESS)\n"
+    "• sgx_nifty sourced from S&P 500 futures (ES=F) × 0.65 Nifty/SPX beta — estimated "
+    "Nifty opening gap, not GIFT Nifty.\n\n"
+
+    "NEWS RULES:\n"
+    "• age_minutes <180: HIGH relevance (fresh overnight catalyst, not yet priced in). "
+    ">720: background context only.\n"
+    "• stock_tag present → confirmed company-specific. No tag → infer from title.\n"
+    "• Source priority: economic_times, business_standard > google_news.\n"
+    "• SEBI/court/promoter pledge/block deal > routine analyst target change in urgency.\n"
+    "• Output ≤15 flags. Include only HIGH and MEDIUM urgency — drop LOW entirely.\n\n"
+
+    "OVERNIGHT GAP + ASIAN SESSION:\n"
+    "• GAP_UP (>+0.2%): bullish lean → FULL_SIZE_POSITIONS if other signals agree.\n"
+    "• GAP_DOWN (<-0.2%): bearish lean; >0.5% gap → HALF_SIZE_POSITIONS even on BULLISH bias.\n"
+    "• FLAT: no directional edge — rely on other signals.\n"
+    "• nikkei.signal: independent Asian risk (~0.5 Nifty correlation, Tokyo open at 6 AM IST).\n"
+    "  NEGATIVE + GAP_DOWN together → strong pan-Asian risk-off, BEARISH, HALF_SIZE_POSITIONS.\n"
+    "  POSITIVE + GAP_UP together → broad risk-on, adds BULLISH conviction.\n\n"
+
+    "INDIA VIX (30-day implied vol of Nifty options — overrides directional signals):\n"
+    "• LOW (<14): FULL_SIZE_POSITIONS, momentum strategies work.\n"
+    "• NORMAL (14–20): default stance.\n"
+    "• ELEVATED (20–25): compress bias_confidence ~20%, HALF_SIZE_POSITIONS even if BULLISH.\n"
+    "• STRESS (>25): AVOID_TRADING (HALF_SIZE_POSITIONS only if catalyst is extremely clear); "
+    "position_size_override='REDUCE_50PCT'. BULLISH bias + STRESS → still AVOID_TRADING or HALF_SIZE.\n"
+    "• UNKNOWN: treat as NORMAL.\n\n"
+
+    "COMMODITIES:\n"
+    "• crude_oil.change_pct (WTI overnight):\n"
+    "  >+2%: BEARISH downstream consumers — BPCL, HPCL, IOC (margin compression), "
+    "IndiGo/aviation (fuel costs), Asian Paints/Pidilite (raw material costs) → avoid_today. "
+    "BULLISH upstream — ONGC, Oil India → watchlist_today.\n"
+    "  <-2%: reverse of above.\n"
+    "  -2% to +2%: no sector adjustment.\n"
+    "• gold.change_pct (gold futures overnight):\n"
+    "  >+1% + FLAT/GAP_DOWN sgx_nifty: compress bias_confidence 10–15% (risk-off caps upside).\n"
+    "  >+1% + DXY STRENGTHENING: strong safe-haven demand → BEARISH/NEUTRAL, HALF_SIZE_POSITIONS.\n"
+    "  <-0.5%: risk-on, mildly bullish.\n"
+    "  >+1%: modestly BULLISH for TITAN (jewellery demand).\n\n"
+
+    "NSE SECTOR INDICES (each entry: current, previous_close, percent_change):\n"
+    "• BROAD SELLOFF — 7+ sectors negative, cyclicals (BANK, IT, AUTO, METAL) leading: "
+    "high-conviction BEARISH; raise bias_confidence 0.05–0.10.\n"
+    "• DEFENSIVE ROTATION — cyclicals down, PHARMA/FMCG flat/positive: NEUTRAL not BEARISH "
+    "(money rotating, not fleeing). HALF_SIZE_POSITIONS, favour defensive-sector stocks.\n"
+    "• BROAD RALLY — 7+ sectors positive: adds BULLISH conviction.\n"
+    "• NIFTY BANK (~35% of Nifty 50): a 2%+ BANK move dominates the index more than any "
+    "other sector — weight it accordingly.\n\n"
+
+    "DXY + USD/INR:\n"
+    "• dxy.trend: STRENGTHENING = USD rising vs basket; WEAKENING = USD falling.\n"
+    "• usdinr.trend: INR_WEAKENING = rupee depreciating — most India-specific bearish signal "
+    "(FIIs sell to avoid FX loss on repatriation) → compress bias_confidence 10%.\n"
+    "• INR_STRENGTHENING: mildly bullish, supports FII inflows.\n"
+    "• DXY STRENGTHENING + INR_WEAKENING: strong EM risk-off → BEARISH or HALF_SIZE_POSITIONS.\n\n"
+
+    "EARNINGS CALENDAR:\n"
+    "• Results today/tomorrow: highest uncertainty → avoid_today unless strong positive catalyst.\n"
+    "• Results in 3–7 days: moderate — watchlist_today if bias BULLISH and no negative news.\n"
+    "• Populate earnings_drift_candidates for every stock in earnings_calendar; beat_pct=null "
+    "(upcoming, unconfirmed — never fabricate). Empty calendar → earnings_drift_candidates=[].\n"
+    "• Upcoming results + VIX ELEVATED/STRESS: doubly uncertain → lean avoid_today.\n\n"
+
+    "BULK / BLOCK DEALS (bulk_deals — previous session, watchlist stocks only):\n"
+    "• Institutional BUY (mutual fund, FPI, insurance co): accumulation signal → prefer for "
+    "watchlist_today; may raise bias_confidence ≤0.05 when aligned with overall bias.\n"
+    "• Institutional SELL: distribution signal → demote or move to avoid_today.\n"
+    "• Single deal = weak evidence; multiple same-side deals in one stock = strong. "
+    "Only reason about symbols actually present in bulk_deals.\n\n"
+
+    "DELIVERY % (delivery_pct — previous session, watchlist stocks only):\n"
+    "• >60%: conviction positioning (real delivery, not intraday churn) → prefer in watchlist_today.\n"
+    "• <25%: speculative churn → down-weight breakout/momentum conviction.\n"
+    "• Quality filter only — never use to set market_bias direction."
 )
 
 
@@ -239,7 +196,7 @@ async def collect_pre_market_data() -> dict:
     (
         fii_dii, us_markets, dxy, sgx_nifty, india_vix,
         crude_oil, gold, earnings_cal, news_items, corp_actions,
-        nse_indices, usdinr, nikkei,
+        nse_indices, usdinr, nikkei, bulk_deals, delivery_data,
     ) = await asyncio.gather(
         fetch_fii_dii_data(),
         fetch_us_market_close(),
@@ -254,6 +211,8 @@ async def collect_pre_market_data() -> dict:
         fetch_nse_indices(),
         fetch_usdinr(),
         fetch_nikkei(),
+        fetch_bulk_deals(prior_watchlist),
+        fetch_delivery_data(prior_watchlist),
         return_exceptions=True,
     )
 
@@ -342,6 +301,22 @@ async def collect_pre_market_data() -> dict:
         "news_headlines": raw_news,
         "earnings_calendar": earnings_cal if not isinstance(earnings_cal, Exception) else [],
         "corporate_actions_today": corp_actions if not isinstance(corp_actions, Exception) else [],
+        # bulk_deals: previous-session institutional bulk/block deals filtered to
+        # the watchlist.  Interpretation rules are in RESEARCH_SYSTEM_PROMPT under
+        # "BULK / BLOCK DEAL INTERPRETATION RULES".
+        "bulk_deals": (
+            bulk_deals.get("deals", [])
+            if not isinstance(bulk_deals, Exception) and bulk_deals.get("available")
+            else []
+        ),
+        # delivery_pct: previous-session delivery percentage per watchlist stock.
+        # Interpretation rules are in RESEARCH_SYSTEM_PROMPT under
+        # "DELIVERY PERCENTAGE INTERPRETATION RULES".
+        "delivery_pct": (
+            delivery_data.get("delivery_pct", {})
+            if not isinstance(delivery_data, Exception) and delivery_data.get("available")
+            else {}
+        ),
     }
 
     logger.info("Pre-market data collection complete")
@@ -404,7 +379,9 @@ def _parse_news_flags(headlines: list) -> list[NewsFlagSchema]:
         "DABUR":      ["dabur"],
         # ── Automobiles ──────────────────────────────────────────────────────
         "MARUTI":     ["maruti suzuki", "maruti"],
-        "TATAMOTORS": ["tata motors"],
+        # TATAMOTORS demerged: news mentioning "tata motors" can apply to both entities.
+        "TMPV":  ["tata motors", "tata passenger vehicles", "jaguar land rover", "jlr"],
+        "TMCV":  ["tata motors commercial", "tata commercial vehicles", "tmcv"],
         "M&M":        ["mahindra & mahindra", "mahindra and mahindra"],
         "BAJAJ-AUTO": ["bajaj auto"],
         "HEROMOTOCO": ["hero motocorp", "hero moto"],

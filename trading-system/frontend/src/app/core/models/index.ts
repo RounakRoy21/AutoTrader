@@ -112,7 +112,9 @@ export interface AgentStatus {
   config?: {
     paper_trading: boolean;
     max_trades_per_day: number;
+    effective_max_trades_per_day?: number;
     max_open_positions: number;
+    effective_max_open_positions?: number;
     daily_drawdown_limit_pct: number;
     daily_drawdown_limit: number;
   };

@@ -397,7 +397,7 @@ class Scanner:
     """
 
     # How long to suppress repeat signals for the same stock (seconds)
-    SIGNAL_COOLDOWN_SECS = 300  # 5 minutes
+    SIGNAL_COOLDOWN_SECS = 1800  # 30 minutes
     # Hard cutoff — no new signals after this time (HH, MM)
     SIGNAL_CUTOFF = (15, 15)    # 3:15 PM IST
     # Minimum ticks before indicators are statistically meaningful
@@ -576,16 +576,28 @@ class Scanner:
         # Condition 2: RSI between bias-modulated band (scanner pre-filter; see docstring)
         #   BULLISH: 42–68   NEUTRAL: 45–65   BEARISH: 48–63
         _rsi_lo, _rsi_hi = {
-            "BULLISH": (42.0, 68.0),
-            "NEUTRAL": (45.0, 65.0),
-            "BEARISH": (48.0, 63.0),
-        }.get(self._market_bias, (45.0, 65.0))
+            "BULLISH": (45.0, 68.0),
+            "NEUTRAL": (50.0, 65.0),
+            "BEARISH": (50.0, 63.0),
+        }.get(self._market_bias, (50.0, 65.0))
         if not (_rsi_lo <= rsi <= _rsi_hi):
             logger.debug(
                 "[Scanner] %s REJECT C2 rsi=%.1f not in [%.0f,%.0f] bias=%s",
                 store.symbol, rsi, _rsi_lo, _rsi_hi, self._market_bias,
             )
             return None
+        # Early-session tighter RSI (9:15–9:44 IST).
+        # Indicators warm up over the first 15–30 candles; momentum is noisiest
+        # right after open.  A ±5-point tighter band rejects borderline entries
+        # before the market establishes its intraday direction.
+        if now_ist.hour == 9 and now_ist.minute < 45:
+            _early_lo, _early_hi = _rsi_lo + 5, _rsi_hi - 5
+            if not (_early_lo <= rsi <= _early_hi):
+                logger.debug(
+                    "[Scanner] %s REJECT EARLY-RSI rsi=%.1f not in tight band [%.0f,%.0f] (pre-9:45)",
+                    store.symbol, rsi, _early_lo, _early_hi,
+                )
+                return None
         # Condition 3: Volume > bias-modulated minimum (skip when historical data unavailable)
         #   BULLISH: 1.3×   NEUTRAL: 1.5×   BEARISH: 2.0×
         _vol_min = {
@@ -629,10 +641,22 @@ class Scanner:
         _t4_end = time.perf_counter_ns()
         logger.log(_PERF, "[PERF T3→T4] all indicators %s: %.0f μs",
                    store.symbol, (_t4_end - _t4_start) / 1_000)
-        # Conditions 4 + 5: EMA trend and MACD momentum — both require ≥35 candles
-        # so that MACD (which needs 26-period EMA) is always evaluated alongside
-        # the EMA crossover check, rather than being silently skipped.  (SM2)
-        if n_candles >= 35:
+        # Stock-level intraday trend bias: suppress long signals when price is
+        # >1% below EMA(21).  Complements the NIFTY macro filter (A2 above) by
+        # catching single-stock downtrends on mixed or bullish market days
+        # (e.g. TATASTEEL falling while NIFTY is flat).  Safe below 21 candles
+        # because compute_ema() returns 0.0 and the ema_21 > 0 guard skips it.
+        if ema_21 > 0 and ltp < ema_21 * 0.99:
+            logger.debug(
+                "[Scanner] %s REJECT EMA21-TREND ltp=%.2f < ema21*0.99=%.2f",
+                store.symbol, ltp, ema_21 * 0.99,
+            )
+            return None
+        # Conditions 4 + 5: EMA trend and MACD momentum — enforced from ≥26 candles
+        # (MACD minimum) so the filter is active from ~9:41 AM rather than ~9:50 AM.
+        # Both checks share the same threshold so MACD is never silently skipped
+        # while EMA is already being evaluated.  (SM2)
+        if n_candles >= 26:
             if ema_9 > 0 and ema_21 > 0 and ema_9 <= ema_21:
                 logger.debug(
                     "[Scanner] %s REJECT C4 ema9=%.2f <= ema21=%.2f",

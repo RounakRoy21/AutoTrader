@@ -96,6 +96,7 @@ class Settings(BaseSettings):
     partial_booking_move_sl_to_breakeven: bool = True  # raise SL to entry after booking
     max_open_positions: int = 3
     max_trades_per_day: int = 6
+    max_trades_per_symbol_per_day: int = 2   # cap repeat entries in same stock (breadth > concentration)
     daily_drawdown_soft_alert_pct: float = 0.02   # 2% soft warning tier (Telegram alert, no halt)
     daily_drawdown_limit_pct: float = 0.03         # 3% hard halt
     # SH2: Gap-at-open filter — reject signals when stock gapped up more than

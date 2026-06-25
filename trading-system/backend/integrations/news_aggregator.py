@@ -134,7 +134,8 @@ class HybridNewsAggregator:
         "DABUR":      "Dabur India NSE",
         # ── Automobiles ──────────────────────────────────────────────────────
         "MARUTI":     "Maruti Suzuki NSE",
-        "TATAMOTORS": "Tata Motors NSE",
+        "TMPV":  "Tata Motors Passenger Vehicles NSE TMPV",
+        "TMCV":  "Tata Motors Commercial Vehicles NSE TMCV",
         "M&M":        "Mahindra Mahindra NSE",
         "BAJAJ-AUTO": "Bajaj Auto NSE",
         "HEROMOTOCO": "Hero MotoCorp NSE",
@@ -340,7 +341,7 @@ class HybridNewsAggregator:
         if not watchlist:
             watchlist = [
                 "RELIANCE", "HDFCBANK", "INFY", "TCS", "ICICIBANK",
-                "AXISBANK", "SBIN", "TATAMOTORS", "BAJFINANCE", "WIPRO",
+                "AXISBANK", "SBIN", "TMPV", "BAJFINANCE", "WIPRO",
             ]
 
         coros = []

@@ -254,3 +254,122 @@ class TestLtpStoreClearedAtSessionStart:
         source = inspect.getsource(ta_module)
         assert "ltp_store" in source
         assert "clear()" in source
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  NSE Client — Bulk Deals & Delivery % (new contextual signals)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _mock_nse_client(get_results):
+    """Build a fake httpx.AsyncClient context manager.
+
+    *get_results* is a list of objects returned by successive ``client.get``
+    calls (the first call is always the NSE homepage cookie request).
+    """
+    fake_client = MagicMock()
+    fake_client.get = AsyncMock(side_effect=get_results)
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=fake_client)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    return ctx
+
+
+class TestFetchBulkDeals:
+    """fetch_bulk_deals must parse the NSE largedeal snapshot, normalise the
+    buy/sell side, and filter to the supplied watchlist."""
+
+    @pytest.mark.asyncio
+    async def test_filters_to_watchlist_and_normalises_side(self):
+        from integrations import nse_client
+
+        api_resp = MagicMock()
+        api_resp.raise_for_status = MagicMock(return_value=None)
+        api_resp.json = MagicMock(return_value={
+            "as_on_date": "24-Jun-2026",
+            "BULK_DEALS_DATA": [
+                {"symbol": "INFY", "buySell": "BUY", "qty": "1200000",
+                 "watp": "1450.50", "clientName": "ABC Mutual Fund"},
+                {"symbol": "WIPRO", "buySell": "SELL", "qty": "800000",
+                 "watp": "420.10", "clientName": "XYZ FPI"},
+            ],
+            "BLOCK_DEALS_DATA": [
+                {"symbol": "INFY", "buyOrSell": "B", "qty": "500000",
+                 "price": "1452.00", "name": "Insurance Co"},
+            ],
+        })
+        homepage = MagicMock()
+
+        with patch("integrations.nse_client.httpx.AsyncClient",
+                   return_value=_mock_nse_client([homepage, api_resp])):
+            result = await nse_client.fetch_bulk_deals(["INFY"])
+
+        assert result["available"] is True
+        assert result["as_on_date"] == "24-Jun-2026"
+        # WIPRO filtered out (not in watchlist); both INFY deals retained.
+        symbols = [d["symbol"] for d in result["deals"]]
+        assert symbols == ["INFY", "INFY"]
+        sides = {d["side"] for d in result["deals"]}
+        assert sides == {"BUY"}  # "BUY" and "B" both normalise to BUY
+        assert result["deals"][0]["qty"] == 1200000
+        assert result["deals"][0]["price"] == 1450.5
+
+    @pytest.mark.asyncio
+    async def test_failure_returns_safe_default(self):
+        from integrations import nse_client
+
+        with patch("integrations.nse_client.httpx.AsyncClient",
+                   side_effect=RuntimeError("network down")):
+            result = await nse_client.fetch_bulk_deals(["INFY"])
+
+        assert result == {"available": False, "as_on_date": None, "deals": []}
+
+
+class TestFetchDeliveryData:
+    """fetch_delivery_data must parse the security-wise bhavcopy CSV, strip the
+    space-prefixed column names, and return delivery % for watchlist stocks."""
+
+    @pytest.mark.asyncio
+    async def test_parses_delivery_pct_for_watchlist(self):
+        from integrations import nse_client
+
+        csv_text = (
+            "SYMBOL, SERIES, DATE1, DELIV_PER\n"
+            "INFY, EQ, 24-Jun-2026, 62.40\n"
+            "WIPRO, EQ, 24-Jun-2026, 18.10\n"
+            "RELIANCE, EQ, 24-Jun-2026, 71.00\n"
+        )
+        csv_resp = MagicMock()
+        csv_resp.status_code = 200
+        csv_resp.content = csv_text.encode()
+        csv_resp.text = csv_text
+        homepage = MagicMock()
+
+        with patch("integrations.nse_client.httpx.AsyncClient",
+                   return_value=_mock_nse_client([homepage, csv_resp])):
+            result = await nse_client.fetch_delivery_data(["INFY", "RELIANCE"])
+
+        assert result["available"] is True
+        assert result["delivery_pct"] == {"INFY": 62.4, "RELIANCE": 71.0}
+        # WIPRO not requested → excluded.
+        assert "WIPRO" not in result["delivery_pct"]
+
+    @pytest.mark.asyncio
+    async def test_empty_watchlist_skips_download(self):
+        from integrations import nse_client
+
+        # No HTTP patch needed — function must short-circuit before any request.
+        result = await nse_client.fetch_delivery_data(None)
+        assert result == {"available": False, "as_on_date": None, "delivery_pct": {}}
+
+
+class TestLastTradingDay:
+    """_last_trading_day must walk back over weekends/holidays to the prior session."""
+
+    def test_skips_weekend(self):
+        from datetime import date
+        from integrations import nse_client
+
+        # Monday 2026-06-22 → previous trading day is Friday 2026-06-19.
+        result = nse_client._last_trading_day(date(2026, 6, 22))
+        assert result == date(2026, 6, 19)

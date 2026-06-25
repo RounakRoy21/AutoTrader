@@ -29,6 +29,8 @@ from core.database import get_db_context
 from core.redis_client import get_redis, get_value, increment, publish, set_value
 from core.redis_keys import DAILY_TRADE_COUNT_KEY, DECISION_FEED_KEY, HALT_KEY
 from integrations.anthropic_client import get_anthropic_client
+from integrations.groww_client import get_groww_client
+from integrations.instrument_service import get_token as _get_instrument_token
 from models.trade import Trade
 from schemas.decision import Decision, DecisionOutput, SignalAudit
 from schemas.market_brief import MarketBias, MarketBriefLLMOutput, NewsUrgency, RecommendedStance
@@ -42,6 +44,18 @@ TRADE_COUNT_KEY = DAILY_TRADE_COUNT_KEY
 
 # Step 0: performance checkpoint log level (DEBUG so silent at INFO)
 _PERF = logging.DEBUG
+
+
+def _ema_of(closes: list[float], period: int) -> float:
+    """Simple EMA using an SMA seed over the first `period` values."""
+    if len(closes) < period:
+        return 0.0
+    k = 2.0 / (period + 1)
+    ema = sum(closes[:period]) / period
+    for price in closes[period:]:
+        ema = price * k + ema * (1.0 - k)
+    return ema
+
 
 # ── Signal-quality thresholds ─────────────────────────────────────────────────
 # These values are stated verbatim in DECISION_SYSTEM_PROMPT so the LLM reasons
@@ -190,6 +204,9 @@ class DecisionEngine:
         self._running = False
         # (stock + rationale) -> last feed push timestamp (IST)
         self._precheck_feed_last: dict[str, datetime] = {}
+        # Multi-day trend cache: symbol → (is_uptrending, cache_date)
+        # Populated lazily on first signal per symbol per day; reset at midnight
+        self._daily_trend_cache: dict[str, tuple[bool, date]] = {}
 
     def set_market_brief(self, brief: MarketBriefLLMOutput) -> None:
         """Update the current Market Brief (called when Research Agent publishes)."""
@@ -215,6 +232,61 @@ class DecisionEngine:
         except Exception as exc:
             logger.error("Failed to query open positions count: %s — defaulting to 0", exc)
             return 0
+
+    async def _is_stock_uptrending(self, symbol: str) -> bool:
+        """Return True when the stock is in a multi-day uptrend (close ≥ daily EMA21).
+
+        Fetches 25 daily candles from the Groww historical API once per symbol
+        per trading day and caches the result in ``_daily_trend_cache``.
+
+        Fail-open design: any API/data error returns True so a Groww outage
+        never silently halts all trading.
+        """
+        today = ist_today()
+        cached = self._daily_trend_cache.get(symbol)
+        if cached is not None and cached[1] == today:
+            return cached[0]
+
+        try:
+            token = _get_instrument_token(symbol)
+            if token is None:
+                logger.debug(
+                    "[DE] %s: no instrument token — skipping trend check (fail open)", symbol
+                )
+                self._daily_trend_cache[symbol] = (True, today)
+                return True
+
+            candles = await get_groww_client().get_historical_data(
+                token, interval="day", days_back=25
+            )
+            if not candles or len(candles) < 21:
+                logger.debug(
+                    "[DE] %s: only %d daily candles — skipping trend check (fail open)",
+                    symbol, len(candles) if candles else 0,
+                )
+                self._daily_trend_cache[symbol] = (True, today)
+                return True
+
+            closes = [float(c["close"]) for c in candles if c.get("close")]
+            if len(closes) < 21:
+                self._daily_trend_cache[symbol] = (True, today)
+                return True
+
+            ema21 = _ema_of(closes, 21)
+            is_up = closes[-1] >= ema21
+            self._daily_trend_cache[symbol] = (is_up, today)
+            if not is_up:
+                logger.info(
+                    "[DE] MULTI-DAY TREND REJECT %s: close=%.2f < EMA21(daily)=%.2f",
+                    symbol, closes[-1], ema21,
+                )
+            return is_up
+        except Exception as exc:
+            logger.warning(
+                "[DE] %s daily trend check failed (%s) — fail open", symbol, exc
+            )
+            self._daily_trend_cache[symbol] = (True, today)
+            return True
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -402,7 +474,15 @@ class DecisionEngine:
             if watchlist and signal.stock not in watchlist:
                 return False, f"{signal.stock} not in today's watchlist", signal
 
-            # Half-size positions based on market brief stance
+        # Multi-day trend filter: reject long entries on stocks trading below their
+        # daily EMA21.  Prevents chasing intraday bounces on structurally weak stocks
+        # (the TATASTEEL / RELIANCE pattern from the backtest).  Applied after the
+        # brief's avoid list (cheaper) but before any DB queries.
+        # Cached per symbol per day; fails open so API outages don't halt trading.
+        if not await self._is_stock_uptrending(signal.stock):
+            return False, f"{signal.stock} below daily EMA21 — multi-day downtrend, skip", signal
+
+        if self._market_brief:
             if stance == RecommendedStance.HALF_SIZE_POSITIONS:
                 signal = signal.model_copy(
                     update={"suggested_qty": max(1, signal.suggested_qty // 2)}
@@ -439,16 +519,25 @@ class DecisionEngine:
                     })
 
         # Check max open positions (authoritative DB query — not an in-memory counter)
-        # Bias-modulated: BULLISH→4, NEUTRAL→3, BEARISH→2
+        # Bias × stance matrix:
+        #   BULLISH + FULL_SIZE → 5   (high conviction, broad participation expected)
+        #   BULLISH + HALF_SIZE → 3   (bullish but cautious conditions, e.g. VIX elevated)
+        #   NEUTRAL + FULL_SIZE → 3   (normal day)
+        #   NEUTRAL + HALF_SIZE → 2   (cautious day — half qty already applied per trade)
+        #   BEARISH  → already rejected above; kept at 2 for completeness
         open_count = await self._count_open_positions()
         _bias = self._market_brief.market_bias.value if self._market_brief else "NEUTRAL"
+        _stance = self._market_brief.recommended_stance.value if self._market_brief else "FULL_SIZE_POSITIONS"
         _max_positions = {
-            "BULLISH": 4,
-            "NEUTRAL": self._settings.max_open_positions,
-            "BEARISH": 2,
-        }.get(_bias, self._settings.max_open_positions)
+            ("BULLISH", "FULL_SIZE_POSITIONS"): 5,
+            ("BULLISH", "HALF_SIZE_POSITIONS"): 3,
+            ("NEUTRAL", "FULL_SIZE_POSITIONS"): 3,
+            ("NEUTRAL", "HALF_SIZE_POSITIONS"): 2,
+            ("BEARISH", "FULL_SIZE_POSITIONS"): 2,
+            ("BEARISH", "HALF_SIZE_POSITIONS"): 2,
+        }.get((_bias, _stance), self._settings.max_open_positions)
         if open_count >= _max_positions:
-            return False, f"Max open positions ({_max_positions}) reached ({_bias} bias)", signal
+            return False, f"Max open positions ({_max_positions}) reached ({_bias}/{_stance})", signal
 
         # Prevent duplicate position in the same stock
         try:
@@ -465,6 +554,27 @@ class DecisionEngine:
         except Exception as exc:
             logger.error("Failed to check duplicate position for %s: %s", signal.stock, exc)
 
+        # Per-symbol daily trade cap: enforce breadth over concentration.
+        # Prevents repeatedly re-entering the same stock (e.g. 3× MARUTI in one day)
+        # while leaving capacity for other watchlist opportunities.
+        try:
+            async with get_db_context() as session:
+                sym_result = await session.execute(
+                    select(func.count()).select_from(Trade).where(
+                        Trade.stock == signal.stock,
+                        Trade.trade_date == ist_today(),
+                    )
+                )
+                sym_count = sym_result.scalar() or 0
+                _sym_cap = self._settings.max_trades_per_symbol_per_day
+                if sym_count >= _sym_cap:
+                    return False, (
+                        f"{signal.stock} per-symbol cap reached "
+                        f"({sym_count}/{_sym_cap} trades today)"
+                    ), signal
+        except Exception as exc:
+            logger.error("Failed to check per-symbol trade count for %s: %s", signal.stock, exc)
+
         # Check daily trade count.
         # Counter is incremented ONLY for EXECUTE decisions (not REDUCE) in
         # trading_agent.py, so this gate accurately reflects full-size entries.
@@ -472,15 +582,27 @@ class DecisionEngine:
         # consume a trade slot — otherwise 5 EXECUTEs + 1 REDUCE would lock out
         # all further signals even though daily exposure is well under the limit.
         # trade_count_str was pre-fetched in the pipeline above.
-        # Bias-modulated: BULLISH→8, NEUTRAL→6, BEARISH→4
+        # Bias × stance matrix (mirrors the max-open-positions matrix above):
+        #   BULLISH + FULL_SIZE → 10  (high-conviction day — capture the full opportunity set)
+        #   BULLISH + HALF_SIZE → 6   (bullish but cautious, e.g. VIX elevated / gap risk)
+        #   NEUTRAL + FULL_SIZE → 6   (normal day — config default)
+        #   NEUTRAL + HALF_SIZE → 4   (cautious day — qty already halved per trade)
+        #   BEARISH  → already rejected above; kept at 4 for completeness
+        # Robustness is NOT compromised by a higher count: the 3% daily-drawdown
+        # hard halt, the 3-consecutive-loss 30-min pause, and stock-lock-after-SL
+        # all remain active and are the true capital backstops — the trade count
+        # is only an activity ceiling, not the risk control.
         trade_count = int(trade_count_str) if trade_count_str else 0
         _max_trades = {
-            "BULLISH": 8,
-            "NEUTRAL": self._settings.max_trades_per_day,
-            "BEARISH": 4,
-        }.get(_bias, self._settings.max_trades_per_day)
+            ("BULLISH", "FULL_SIZE_POSITIONS"): 10,
+            ("BULLISH", "HALF_SIZE_POSITIONS"): 6,
+            ("NEUTRAL", "FULL_SIZE_POSITIONS"): self._settings.max_trades_per_day,
+            ("NEUTRAL", "HALF_SIZE_POSITIONS"): 4,
+            ("BEARISH", "FULL_SIZE_POSITIONS"): 4,
+            ("BEARISH", "HALF_SIZE_POSITIONS"): 4,
+        }.get((_bias, _stance), self._settings.max_trades_per_day)
         if trade_count >= _max_trades:
-            return False, f"Max daily trades ({_max_trades}) reached ({_bias} bias)", signal
+            return False, f"Max daily trades ({_max_trades}) reached ({_bias}/{_stance})", signal
 
         # Monday: half-size positions (skip if already halved by stance above)
         if day_name == "Monday" and not size_reduced:

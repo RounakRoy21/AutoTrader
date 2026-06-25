@@ -36,6 +36,7 @@ from core.redis_keys import (
     DATA_API_DETAIL_KEY,
     DATA_API_LAST_OK_KEY,
     SCANNER_FEED_CONNECTED_AT_KEY,
+    LATEST_MARKET_BRIEF_KEY,
 )
 from core.nse_calendar import get_market_status
 from agents.trading_agent_manager import get_trading_agent_manager
@@ -91,6 +92,7 @@ async def get_agent_status():
         DATA_API_STATUS_KEY,            # 15
         DATA_API_DETAIL_KEY,            # 16
         SCANNER_FEED_CONNECTED_AT_KEY,  # 17
+        LATEST_MARKET_BRIEF_KEY,        # 18
     ]
     try:
         r = await get_redis()
@@ -98,9 +100,37 @@ async def get_agent_status():
     except Exception:
         values = [None] * len(keys)
 
+    import json as _json
     settings = get_settings()
     calls_research = int(values[13]) if values[13] else 0
     calls_decision = int(values[14]) if values[14] else 0
+
+    # ── Effective bias × stance limits (mirrors decision_engine.py matrices) ──
+    _bias = (values[4].decode() if isinstance(values[4], bytes) else (values[4] or "")) or "NEUTRAL"
+    _stance = "FULL_SIZE_POSITIONS"
+    try:
+        _brief_raw = values[18].decode() if isinstance(values[18], bytes) else (values[18] or "")
+        if _brief_raw:
+            _brief_json = _json.loads(_brief_raw)
+            _stance = _brief_json.get("recommended_stance", "FULL_SIZE_POSITIONS")
+    except Exception:
+        pass
+    _effective_max_trades = {
+        ("BULLISH", "FULL_SIZE_POSITIONS"): 10,
+        ("BULLISH", "HALF_SIZE_POSITIONS"): 6,
+        ("NEUTRAL", "FULL_SIZE_POSITIONS"): settings.max_trades_per_day,
+        ("NEUTRAL", "HALF_SIZE_POSITIONS"): 4,
+        ("BEARISH", "FULL_SIZE_POSITIONS"): 4,
+        ("BEARISH", "HALF_SIZE_POSITIONS"): 4,
+    }.get((_bias, _stance), settings.max_trades_per_day)
+    _effective_max_positions = {
+        ("BULLISH", "FULL_SIZE_POSITIONS"): 5,
+        ("BULLISH", "HALF_SIZE_POSITIONS"): 3,
+        ("NEUTRAL", "FULL_SIZE_POSITIONS"): settings.max_open_positions,
+        ("NEUTRAL", "HALF_SIZE_POSITIONS"): 2,
+        ("BEARISH", "FULL_SIZE_POSITIONS"): 2,
+        ("BEARISH", "HALF_SIZE_POSITIONS"): 2,
+    }.get((_bias, _stance), settings.max_open_positions)
 
     # ── Scanner candle warmup ──────────────────────────────────────────────────
     # Signal generation requires MIN_CANDLES_FOR_INDICATORS (15) completed 1m
@@ -169,7 +199,9 @@ async def get_agent_status():
         "config": {
             "paper_trading": settings.paper_trading,
             "max_trades_per_day": settings.max_trades_per_day,
+            "effective_max_trades_per_day": _effective_max_trades,
             "max_open_positions": settings.max_open_positions,
+            "effective_max_open_positions": _effective_max_positions,
             "daily_drawdown_limit_pct": settings.daily_drawdown_limit_pct,
             "daily_drawdown_limit": settings.daily_drawdown_limit,
         },
