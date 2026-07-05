@@ -36,6 +36,7 @@ from core.redis_keys import (
     DATA_API_DETAIL_KEY,
     DATA_API_LAST_OK_KEY,
     SCANNER_FEED_CONNECTED_AT_KEY,
+    SCANNER_NIFTY_FILTER_KEY,
     LATEST_MARKET_BRIEF_KEY,
     NIFTY50_CONSTITUENTS_KEY,
     NIFTY50_DRIFT_KEY,
@@ -96,6 +97,7 @@ async def get_agent_status():
         DATA_API_DETAIL_KEY,            # 16
         SCANNER_FEED_CONNECTED_AT_KEY,  # 17
         LATEST_MARKET_BRIEF_KEY,        # 18
+        SCANNER_NIFTY_FILTER_KEY,       # 19
     ]
     try:
         r = await get_redis()
@@ -197,6 +199,13 @@ async def get_agent_status():
             "elapsed_min": warmup_elapsed_min,
             "remaining_min": warmup_remaining_min,
             "required_candles": WARMUP_CANDLES,
+        },
+        "scanner_nifty_filter": {
+            # True when the NIFTY 50 intraday trend filter is actively suppressing
+            # ALL long signals.  This is the most common reason for a silent scanner
+            # (no decision-feed entries) that the operator cannot otherwise diagnose
+            # from the dashboard.  Set by scanner.py on state transitions.
+            "active": (values[19].decode() if isinstance(values[19], bytes) else (values[19] or "")) == "TRUE",
         },
         "market_status": get_market_status(),
         "config": {

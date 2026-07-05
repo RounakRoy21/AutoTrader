@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, time as dt_time
 
 import pytz
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,6 +28,7 @@ from core.redis_keys import (
     RESEARCH_STATUS_KEY,
     TRADING_STATUS_KEY,
     RISK_STATUS_KEY,
+    DAILY_TRADE_COUNT_KEY,
 )
 from core.scheduler import (
     schedule_cron,
@@ -49,6 +50,7 @@ from agents.research_agent import run_research_agent
 from agents.trading_agent_manager import get_trading_agent_manager
 from integrations.instrument_service import load_instrument_map
 from models.market_brief import MarketBrief
+from models.trade import Trade
 
 # ─────────────────────────────────────────────────────
 # Logging
@@ -159,6 +161,33 @@ async def lifespan(app: FastAPI):
         await _alert("info", "AutoTrader starting up — Redis connected, agents reset to INACTIVE")
     except Exception:
         logger.warning("⚠️ Redis unreachable — running in fallback mode")
+
+    # 2b. Sync daily trade counter from DB on every startup.
+    #     The Redis key has no guaranteed TTL from previous runs — if the backend
+    #     was restarted on a weekend or after midnight without a new trading session
+    #     starting, the key carries over from the previous day (e.g. Friday's count
+    #     of 4 shows on Sunday).  Querying the DB is authoritative: today's actual
+    #     trade count is used, which is 0 on weekends/holidays.
+    try:
+        today_ist = datetime.now(_IST).date()
+        async with get_db_context() as session:
+            _result = await session.execute(
+                select(func.count()).select_from(Trade).where(
+                    Trade.trade_date == today_ist
+                )
+            )
+            _count_today = _result.scalar() or 0
+        from datetime import timedelta as _td
+        _now_sync = datetime.now(_IST)
+        _midnight = (_now_sync + _td(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        _ttl_sync = max(60, int((_midnight - _now_sync).total_seconds()))
+        await set_value(DAILY_TRADE_COUNT_KEY, str(_count_today), ttl=_ttl_sync)
+        logger.info(
+            "✅ Daily trade counter synced: %d trades today (TTL %ds until midnight IST)",
+            _count_today, _ttl_sync,
+        )
+    except Exception as _sync_exc:
+        logger.warning("⚠️ Could not sync daily trade counter from DB: %s", _sync_exc)
 
     # 3. Groww auto-authentication: always reauthenticate on startup.
     #    The Redis volume persists across Docker rebuilds, so a stale token may

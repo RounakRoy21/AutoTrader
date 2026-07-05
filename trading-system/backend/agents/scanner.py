@@ -420,6 +420,9 @@ class Scanner:
         # Market bias (BEARISH / NEUTRAL / BULLISH) — updated by set_market_bias() when
         # the research agent publishes a new brief.  Used to modulate signal thresholds.
         self._market_bias: str = "NEUTRAL"
+        # Tracks whether the NIFTY trend filter is currently suppressing signals.
+        # Written to Redis on state transitions so the dashboard can surface it.
+        self._nifty_filter_active: bool = False
 
     def set_market_bias(self, bias: str) -> None:
         """Update the cached market bias (called by TradingAgent when a new brief arrives)."""
@@ -567,7 +570,44 @@ class Scanner:
                     "[Scanner] %s REJECT NIFTY-TREND drift=%.3f%% < threshold=%.3f%% (%s bias) — suppressing long signals",
                     store.symbol, nifty_drift * 100, _nifty_thresh * 100, self._market_bias,
                 )
+                # On first transition into suppressed state: log INFO + write Redis key.
+                if not self._nifty_filter_active:
+                    self._nifty_filter_active = True
+                    logger.info(
+                        "[Scanner] NIFTY trend filter ACTIVE — all long signals suppressed "
+                        "(drift=%.2f%%, threshold=%.1f%%, bias=%s, NIFTY open=%.2f ltp=%.2f)",
+                        nifty_drift * 100, _nifty_thresh * 100, self._market_bias,
+                        self._nifty_open_price, self._nifty_ltp,
+                    )
+                    try:
+                        from core.redis_client import set_value as _sv
+                        from core.redis_keys import SCANNER_NIFTY_FILTER_KEY as _NK
+                        import asyncio as _asyncio
+                        loop = self._loop or _asyncio.get_event_loop()
+                        loop.call_soon_threadsafe(
+                            lambda: _asyncio.ensure_future(_sv(_NK, "TRUE", ttl=86400))
+                        )
+                    except Exception:
+                        pass  # non-critical — never block signal path
                 return None
+            # NIFTY recovered: clear the filter flag on transition.
+            if self._nifty_filter_active:
+                self._nifty_filter_active = False
+                logger.info(
+                    "[Scanner] NIFTY trend filter CLEARED — signals resuming "
+                    "(drift=%.2f%%, threshold=%.1f%%, bias=%s)",
+                    nifty_drift * 100, _nifty_thresh * 100, self._market_bias,
+                )
+                try:
+                    from core.redis_client import set_value as _sv
+                    from core.redis_keys import SCANNER_NIFTY_FILTER_KEY as _NK
+                    import asyncio as _asyncio
+                    loop = self._loop or _asyncio.get_event_loop()
+                    loop.call_soon_threadsafe(
+                        lambda: _asyncio.ensure_future(_sv(_NK, "FALSE", ttl=86400))
+                    )
+                except Exception:
+                    pass  # non-critical
 
         # Condition 1: Price > VWAP
         if ltp <= vwap:
@@ -1112,6 +1152,23 @@ class Scanner:
                                 exc_type,
                             )
 
+                    # Transient connectivity errors — GrowwFeed uses NATS internally
+                    # for its pub/sub layer.  "no servers available" is the NATS
+                    # client message when the broker is momentarily unreachable
+                    # (brief Groww-side outage, container restart, network blip).
+                    # These are recoverable with backoff and do NOT need reauth.
+                    _is_transient = False
+                    if not _is_auth:
+                        _lmsg_t = exc_msg.lower()
+                        if (
+                            "nats" in _lmsg_t
+                            or "no servers available" in _lmsg_t
+                            or "connection reset" in _lmsg_t
+                            or "connection timed out" in _lmsg_t
+                            or "temporarily unavailable" in _lmsg_t
+                        ):
+                            _is_transient = True
+
                     if _is_auth:
                         try:
                             await groww_client.reauthenticate()
@@ -1128,6 +1185,23 @@ class Scanner:
                                 reauth_exc,
                             )
                             raise  # propagate to let the manager report it
+                    elif _is_transient:
+                        _MAX_TRANSIENT = 20
+                        if _reconnect_attempt > _MAX_TRANSIENT:
+                            logger.error(
+                                "[Scanner] Transient GrowwFeed error persisted after "
+                                "%d attempts — scanner stopping",
+                                _MAX_TRANSIENT,
+                            )
+                            raise
+                        _backoff = min(30, 5 * _reconnect_attempt)
+                        logger.warning(
+                            "[Scanner] Transient GrowwFeed connection error "
+                            "(%s: %s) — retrying in %ds (attempt #%d)",
+                            exc_type, exc_msg, _backoff, _reconnect_attempt,
+                        )
+                        await asyncio.sleep(_backoff)
+                        continue  # retry without reauth
                     else:
                         logger.error(
                             "[Scanner] Non-auth GrowwFeed failure (%s) — "

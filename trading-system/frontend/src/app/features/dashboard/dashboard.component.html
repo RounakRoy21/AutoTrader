@@ -76,6 +76,12 @@
           </div>
         </div>
 
+        <!-- NIFTY trend filter banner — shown when NIFTY drift is suppressing all long signals -->
+        <div class="halt-banner" *ngIf="agentStatus.scanner_nifty_filter?.active">
+          <mat-icon>trending_down</mat-icon>
+          <span>NIFTY TREND FILTER ACTIVE — index down from session open, all long signals suppressed</span>
+        </div>
+
         <div class="status-row">
           <span class="status-dot at-pulse" [class.active]="agentStatus.research_agent.status === 'ACTIVE'"
                 [class.inactive]="agentStatus.research_agent.status !== 'ACTIVE'"></span>

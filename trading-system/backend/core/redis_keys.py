@@ -71,6 +71,13 @@ DATA_API_LAST_OK_KEY = "data_api:last_ok"    # ISO timestamp of last successful 
 # assuming something is broken.  TTL = 86400 s (auto-expires at midnight).
 SCANNER_FEED_CONNECTED_AT_KEY = "scanner:feed_connected_at"  # ISO-8601 UTC string
 
+# Set to "TRUE" whenever the NIFTY 50 intraday trend filter is actively suppressing
+# all long signals (NIFTY drifted below the threshold from its session open).
+# Cleared to "FALSE" when the first signal passes the filter — i.e. NIFTY recovered.
+# TTL = 86400 s (auto-expires overnight so it doesn't carry across sessions).
+# Written by scanner.py; read by /api/agent/status for dashboard surfacing.
+SCANNER_NIFTY_FILTER_KEY = "scanner:nifty_filter_active"  # "TRUE" | "FALSE"
+
 # ── NIFTY 50 constituent monitor ──────────────────────────────────────────────
 # Written by agents/nifty50_monitor.check_nifty50_drift() (monthly job).  Tracks
 # the official index membership so the operator is alerted when stocks enter/leave

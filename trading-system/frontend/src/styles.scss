@@ -179,22 +179,50 @@ mat-sidenav {
 }
 
 // ── Snackbars ──────────────────────────────────────────────────
-.snack-error .mdc-snackbar__surface {
-  background: #b71c1c !important;
-  color: #fff !important;
+// Base: applies to ALL snackbars (dark theme default).
+// MDC keeps message text in __label and button text in the action button —
+// setting color only on __surface does not cascade, so we target each element.
+.mat-mdc-snack-bar-container .mdc-snackbar__surface {
+  background: var(--at-surface-3) !important;
+}
+.mat-mdc-snack-bar-container .mdc-snackbar__label {
+  color: rgba(255, 255, 255, 0.87) !important;
+}
+.mat-mdc-snack-bar-container .mat-mdc-snack-bar-action .mdc-button__label {
+  color: rgba(255, 255, 255, 0.55) !important;
 }
 
+// Light-mode base overrides (at-surface-3 = #E2E8F0 in light, dark text).
+body:not(.dark-theme) .mat-mdc-snack-bar-container .mdc-snackbar__surface {
+  background: var(--at-surface-3) !important;
+}
+body:not(.dark-theme) .mat-mdc-snack-bar-container .mdc-snackbar__label {
+  color: rgba(0, 0, 0, 0.87) !important;
+}
+body:not(.dark-theme) .mat-mdc-snack-bar-container .mat-mdc-snack-bar-action .mdc-button__label {
+  color: rgba(0, 0, 0, 0.55) !important;
+}
+
+// Errors — always red regardless of theme.
+.snack-error .mdc-snackbar__surface { background: #b71c1c !important; }
+.snack-error .mdc-snackbar__label { color: #fff !important; }
+.snack-error .mat-mdc-snack-bar-action .mdc-button__label { color: rgba(255, 255, 255, 0.7) !important; }
+
+// Profit toasts (green-accented).
 .at-snackbar-profit .mdc-snackbar__surface {
   background: var(--at-surface-2) !important;
   border-left: 3px solid var(--at-status-active) !important;
-  color: var(--at-profit) !important;
 }
+.at-snackbar-profit .mdc-snackbar__label { color: var(--at-profit) !important; }
+.at-snackbar-profit .mat-mdc-snack-bar-action .mdc-button__label { color: var(--at-text-secondary) !important; }
 
+// Loss toasts (red-accented).
 .at-snackbar-loss .mdc-snackbar__surface {
   background: var(--at-surface-2) !important;
   border-left: 3px solid var(--at-status-error) !important;
-  color: var(--at-loss) !important;
 }
+.at-snackbar-loss .mdc-snackbar__label { color: var(--at-loss) !important; }
+.at-snackbar-loss .mat-mdc-snack-bar-action .mdc-button__label { color: var(--at-text-secondary) !important; }
 
 // ── LTP flash animations ───────────────────────────────────────
 @keyframes flash-profit {

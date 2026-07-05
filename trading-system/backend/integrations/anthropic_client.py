@@ -127,6 +127,10 @@ class AnthropicClient:
             extra_kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
             extra_kwargs["temperature"] = 1  # mandatory when thinking is enabled
 
+        # Mutable copy so a thinking-incompatibility on attempt 1 can be stripped
+        # before attempt 2 — without touching the original extra_kwargs definition.
+        _active_kwargs = dict(extra_kwargs)
+
         for attempt in range(1, MAX_LLM_RETRIES + 1):
             try:
                 message = await self._client.messages.create(
@@ -136,7 +140,7 @@ class AnthropicClient:
                     tools=tools,
                     tool_choice={"type": "tool", "name": _TOOL_NAME},
                     messages=[{"role": "user", "content": user_content}],
-                    **extra_kwargs,
+                    **_active_kwargs,
                 )
                 # Increment daily call counter immediately after a successful HTTP
                 # response — before validation — so we count every billed API call
@@ -189,6 +193,26 @@ class AnthropicClient:
                 )
                 if attempt < MAX_LLM_RETRIES:
                     await asyncio.sleep(5)
+            except anthropic.BadRequestError as exc:
+                # 400 errors often mean the requested feature combination is not
+                # supported by this model version (e.g. extended thinking +
+                # forced tool_choice).  Strip thinking params and retry once so
+                # the brief still comes from the real LLM rather than the mock.
+                if "thinking" in _active_kwargs:
+                    logger.warning(
+                        "Extended thinking rejected by API for model=%s "
+                        "(attempt %d/%d): %s — retrying without thinking",
+                        active_model, attempt, MAX_LLM_RETRIES, exc,
+                    )
+                    _active_kwargs.pop("thinking", None)
+                    _active_kwargs.pop("temperature", None)
+                    continue  # retry immediately, no sleep needed
+                logger.error(
+                    "Anthropic bad request (attempt %d/%d): %s",
+                    attempt, MAX_LLM_RETRIES, exc,
+                )
+                if attempt < MAX_LLM_RETRIES:
+                    await asyncio.sleep(2)
             except anthropic.APIError as exc:
                 logger.error("Anthropic API error (attempt %d/%d): %s", attempt, MAX_LLM_RETRIES, exc)
                 if attempt < MAX_LLM_RETRIES:

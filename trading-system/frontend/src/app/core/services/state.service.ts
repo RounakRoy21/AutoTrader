@@ -93,12 +93,22 @@ export class StateService implements OnDestroy {
 
   /** Subscribe to WebSocket events for real-time updates. */
   private initWebSocket(): void {
-    // Trade events → refresh open positions
+    // Trade events → refresh open positions + agent status (daily_trade_count) + daily PnL
+    // Agent status polls at 60s when WS is connected; without this refresh the
+    // daily_trade_count KPI can lag up to 60s after a trade opens or closes.
     this.ws.trades$.pipe(takeUntil(this.destroy$)).subscribe(() => {
       this.api
         .getOpenTrades()
         .pipe(catchError(() => EMPTY))
         .subscribe((trades) => this._openPositions$.next(trades));
+      this.api
+        .getAgentStatus()
+        .pipe(catchError(() => EMPTY))
+        .subscribe((s) => this._agentStatus$.next(s));
+      this.api
+        .getDailyPnl()
+        .pipe(catchError(() => EMPTY))
+        .subscribe((pnl) => this._dailyPnl$.next(pnl));
     });
 
     // Market brief updates

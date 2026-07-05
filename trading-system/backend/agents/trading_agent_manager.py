@@ -16,9 +16,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timedelta
 from typing import Optional
 
+import pytz
+
 from core.nse_calendar import ist_today
+
+_IST = pytz.timezone("Asia/Kolkata")
+
+
+def _secs_until_midnight_ist() -> int:
+    """Seconds from now until the next midnight IST (minimum 60)."""
+    now = datetime.now(_IST)
+    tomorrow_midnight = (now + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return max(60, int((tomorrow_midnight - now).total_seconds()))
 
 from sqlalchemy import func, select
 
@@ -226,11 +240,15 @@ class TradingAgentManager:
                     )
                 )
                 count = result.scalar() or 0
-            await set_value(TRADE_COUNT_KEY, str(count))
-            logger.info("[Manager] Restored daily_trade_count = %d from DB", count)
+            _ttl = _secs_until_midnight_ist()
+            await set_value(TRADE_COUNT_KEY, str(count), ttl=_ttl)
+            logger.info(
+                "[Manager] Restored daily_trade_count = %d from DB (TTL %ds until midnight IST)",
+                count, _ttl,
+            )
         except Exception as exc:
             logger.error("[Manager] Failed to restore trade count from DB: %s — defaulting to 0", exc)
-            await set_value(TRADE_COUNT_KEY, "0")
+            await set_value(TRADE_COUNT_KEY, "0", ttl=_secs_until_midnight_ist())
 
         # Reset the daily halt flag so yesterday's drawdown halt doesn't block today
         await set_value(HALT_KEY, "FALSE")

@@ -109,6 +109,9 @@ export interface AgentStatus {
     remaining_min: number;
     required_candles: number;
   };
+  scanner_nifty_filter?: {
+    active: boolean;
+  };
   config?: {
     paper_trading: boolean;
     max_trades_per_day: number;
