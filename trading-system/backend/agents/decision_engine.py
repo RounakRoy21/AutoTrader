@@ -62,7 +62,12 @@ def _ema_of(closes: list[float], period: int) -> float:
 # with the same numbers, and are independently enforced in _validate_decision()
 # regardless of what the LLM returns.
 
-# RSI (14-period, 1-min ticks) — long-only system
+# RSI (14-period, LTP-tick-based) — long-only system
+# The RSI here is computed on the rolling series of raw last-price ticks
+# (not 1-minute candle closes). At ~1 tick/second this covers ~14 seconds of
+# price action, making it a short-term momentum measure rather than a
+# 14-candle indicator. The 5-minute RSI in the scanner provides the
+# timeframe-anchored filter. Both are described accurately in the prompt below.
 # SM1 — RSI band asymmetry note: The Scanner fires signals at RSI 45–65 (tight
 # conservative pre-filter).  The DecisionEngine accepts RSI 40–72 (wider).
 # The gap (40–44 and 66–72) is intentional: signals in those zones are never
@@ -96,7 +101,8 @@ DECISION_SYSTEM_PROMPT = (
     "Return ONLY a valid JSON object matching the DecisionOutput schema — no prose, no markdown fences.\n\n"
 
     "MANDATORY ENTRY THRESHOLDS (verify each before deciding):\n"
-    "  1. RSI (1-min, 14-period): Valid long zone 40–72. "
+    "  1. RSI (14-period, tick-based — NOT a 1-min candle RSI; computed on the last "
+    "14 raw LTP ticks, ~14 seconds of price action): Valid long zone 40–72. "
     "     Hard reject if RSI > 80 or RSI < 28.\n"
     "  2. Volume ratio: Minimum 1.5× daily avg. "
     "     Hard reject if < 1.2×.\n"

@@ -70,7 +70,7 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:4200,http://localhost:4201"
 
     # ── Trading Configuration ─────────────────────
-    total_capital: float = 1_000_000.0
+    total_capital: float = 100_000.0
     core_bucket_pct: float = 0.70
     hedge_bucket_pct: float = 0.20
     warchest_bucket_pct: float = 0.10

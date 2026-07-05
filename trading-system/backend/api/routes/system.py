@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Security
 from fastapi.security import APIKeyHeader
 
 from core.config import get_settings
-from core.database import check_db_health
+from core.database import check_db_health, get_db_context
 from core.redis_client import check_redis_health, get_redis, get_value, set_value
 from core.redis_keys import (
     HALT_KEY,
@@ -161,6 +161,38 @@ async def get_agent_status():
         except Exception:
             pass  # non-critical — leave defaults (complete=True = no false banner)
 
+    # ── Avg realised R:R — computed live from today's closed trades ———————————
+    # Surfaced here alongside drawdown so operators can tell at a glance whether
+    # the exit stack is preserving the expected reward-to-risk ratio.
+    # Floor: ≥1.2 for positive expectancy at the target win rate (≈52–53%).
+    avg_realised_rr_today: float | None = None
+    try:
+        import pytz as _pytz
+        from models.trade import Trade as _Trade
+        from sqlalchemy import select as _select
+        _IST_rr = _pytz.timezone("Asia/Kolkata")
+        _today_ist = datetime.now(_IST_rr).date()
+        async with get_db_context() as _db:
+            _r = await _db.execute(
+                _select(_Trade.realized_pnl).where(
+                    _Trade.trade_date == _today_ist,
+                    _Trade.status == "CLOSED",
+                    _Trade.realized_pnl.isnot(None),
+                )
+            )
+            _pnls = [row[0] for row in _r.all()]
+        _pos = [p for p in _pnls if p > 0]
+        _neg = [abs(p) for p in _pnls if p < 0]
+        if _pos and _neg:
+            avg_realised_rr_today = round(
+                (sum(_pos) / len(_pos)) / (sum(_neg) / len(_neg)), 2
+            )
+        elif _pos:
+            avg_realised_rr_today = 999.0  # all winners so far
+        # else: None — no closed trades yet, or exclusively losses
+    except Exception:
+        pass  # non-critical; DB may be unreachable
+
     return _envelope(True, {
         "research_agent": {
             "status": values[0] or "INACTIVE",
@@ -180,6 +212,7 @@ async def get_agent_status():
             "status": values[10] or "INACTIVE",
             "daily_loss": float(values[11]) if values[11] else 0.0,
             "drawdown_pct": float(values[12]) if values[12] else 0.0,
+            "avg_realised_rr": avg_realised_rr_today,
         },
         "anthropic": {
             "calls_research_today": calls_research,

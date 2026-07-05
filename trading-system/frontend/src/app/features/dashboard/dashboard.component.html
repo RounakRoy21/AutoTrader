@@ -125,6 +125,24 @@
           </div>
         </div>
 
+        <!-- Avg Realised R:R — floor ≥1.2 for positive expectancy at target win rate -->
+        <div class="rr-section"
+             *ngIf="agentStatus.risk_manager.avg_realised_rr !== null && agentStatus.risk_manager.avg_realised_rr !== undefined">
+          <div class="rr-row">
+            <span class="rr-label">Avg R:R today</span>
+            <span class="rr-value"
+                  [class.rr-good]="agentStatus.risk_manager.avg_realised_rr >= 1.2"
+                  [class.rr-warn]="agentStatus.risk_manager.avg_realised_rr >= 0.8 && agentStatus.risk_manager.avg_realised_rr < 1.2"
+                  [class.rr-bad]="agentStatus.risk_manager.avg_realised_rr > 0 && agentStatus.risk_manager.avg_realised_rr < 0.8">
+              {{ agentStatus.risk_manager.avg_realised_rr >= 999 ? '∞' : (agentStatus.risk_manager.avg_realised_rr | number:'1.2-2') }}
+            </span>
+          </div>
+          <div class="rr-floor-hint"
+               *ngIf="agentStatus.risk_manager.avg_realised_rr > 0 && agentStatus.risk_manager.avg_realised_rr < 1.2 && agentStatus.risk_manager.avg_realised_rr < 999">
+            Below 1.2 floor — exit quality below break-even threshold
+          </div>
+        </div>
+
         <div class="halt-controls">
           <button mat-stroked-button color="warn"
                   (click)="halt()"

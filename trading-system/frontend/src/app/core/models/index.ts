@@ -87,6 +87,10 @@ export interface AgentStatus {
     status: string;
     daily_loss: number;
     drawdown_pct: number;
+    /** avg(winning P&L) / avg(|losing P&L|) for today's closed trades.
+     *  null before the first closed trade. 999 when all trades are winners.
+     *  Floor for positive expectancy at ~52–53% win rate: ≥1.2 */
+    avg_realised_rr: number | null;
   };
   anthropic?: {
     calls_research_today: number;

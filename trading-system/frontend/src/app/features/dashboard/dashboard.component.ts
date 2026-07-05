@@ -55,7 +55,7 @@ export class DashboardComponent implements OnInit, OnDestroy {
   agentStatus: AgentStatus = {
     research_agent: { status: 'INACTIVE', step: 'IDLE', last_bias: null, last_confidence: null, last_completed: null },
     trading_agent: { status: 'INACTIVE', trading_halted: false, daily_trade_count: 0, last_signal_stock: null, last_signal_time: null },
-    risk_manager: { status: 'INACTIVE', daily_loss: 0, drawdown_pct: 0 },
+    risk_manager: { status: 'INACTIVE', daily_loss: 0, drawdown_pct: 0, avg_realised_rr: null },
   };
   health: HealthCheck | null = null;
   todayPnl = 0;

@@ -238,6 +238,32 @@
   margin-top: 4px;
 }
 
+// ── Avg Realised R:R ──────────────────────────────────────────────────
+.rr-section { margin-top: 8px; margin-bottom: 2px; }
+
+.rr-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.8rem;
+}
+
+.rr-label { color: var(--at-text-secondary); }
+
+.rr-value {
+  font-family: var(--at-font-mono);
+  font-weight: 600;
+  &.rr-good { color: var(--at-profit); }
+  &.rr-warn { color: var(--at-status-degraded); }
+  &.rr-bad  { color: var(--at-loss); }
+}
+
+.rr-floor-hint {
+  font-size: 0.7rem;
+  color: var(--at-loss);
+  margin-top: 2px;
+}
+
 // â”€â”€ Controls â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 .halt-controls, .agent-controls {
   display: flex;

@@ -1,7 +1,8 @@
 # AutoTrader — On-Device Android (Kotlin) Migration Plan
 
 > **Status:** Research / architecture spike complete. No port code written yet.
-> **Last updated:** 2026-06-25
+> **Last updated:** 2026-07-05 (reviewed against current backend: added `nifty50_monitor`,
+> `rbi_client`, `core/nifty50`; expanded research data sources; news feeds now 7)
 > **Purpose of this document:** A self-contained record so that if the chat session is lost,
 > we (or a future agent) can resume the Android port from exactly this point. It captures the
 > objective, the chosen approach, the full Python→Kotlin component mapping, the Groww REST
@@ -45,6 +46,14 @@ pyotp (TOTP), pandas/numpy (TA), anthropic (Claude), python-telegram-bot, feedpa
 **Frontend (Angular 17):** Material, chart.js/ng2-charts, rxjs, WebSocket client. Production build
 served by nginx in the current Docker deployment.
 
+**Research data sources (all plain HTTPS, easy to port):** Yahoo Finance (Nifty 50 close, India VIX,
+DXY, USD/INR, Nikkei 225, crude oil, gold, earnings calendar) with Alpha Vantage as a US-close
+fallback; NSE HTTP (FII/DII, index snapshots, GIFT Nifty, bulk deals, delivery data, corporate
+actions & announcements, event calendar); RBI RSS (press releases + notifications — repo/liquidity/
+regulatory macro context); and the `HybridNewsAggregator` (7 Indian financial RSS feeds + per-stock
+and broad Google News RSS). A monthly `nifty50_monitor` diffs live NIFTY 50 constituents against the
+app's coverage registry (`core/nifty50.py`) and alerts on index drift / demergers.
+
 **Runtime topology today:** 3 Docker containers — `autotrader-backend`, `autotrader-frontend`
 (nginx), `autotrader-postgres` — plus Redis.
 
@@ -60,6 +69,7 @@ served by nginx in the current Docker deployment.
 | 15:15 | Hard cutoff: no new entry signals | Scanner (`SIGNAL_CUTOFF`) |
 | 15:30 | Trading session **stop** | APScheduler cron |
 | EOD | EOD P&L report | Risk Manager (`EOD_REPORT_TIME`) |
+| 05:30 (1st of month) | NIFTY 50 constituent drift check (index add/remove, demergers) | APScheduler monthly cron |
 
 Notes: Fridays stop generating signals after 14:00. NSE-holiday guard skips the whole day.
 On a mid-day backend restart, both research and trading sessions **catch up** automatically.
@@ -117,11 +127,15 @@ FastAPI surface the dashboard consumes.
 | `agents/decision_engine.py` (pre-checks + Claude LLM + bias×stance matrices) | gate + size + confirm trades | `DecisionEngine`; pre-checks pure Kotlin; LLM via Anthropic REST (OkHttp) |
 | `agents/risk_manager.py` (thread + 5s poll loop) | SL/target/trailing/ROI-decay/partial/EOD/drawdown | `RiskManager` coroutine with `delay(5_000)` loop; identical rule order |
 | `agents/research_agent.py` (multi-API + Claude → brief) | pre-market brief + watchlist | `ResearchAgent` coroutine; same external calls via REST |
+| `agents/nifty50_monitor.py` | monthly NIFTY 50 constituent drift detection | `Nifty50Monitor` — `WorkManager` periodic (monthly) task; diff live constituents vs registry, alert on drift |
+| `core/nifty50.py` (coverage registry + `diff_constituents`) | tracked symbols + index diff | Kotlin `object Nifty50` with `TRACKED_SYMBOLS` + `diffConstituents()` |
 | `integrations/groww_client.py` (SDK wrapper + feed adapter) | broker I/O | **`GrowwRestClient`** (Retrofit) — see §5 & §6; **no websocket** |
+| `integrations/kite_client.py` | **DEPRECATED** legacy Zerodha Kite wrapper | not ported (kept in source for reference only) |
 | `integrations/instrument_service.py` (symbol↔token) | instrument map | download public CSV, parse (kotlin-csv), build map; keep `FALLBACK_TOKEN_MAP` |
 | `integrations/anthropic_client.py` | Claude calls | OkHttp + Anthropic Messages REST |
-| `integrations/alpha_vantage_client.py` | macro data | OkHttp REST |
-| `integrations/nse_client.py` | FII/DII, indices, bulk deals | OkHttp REST (mind NSE cookie/User-Agent handling) |
+| `integrations/alpha_vantage_client.py` | macro data | OkHttp REST (Yahoo Finance chart endpoints for VIX/DXY/USD-INR/Nikkei/crude/gold/earnings; Alpha Vantage as US-close fallback) |
+| `integrations/nse_client.py` | FII/DII, indices, GIFT Nifty, bulk deals, delivery, corporate actions/announcements, event calendar | OkHttp REST (mind NSE cookie/User-Agent handling) |
+| `integrations/rbi_client.py` | RBI macro/policy RSS (2 feeds) | OkHttp + Rome/Kotlin XML RSS parser |
 | `integrations/news_aggregator.py` (feedparser) | RSS news | **Rome** or a Kotlin RSS/XML parser |
 | `integrations/telegram_client.py` | alerts | OkHttp → Telegram Bot API |
 | `integrations/ltp_store.py` (in-memory LTP) | latest prices | in-memory `ConcurrentHashMap` + `StateFlow` |
@@ -238,8 +252,9 @@ BroadcastReceiver posts the job onto the service scope. Re-arm for the next day 
 Use `WorkManager` as a backstop for missed/retryable work (research catch-up).
 
 **Jobs:** 06:00 research · 08:30 reauth · 09:15 start session · 12:30 research (45-min guard) ·
-15:30 stop session. Plus the in-session loops (price 1–2 s, volume 60 s, risk 5 s) run as
-coroutines inside the active session, not as alarms.
+15:30 stop session · 05:30 on the 1st of each month NIFTY 50 constituent drift check. Plus the
+in-session loops (price 1–2 s, volume 60 s, risk 5 s) run as coroutines inside the active session,
+not as alarms. (The current backend registers the monthly job via `scheduler.schedule_monthly`.)
 
 **Catch-up on (re)start:** on service start during 09:15–15:29 on a non-holiday weekday, auto-start
 the session and trigger a research run if no brief exists for today — identical to `main.py` today.
@@ -334,6 +349,7 @@ max 3 open positions / 6 trades-per-day baseline (scaled by matrices); max 2 tra
 | `decision_feed` (rolling 100, LPUSH/LTRIM) | bounded in-memory `ArrayDeque(100)` + StateFlow |
 | `trade_atr:{symbol}` (24 h TTL) | in-memory map with expiry timestamps |
 | `data_api:*`, `scanner:feed_connected_at` | in-memory StateFlow |
+| `nifty50:constituents`, `nifty50:drift`, `nifty50:last_check` | DataStore (persist last-known constituents + drift report across restarts) |
 | `anthropic_calls:today:*` (24 h TTL) | in-memory counters reset at IST midnight |
 
 **Redis pub/sub channels → EventBus (`MutableSharedFlow`):** `trade_events`, `eod_report`,
@@ -434,6 +450,8 @@ decisions, P&L, and dashboard state against the Python system on identical data.
 - Pre-checks + matrices + LLM: `backend/agents/decision_engine.py`
 - Risk rules: `backend/agents/risk_manager.py` (`_poll`)
 - Research brief: `backend/agents/research_agent.py`
+- NIFTY 50 constituent monitor: `backend/agents/nifty50_monitor.py`, `backend/core/nifty50.py`
+- RBI macro/policy feeds: `backend/integrations/rbi_client.py`
 - Broker wrapper (reference for REST mapping): `backend/integrations/groww_client.py`
 - Instrument map + fallback tokens: `backend/integrations/instrument_service.py`
 - Groww REST detail (memory): `/memories/repo/groww-rest-api-map.md`

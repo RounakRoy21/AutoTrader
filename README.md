@@ -34,12 +34,12 @@ An automated NSE intraday equity trading system. Streams live tick data from Gro
                      │  │  Hard square-off at 15:00 IST                │   │
                      │  └──────────────────────────────────────────────┘   │
                      │                                                     │
-06:00–09:10 IST      │  ┌──────────────────────────────────────────────┐   │
+06:00 + 12:30 IST    │  ┌──────────────────────────────────────────────┐   │
                      │  │            Research Agent                    │   │
-  Alpha Vantage  ───►│  │  SGX Nifty, DXY, US market close, FII/DII    │   │
-  Yahoo Finance  ───►│  │  India VIX, crude oil (Brent), gold          │   │
-  RSS / Google   ───►│  │  Earnings calendar (next 7 days)             │   │
-  News RSS feeds ───►│  │  Financial news headlines                    │   │
+  Alpha Vantage  ───►│  │  Global cues: SGX/GIFT Nifty, US close, DXY  │   │
+  Yahoo Finance  ───►│  │  USD/INR, Nikkei, India VIX, crude, gold     │   │
+  RSS / Google   ───►│  │  FII/DII, bulk deals, delivery, corp actions │   │
+  RBI / News RSS ───►│  │  RBI policy, earnings cal, 7 RSS + news      │   │
   NSE data       ───►│  │  → Claude synthesises → Market Brief         │   │
                      │  │  → published to Redis + PostgreSQL           │   │
                      │  └──────────────────────────────────────────────┘   │
@@ -89,13 +89,14 @@ An automated NSE intraday equity trading system. Streams live tick data from Gro
 - Consecutive loss pause (configurable N losses → pause M minutes)
 - Stock lock after stop-loss hit for remainder of the day
 
-**Research Agent** (pre-market, 06:00–09:10 IST)
-- Fetches SGX Nifty proxy (Nifty 50 close via Yahoo Finance `^NSEI`), DXY trend, US market close (Alpha Vantage)
-- India VIX (NSE implied-volatility index via Yahoo Finance `^INDIAVIX`) — drives `recommended_stance` and `position_size_override`
-- Brent crude oil (Yahoo Finance `CL=F`) and gold spot (Yahoo Finance `GC=F`) — feed commodity interpretation rules in the LLM prompt
-- FII/DII net buy/sell data (NSE)
+**Research Agent** (pre-market 06:00 IST + mid-session refresh 12:30 IST)
+- Global cues: SGX/GIFT Nifty proxy (S&P 500 futures `ES=F` + Nifty 50 `^NSEI` fallback), US market close (`^GSPC`/`^IXIC`), DXY (`DX-Y.NYB`), USD/INR (`USDINR=X`), Nikkei 225 (`^N225`) — all via Yahoo Finance, with Alpha Vantage as fallback
+- India VIX (30-day implied vol of Nifty options via Yahoo Finance `^INDIAVIX`) — drives `recommended_stance` and `position_size_override`
+- Brent crude oil and gold spot (Yahoo Finance) — feed commodity interpretation rules in the LLM prompt
+- NSE market internals: FII/DII net buy/sell, index snapshots, GIFT Nifty, bulk deals, delivery-volume data, corporate actions & announcements, and the event calendar
+- RBI macro/monetary-policy context (`rbi_client`): repo-rate decisions, liquidity/OMO ops, penalties and regulatory circulars from the RBI press-release + notification RSS feeds
 - Earnings calendar: upcoming NSE results in the next 7 days (Yahoo Finance `quoteSummary`) — populates `earnings_drift_candidates`; stocks with results today/tomorrow are flagged as high-uncertainty and bias the watchlist
-- Financial news headlines via `HybridNewsAggregator`: 5 Indian RSS feeds (Economic Times, Business Standard, Moneycontrol, LiveMint, NDTV Profit) + targeted Google News RSS per watchlist stock
+- Financial news headlines via `HybridNewsAggregator`: 7 Indian financial RSS feeds (Economic Times, Hindu BusinessLine Markets, LiveMint, Business Standard, Hindu BusinessLine Economy, CNBC-TV18 Markets, NDTV Profit) + per-stock Google News RSS + a broad India-market Google News query
 - Claude synthesises all inputs into a structured `MarketBrief` with a `BULLISH / NEUTRAL / BEARISH` bias
 - Bias is injected into every trade decision — a bearish brief suppresses long signals
 - VIX regime gates position sizing: ELEVATED (20–25) → half-size; STRESS (>25) → avoid trading
@@ -116,7 +117,7 @@ An automated NSE intraday equity trading system. Streams live tick data from Gro
   - Responsive design: sticky table headers, mobile-optimized column visibility, touch-friendly controls
   - Live IST clock, paper trading badge, WebSocket connection status chip, theme toggle
 - In-browser Groww TOTP authentication page (`/auth/groww`)
-- TOTP-based Groww authentication (no daily re-login needed)
+- TOTP-based Groww authentication with automatic daily re-authentication (08:30 IST) and mid-session re-auth on token expiry — no manual re-login required
 - Real-time WebSocket feed: live tick updates, decisions, trade events, market briefs
 
 **Infrastructure**
@@ -140,8 +141,8 @@ An automated NSE intraday equity trading system. Streams live tick data from Gro
 | Scheduling | APScheduler 3.10 |
 | Broker | Groww API (growwapi SDK) |
 | LLM | Anthropic Claude — Sonnet 4.6 (Research Agent), Haiku 4.5 (Decision Engine) |
-| Market data | Alpha Vantage (US close, DXY), Yahoo Finance (Nifty 50 close, India VIX, crude oil, gold, earnings calendar), NSE HTTP |
-| News | HybridNewsAggregator — 5 Indian financial RSS feeds + Google News RSS (no API key) |
+| Market data | Yahoo Finance (Nifty 50 close, India VIX, crude oil, gold, DXY, USD/INR, Nikkei 225, earnings calendar), Alpha Vantage (US close fallback), NSE HTTP (FII/DII, indices, GIFT Nifty, bulk deals, delivery data, corporate actions/announcements, event calendar), RBI RSS (policy/liquidity/regulatory) |
+| News | HybridNewsAggregator — 7 Indian financial RSS feeds + per-stock & broad Google News RSS (no API key) |
 | Alerts | Telegram Bot API |
 | Frontend | Angular 17, TypeScript |
 | Containers | Docker, Docker Compose |
@@ -161,22 +162,29 @@ trading-system/
 │   │   ├── trading_agent_manager.py
 │   │   ├── risk_manager.py         # Deterministic position monitoring
 │   │   ├── research_agent.py       # Pre-market data + market brief
-│   │   └── token_refresh.py        # (stub) TOTP tokens do not expire
+│   │   ├── nifty50_monitor.py      # Monthly NIFTY 50 constituent drift detector
+│   │   └── token_refresh.py        # (stub) daily re-auth handled in main.py + groww_client
 │   ├── api/routes/                 # REST endpoints (trades, P&L, system, auth)
 │   ├── api/websocket.py            # Live data WebSocket
 │   ├── core/
 │   │   ├── config.py               # Pydantic-settings config (all from .env)
 │   │   ├── database.py             # Async SQLAlchemy engine
+│   │   ├── nifty50.py              # NIFTY 50 coverage registry + constituent diff
+│   │   ├── nse_calendar.py         # NSE holiday calendar + IST helpers
 │   │   ├── redis_client.py
+│   │   ├── redis_keys.py
 │   │   └── scheduler.py
 │   ├── integrations/
-│   │   ├── groww_client.py         # Groww API wrapper (retry + circuit breaker)
+│   │   ├── groww_client.py         # Groww API wrapper (retry + circuit breaker + GrowwFeed)
+│   │   ├── kite_client.py          # DEPRECATED — legacy Zerodha Kite wrapper (kept for reference)
 │   │   ├── anthropic_client.py
-│   │   ├── alpha_vantage_client.py # US close, DXY (Alpha Vantage); Nifty 50, India VIX,
-│   │   │                           #   crude oil, gold, earnings calendar (Yahoo Finance)
+│   │   ├── alpha_vantage_client.py # US close fallback (Alpha Vantage); Nifty 50, India VIX, DXY,
+│   │   │                           #   USD/INR, Nikkei, crude oil, gold, earnings (Yahoo Finance)
 │   │   ├── instrument_service.py   # NSE instrument list download + symbol resolution
-│   │   ├── news_aggregator.py      # HybridNewsAggregator: RSS + Google News RSS
-│   │   ├── nse_client.py           # FII/DII data
+│   │   ├── news_aggregator.py      # HybridNewsAggregator: 7 RSS feeds + Google News RSS
+│   │   ├── nse_client.py           # FII/DII, indices, GIFT Nifty, bulk deals, delivery,
+│   │   │                           #   corporate actions/announcements, event calendar
+│   │   ├── rbi_client.py           # RBI press-release + notification RSS (macro/policy)
 │   │   ├── telegram_client.py
 │   │   ├── ltp_store.py            # In-memory LTP cache (Redis-backed)
 │   │   └── mock_tick_generator.py  # ±2% random walk for offline dev
@@ -270,9 +278,14 @@ Add `--build` (Linux) or `-Build` (Windows) to rebuild images after code changes
 
 ---
 
-### Step 3 — Authenticate with Groww (one-time only)
+### Step 3 — Authenticate with Groww
 
-Groww TOTP tokens don’t expire, so this is done once:
+When `GROWW_CLIENT_ID` and `GROWW_TOTP_SECRET` are set in `.env`, the backend
+**auto-authenticates on every startup** and **re-authenticates daily at 08:30 IST**
+(Groww session tokens expire after roughly a day). It also re-authenticates
+automatically if the token expires mid-session. No manual step is normally required.
+
+If you ever need to authenticate manually (e.g. the TOTP secret was just added), call:
 
 ```bash
 curl -X POST http://localhost:8000/api/auth/groww/login \
@@ -324,7 +337,7 @@ Leave `GROWW_CLIENT_ID` blank in `.env`. The system automatically falls back to 
 ```bash
 cd trading-system/backend
 python -m pytest tests/ -p no:warnings -q
-# 153 passed
+# 226 passed
 ```
 
 ---
@@ -336,7 +349,7 @@ All configuration lives in `trading-system/.env`. Key variables:
 | Variable | Description | Default |
 |---|---|---|
 | `PAPER_TRADING` | `true` = simulate orders, no real trades | `true` |
-| `TOTAL_CAPITAL` | Capital allocated to the system (₹) | `1000000.0` |
+| `TOTAL_CAPITAL` | Capital allocated to the system (₹) | `100000.0` |
 | `MAX_OPEN_POSITIONS` | Maximum simultaneous open positions | `3` |
 | `MAX_TRADES_PER_DAY` | Hard daily trade count ceiling | `6` |
 | `DAILY_DRAWDOWN_LIMIT_PCT` | % loss that triggers a trading halt | `0.03` |
@@ -371,7 +384,7 @@ See **[PRODUCTION_SETUP.md](trading-system/PRODUCTION_SETUP.md)** for the comple
 
 ## Important Notes
 
-- **No daily re-authentication.** Groww TOTP tokens do not expire. Authenticate once with `POST /api/auth/groww/login` and the token persists in Redis until you explicitly log out.
+- **Automatic Groww authentication.** With `GROWW_CLIENT_ID` + `GROWW_TOTP_SECRET` in `.env`, the backend authenticates on startup and re-authenticates daily at 08:30 IST (Groww session tokens expire after ~a day), plus auto-reauth on mid-session token expiry. Manual `POST /api/auth/groww/login` is only a fallback.
 - **Long-only, NSE MIS (intraday).** The system does not hold overnight positions. All trades are squared off by 15:00 IST at the latest.
 - **Not a backtesting framework.** The system is built for live event-driven trading. For historical backtesting, use a separate tool (vectorbt, backtrader) and replay Groww historical OHLCV data through the same signal conditions.
 - **Start with `PAPER_TRADING=true`.** Run for at least 2 full trading weeks before enabling real orders.
