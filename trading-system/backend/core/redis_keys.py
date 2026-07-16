@@ -48,10 +48,27 @@ DECISION_FEED_KEY = "decision_feed"
 # re-fetches with the new watchlist before the 09:15 trading session starts.
 INSTRUMENT_MAP_KEY = "groww_instrument_map"
 
-# ── Anthropic API call counters (daily, auto-reset via TTL) ────────────────────
+# ── Anthropic API call counters (daily, per IST calendar day) ─────────────────
 # research = claude-sonnet calls (market brief generation, ~2/day)
 # decision = claude-haiku calls (trade decision engine, ~0–20/day in live mode)
-# TTL is set to 24 h on first increment so they reset automatically each day.
+# Keys are date-stamped in IST so each calendar day gets its own key and stale
+# counts from yesterday never bleed into today's display.
+# TTL is 48 h so keys survive across weekends and are eventually cleaned up.
+def anthropic_calls_research_key() -> str:
+    """Return today's IST-date-stamped Redis key for research (Sonnet) call count."""
+    from datetime import datetime
+    import pytz
+    return f"anthropic_calls:{datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d')}:research"
+
+
+def anthropic_calls_decision_key() -> str:
+    """Return today's IST-date-stamped Redis key for decision (Haiku) call count."""
+    from datetime import datetime
+    import pytz
+    return f"anthropic_calls:{datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d')}:decision"
+
+
+# Kept for any external tooling that reads these names — no longer written to.
 ANTHROPIC_CALLS_RESEARCH_KEY = "anthropic_calls:today:research"
 ANTHROPIC_CALLS_DECISION_KEY = "anthropic_calls:today:decision"
 

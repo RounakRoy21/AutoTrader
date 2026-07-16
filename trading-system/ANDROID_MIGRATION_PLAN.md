@@ -330,7 +330,7 @@ target → trailing SL → MIS 15:00 square-off; then daily drawdown halt; then 
 **Order placement sequence (`trading_agent.py`):** circuit-limit guard (quote `upper_circuit_limit`,
 skip if LTP ≥ 99.5% of upper) → place MARKET BUY → verify fill (retry ≤1.5 s) → recompute SL/target
 from fill (ATR-based, else fixed 1.0%/2.0%) → place GTT/SL exit (on failure: **HALT new trades** +
-Telegram) → compute partial target → persist Trade → increment counter (EXECUTE only) → publish event
+Telegram) → compute partial target → persist Trade → increment counter (EXECUTE and REDUCE both count) → publish event
 → Telegram entry alert.
 
 **Capital model:** total ₹10,00,000; buckets core 70% / hedge 20% / warchest 10%; max loss/trade 1.5%;

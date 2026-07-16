@@ -29,8 +29,8 @@ from core.redis_keys import (
     RISK_STATUS_KEY,
     RISK_DAILY_LOSS_KEY,
     RISK_DRAWDOWN_PCT_KEY,
-    ANTHROPIC_CALLS_RESEARCH_KEY,
-    ANTHROPIC_CALLS_DECISION_KEY,
+    anthropic_calls_research_key,
+    anthropic_calls_decision_key,
     DECISION_FEED_KEY,
     DATA_API_STATUS_KEY,
     DATA_API_DETAIL_KEY,
@@ -91,8 +91,8 @@ async def get_agent_status():
         RISK_STATUS_KEY,                # 10
         RISK_DAILY_LOSS_KEY,            # 11
         RISK_DRAWDOWN_PCT_KEY,          # 12
-        ANTHROPIC_CALLS_RESEARCH_KEY,   # 13
-        ANTHROPIC_CALLS_DECISION_KEY,   # 14
+        anthropic_calls_research_key(),   # 13
+        anthropic_calls_decision_key(),   # 14
         DATA_API_STATUS_KEY,            # 15
         DATA_API_DETAIL_KEY,            # 16
         SCANNER_FEED_CONNECTED_AT_KEY,  # 17

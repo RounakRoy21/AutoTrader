@@ -425,13 +425,14 @@ class TradingAgent:
             await set_value(f"trade_atr:{signal.stock}", str(round(signal.atr, 4)), ttl=86400)
 
         # Increment daily trade counter.
-        # Only EXECUTE decisions count toward max_trades_per_day.
-        # REDUCE decisions open a real (half-size) position but are already
-        # penalised by halved quantity; consuming a full trade slot on top of
-        # that would lock out future signals after e.g. 5 EXECUTEs + 1 REDUCE,
-        # even though daily exposure is well under the intended limit.
-        if decision.decision == Decision.EXECUTE:
-            await increment(TRADE_COUNT_KEY)
+        # Both EXECUTE and REDUCE decisions count toward max_trades_per_day.
+        # Rationale for counting REDUCE:
+        #  1. Consistency — _restore_trade_count queries the DB counting ALL trades,
+        #     so the counter semantics must match or the value drifts after a restart.
+        #  2. Safety — excluding REDUCE created a loophole where a day could exceed
+        #     the intended daily trade limit if all signals came back as REDUCE.
+        #  3. Accuracy — REDUCE opens a real position and consumes daily capacity.
+        await increment(TRADE_COUNT_KEY)
 
         # Publish trade event to Redis
         await publish("trade_events", {
