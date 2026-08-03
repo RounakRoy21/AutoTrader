@@ -151,10 +151,12 @@ DECISION_SYSTEM_PROMPT = (
     "  • OPENING (09:15–09:45): High noise, gap fills, and opening-range chasing are common. "
     "Reduce confidence_score by 10 for all signals before 09:45 — "
     "EMA and MACD confirmation are not yet available in this window.\n"
-    "  • DEAD ZONE (11:30–13:00): Low volume / rangebound. "
-    "Reduce confidence_score by 10; require volume_ratio ≥ 2.0× to override.\n"
-    "  • LATE WINDOW (after 14:30, <60 min to close): "
-    "Reduced time for target achievement. Reduce confidence_score by 10.\n"
+    "  • DEAD ZONE (11:30–13:00): Low volume / rangebound — historically the weakest phase "
+    "(profit factor ~0.6 in backtest). Reduce confidence_score by 25; only a signal that is "
+    "otherwise exceptional (volume_ratio ≥ 2.5× AND VWAP deviation in the 0.1%–0.5% sweet spot) "
+    "can still reach EXECUTE. Everything else must REDUCE or REJECT.\n"
+    "  • LATE WINDOW (after 14:30, <60 min to close): Reduced time for target achievement and "
+    "historically the weakest phase (profit factor ~0.55 in backtest). Reduce confidence_score by 25.\n"
     "  • LAST 30 MIN (after 15:00): Hard reject — insufficient time for MIS exit."
 )
 

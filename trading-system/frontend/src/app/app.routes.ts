@@ -28,6 +28,11 @@ export const routes: Routes = [
       import('./features/decision-feed/decision-feed.component').then(m => m.DecisionFeedComponent),
   },
   {
+    path: 'news-health',
+    loadComponent: () =>
+      import('./features/news-health/news-health.component').then(m => m.NewsHealthComponent),
+  },
+  {
     path: 'auth/groww',
     loadComponent: () =>
       import('./features/groww-auth/groww-auth-callback.component').then(m => m.GrowwAuthCallbackComponent),

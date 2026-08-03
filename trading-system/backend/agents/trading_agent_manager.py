@@ -38,7 +38,7 @@ from sqlalchemy import func, select
 
 from core.database import get_db_context
 from core.redis_client import publish, set_value
-from core.redis_keys import DAILY_TRADE_COUNT_KEY, HALT_KEY, TRADING_STATUS_KEY
+from core.redis_keys import DAILY_TRADE_COUNT_KEY, HALT_KEY, RISK_STATUS_KEY, TRADING_STATUS_KEY
 from core.nse_calendar import is_nse_holiday
 from models.trade import Trade
 
@@ -154,19 +154,23 @@ class TradingAgentManager:
           - 'manual'     — user pressed Stop Agent in the dashboard / called the API
         """
         if not self.is_running or self._agent is None:
-            # No live task — but Redis may still say ACTIVE from a previous crash/restart.
-            # Always force-clear Redis status on a manual stop so the dashboard resets.
+            # No live task — but Redis may still say ACTIVE from a previous crash or
+            # from a session that ended before stop() was called (e.g. scanner crash).
+            # Always force-clear both statuses so the dashboard reflects reality,
+            # regardless of whether this is a manual or scheduled stop.
             current = await _get_redis_trading_status()
-            if source == "manual" and current == "ACTIVE":
+            if current == "ACTIVE":
                 await set_value(TRADING_STATUS_KEY, "INACTIVE")
+                await set_value(RISK_STATUS_KEY, "INACTIVE")
+                msg = "Stale ACTIVE status cleared — trading session had already ended (backend may have restarted or scanner crashed)"
                 await publish("system_alerts", {
                     "type": "warning",
-                    "message": "Stale ACTIVE status cleared — trading agent was not running (backend may have restarted)",
+                    "message": msg,
                     "timestamp": _now_iso(),
                 })
-                logger.warning("[Manager] Cleared stale ACTIVE status from Redis (no live task)")
+                logger.warning("[Manager] Cleared stale ACTIVE status from Redis (no live task, source=%s)", source)
                 return "stale_cleared"
-            logger.info("[Manager] No active trading session — ignoring stop request")
+            logger.info("[Manager] No active trading session — ignoring stop request (source=%s)", source)
             return "not_running"
 
         await self._agent.stop()

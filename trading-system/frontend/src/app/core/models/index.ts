@@ -168,3 +168,21 @@ export interface SystemAlert {
   message: string;
   timestamp: string;
 }
+
+export interface NewsSourceHealth {
+  name: string;
+  type: 'rss' | 'google_news';
+  status: 'OK' | 'STALE' | 'DOWN';
+  items: number;
+  last_ok: string | null;
+  error: string | null;
+  checked_at: string;
+}
+
+export interface NewsHealth {
+  checked_at: string | null;
+  healthy_count: number;
+  total_count: number;
+  sources: NewsSourceHealth[];
+  checked: boolean;
+}

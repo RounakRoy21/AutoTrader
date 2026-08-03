@@ -703,6 +703,50 @@ def print_report(results: List[BacktestResult]) -> None:
             sym_pnl  = sum(r.pnl_pct for r in sym_res)
             print(f"  {sym:<12} signals={len(sym_res)}  wins={sym_wins}  win%={sym_wr:.1f}  sum_pnl={sym_pnl:+.3f}%")
 
+    # ── Session-phase breakdown ───────────────────────────────────────────────
+    # Groups signals by the NSE intraday session phase in which they fired so we
+    # can see how win rate degrades through the day, independent of when the live
+    # system happened to be running.  This is the unbiased view the live P&L can't
+    # give us when the containers are only started after mid-day.
+    def _phase(signal_time: str) -> str:
+        hh, mm = (int(x) for x in signal_time.split(":"))
+        minutes = hh * 60 + mm
+        if minutes < 11 * 60 + 30:      # 09:15–11:29
+            return "EARLY (09:15-11:30)"
+        if minutes < 13 * 60:           # 11:30–12:59
+            return "DEAD ZONE (11:30-13:00)"
+        if minutes < 14 * 60 + 30:      # 13:00–14:29
+            return "RECOVERY (13:00-14:30)"
+        return "LATE (14:30-15:30)"
+
+    _phase_order = [
+        "EARLY (09:15-11:30)",
+        "DEAD ZONE (11:30-13:00)",
+        "RECOVERY (13:00-14:30)",
+        "LATE (14:30-15:30)",
+    ]
+    print(f"\n{'Per-session-phase':─<60}")
+    print(f"  {'Phase':<24} {'Sigs':>5} {'Win%':>7} {'DecWin%':>8} {'SumPnL%':>9} {'PF':>6}")
+    for phase in _phase_order:
+        ph_res = [r for r in results if _phase(r.signal_time) == phase]
+        if not ph_res:
+            continue
+        ph_total   = len(ph_res)
+        ph_wins    = sum(1 for r in ph_res if r.outcome == "WIN")
+        ph_decided = [r for r in ph_res if r.outcome in ("WIN", "LOSS")]
+        ph_dec_wr  = (sum(1 for r in ph_decided if r.outcome == "WIN") / len(ph_decided) * 100) if ph_decided else 0.0
+        ph_wr      = ph_wins / ph_total * 100
+        ph_pnl     = sum(r.pnl_pct for r in ph_res)
+        ph_gw      = sum(r.pnl_pct for r in ph_res if r.outcome == "WIN")
+        ph_gl      = abs(sum(r.pnl_pct for r in ph_res if r.outcome == "LOSS"))
+        ph_pf      = ph_gw / ph_gl if ph_gl > 0 else float("inf")
+        ph_pf_str  = f"{ph_pf:.2f}" if ph_pf != float("inf") else "∞"
+        print(
+            f"  {phase:<24} {ph_total:>5} {ph_wr:>6.1f}% {ph_dec_wr:>7.1f}% "
+            f"{ph_pnl:>+8.2f}% {ph_pf_str:>6}"
+        )
+
+
 
 # ── Main orchestration ────────────────────────────────────────────────────────
 

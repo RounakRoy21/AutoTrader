@@ -41,6 +41,7 @@ from core.redis_keys import (
     NIFTY50_CONSTITUENTS_KEY,
     NIFTY50_DRIFT_KEY,
     NIFTY50_LAST_CHECK_KEY,
+    NEWS_HEALTH_KEY,
 )
 from core.nse_calendar import get_market_status
 from agents.trading_agent_manager import get_trading_agent_manager
@@ -362,6 +363,56 @@ async def run_nifty50_check():
         return _envelope(bool(report.get("available")), report)
     except Exception as exc:
         logger.error("Manual NIFTY 50 check failed: %s", exc)
+        return _envelope(False, error=str(exc))
+
+
+@router.get("/api/news/health")
+async def get_news_health():
+    """Return the latest per-source news-aggregator health snapshot.
+
+    Surfaces which RSS feeds and Google-News queries are currently returning
+    fresh items (OK), reachable but empty (STALE), or failing (DOWN) — so a
+    silently-broken feed URL is visible before news quality degrades.  Reads the
+    persisted snapshot without making a network call; use
+    POST /api/news/health/check to force a fresh probe.
+    """
+    import json as _json
+    try:
+        r = await get_redis()
+        raw = await r.get(NEWS_HEALTH_KEY)
+    except Exception as exc:
+        return _envelope(False, error=str(exc))
+
+    if not raw:
+        return _envelope(True, {
+            "checked_at": None,
+            "healthy_count": 0,
+            "total_count": 0,
+            "sources": [],
+            "checked": False,
+        })
+    try:
+        snapshot = _json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        snapshot["checked"] = True
+        return _envelope(True, snapshot)
+    except Exception as exc:
+        return _envelope(False, error=str(exc))
+
+
+@router.post("/api/news/health/check", dependencies=[Depends(_require_api_key)])
+async def run_news_health_check():
+    """Probe all news sources on demand and return a fresh health snapshot.
+
+    Lets the operator verify feed health immediately (e.g. after fixing a broken
+    RSS URL) instead of waiting for the 6:00 AM Research Agent startup probe.
+    """
+    from integrations.news_aggregator import HybridNewsAggregator
+    try:
+        snapshot = await HybridNewsAggregator().check_feed_health()
+        snapshot["checked"] = True
+        return _envelope(True, snapshot)
+    except Exception as exc:
+        logger.error("Manual news health check failed: %s", exc)
         return _envelope(False, error=str(exc))
 
 

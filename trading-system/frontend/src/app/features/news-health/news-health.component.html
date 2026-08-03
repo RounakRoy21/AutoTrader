@@ -1,0 +1,73 @@
+<mat-card class="news-health-card">
+  <mat-card-header>
+    <mat-card-title>News Aggregator Health</mat-card-title>
+    <span class="header-spacer"></span>
+    <button mat-stroked-button color="primary"
+            [disabled]="rechecking"
+            matTooltip="Probe every source live now"
+            (click)="recheck()">
+      <mat-icon>{{ rechecking ? 'hourglass_empty' : 'refresh' }}</mat-icon>
+      {{ rechecking ? 'Checking…' : 'Re-check now' }}
+    </button>
+  </mat-card-header>
+
+  <mat-progress-bar *ngIf="loading || rechecking" mode="query"></mat-progress-bar>
+
+  <mat-card-content>
+    <!-- Summary banner -->
+    <div class="summary" *ngIf="health && health.checked">
+      <div class="summary-count" [class.all-ok]="!hasProblems" [class.has-problems]="hasProblems">
+        <mat-icon>{{ hasProblems ? 'report_problem' : 'verified' }}</mat-icon>
+        <span class="count-text">
+          {{ health.healthy_count }} / {{ health.total_count }} sources healthy
+        </span>
+      </div>
+      <div class="checked-at" *ngIf="health.checked_at">
+        Last checked: {{ health.checked_at | date:'medium' }}
+      </div>
+    </div>
+
+    <!-- Never run yet -->
+    <div class="empty-msg" *ngIf="health && !health.checked && !loading">
+      <mat-icon>info</mat-icon>
+      <p>No health snapshot yet. The first probe runs at 06:00 IST, or click
+         <strong>Re-check now</strong> to run one immediately.</p>
+    </div>
+
+    <!-- Source table -->
+    <div class="table-scroll" *ngIf="health && health.checked && health.sources.length">
+      <table class="source-table full-width">
+        <thead>
+          <tr>
+            <th>Source</th>
+            <th>Type</th>
+            <th>Status</th>
+            <th class="num">Items</th>
+            <th>Detail</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr *ngFor="let s of sortedSources" [class]="statusClass(s.status)">
+            <td class="src-name">{{ s.name }}</td>
+            <td>
+              <span class="type-chip">{{ s.type === 'rss' ? 'RSS' : 'Google News' }}</span>
+            </td>
+            <td>
+              <span class="status-badge" [class]="statusClass(s.status)">
+                <mat-icon>{{ statusIcon(s.status) }}</mat-icon>
+                {{ s.status }}
+              </span>
+            </td>
+            <td class="num">{{ s.items }}</td>
+            <td class="detail">
+              <span *ngIf="s.status === 'OK'" class="muted">Fresh items received</span>
+              <span *ngIf="s.status !== 'OK'" class="err-text" [matTooltip]="s.error || ''">
+                {{ s.error }}
+              </span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </mat-card-content>
+</mat-card>

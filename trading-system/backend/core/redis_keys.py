@@ -37,6 +37,15 @@ LATEST_MARKET_BRIEF_KEY = "latest_market_brief"
 # to exactly the stocks the agent flagged.  TTL = 24 h (one trading day).
 TODAY_WATCHLIST_KEY = "today_watchlist"
 
+# ── News aggregator health ────────────────────────────────────────────────────
+# Per-source health snapshot written by HybridNewsAggregator.check_feed_health()
+# (6 AM probe + on-demand refresh).  JSON blob with each RSS/Google-News source's
+# status (OK / DOWN / STALE), fresh-item count, last-OK timestamp and last error.
+# Read by GET /api/news/health so the operator can see at a glance which sources
+# are healthy and catch a silently-broken RSS URL before news quality degrades.
+# No TTL — the snapshot persists across restarts and is overwritten each check.
+NEWS_HEALTH_KEY = "news:health"
+
 # ── Decision feed ─────────────────────────────────────────────────────────────
 # Rolling list of the last 100 decision engine events (pre-check rejections +
 # LLM decisions).  Stored as a Redis list (LPUSH / LTRIM); each entry is JSON.

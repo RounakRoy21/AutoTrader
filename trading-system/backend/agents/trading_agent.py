@@ -504,30 +504,37 @@ class TradingAgent:
         scanner_task = asyncio.create_task(self._scanner.start(), name="scanner")
         decision_task = asyncio.create_task(self._process_decisions(), name="decision_processor")
 
-        done, pending = await asyncio.wait(
-            [scanner_task, decision_task],
-            return_when=asyncio.FIRST_EXCEPTION,
-        )
+        try:
+            done, pending = await asyncio.wait(
+                [scanner_task, decision_task],
+                return_when=asyncio.FIRST_EXCEPTION,
+            )
 
-        # If one finished with an exception, cancel the other and surface the error
-        for task in done:
-            exc = task.exception()
-            if exc is not None:
-                logger.critical(
-                    "Component '%s' crashed: %s — stopping Trading Agent",
-                    task.get_name(), exc,
-                )
-                await publish("system_alerts", {
-                    "type": "critical",
-                    "message": f"Component {task.get_name()} crashed: {exc}",
-                    "timestamp": datetime.now(IST).isoformat(),
-                })
-        for task in pending:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            # If one finished with an exception, cancel the other and surface the error
+            for task in done:
+                exc = task.exception()
+                if exc is not None:
+                    logger.critical(
+                        "Component '%s' crashed: %s — stopping Trading Agent",
+                        task.get_name(), exc,
+                    )
+                    await publish("system_alerts", {
+                        "type": "critical",
+                        "message": f"Component {task.get_name()} crashed: {exc}",
+                        "timestamp": datetime.now(IST).isoformat(),
+                    })
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        finally:
+            # Guarantee the Risk Manager thread is always stopped when start() exits,
+            # whether due to a normal 15:30 stop(), scanner crash, or cancellation.
+            # RiskManager.stop() is idempotent — safe to call even if already stopped.
+            self._risk_manager.stop()
+            logger.info("Risk Manager stopped in start() finally block")
 
     async def stop(self) -> None:
         """Stop all sub-modules."""

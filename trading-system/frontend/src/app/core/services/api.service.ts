@@ -16,6 +16,7 @@ import {
   HealthCheck,
   GrowwAuthStatus,
   LtpMap,
+  NewsHealth,
 } from '../models';
 
 @Injectable({ providedIn: 'root' })
@@ -107,6 +108,20 @@ export class ApiService {
   healthCheck(): Observable<HealthCheck> {
     return this.http
       .get<ApiResponse<HealthCheck>>(`${this.baseUrl}/health`)
+      .pipe(map((r) => r.data));
+  }
+
+  // ── News aggregator health ────────────────────
+
+  getNewsHealth(): Observable<NewsHealth> {
+    return this.http
+      .get<ApiResponse<NewsHealth>>(`${this.baseUrl}/news/health`)
+      .pipe(map((r) => r.data));
+  }
+
+  runNewsHealthCheck(): Observable<NewsHealth> {
+    return this.http
+      .post<ApiResponse<NewsHealth>>(`${this.baseUrl}/news/health/check`, {})
       .pipe(map((r) => r.data));
   }
 

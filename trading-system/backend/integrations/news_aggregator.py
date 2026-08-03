@@ -395,35 +395,96 @@ class HybridNewsAggregator:
         )
         return deduped[:_OUTPUT_CAP]
 
-    async def check_feed_health(self) -> None:
-        """Verify each RSS feed is reachable and returning fresh entries.
+    async def check_feed_health(self) -> dict:
+        """Probe every news source and persist a per-source health snapshot.
 
-        Called once at Research Agent startup (6:00 AM IST), not on every
-        collection run.  A feed being down is logged and published to
-        system_alerts so the dashboard operator can investigate, but it
-        does NOT halt the system — the other sources continue normally.
+        Called once at Research Agent startup (6:00 AM IST) and on demand via
+        POST /api/news/health/check.  Each RSS feed, the broad Google-News query,
+        and a representative per-stock Google-News query are probed concurrently
+        so this completes in ~one round-trip time (≤ _FETCH_TIMEOUT seconds).
 
-        All feeds are checked concurrently so this completes in one
-        round-trip time (≤ _FETCH_TIMEOUT seconds) rather than
-        N × _FETCH_TIMEOUT seconds.
+        A source returning 0 fresh entries or raising is marked DOWN/STALE and a
+        system_alert is published, but the check never halts the system — the
+        remaining sources continue normally.  The full snapshot is written to
+        Redis (NEWS_HEALTH_KEY) so GET /api/news/health can surface which sources
+        are healthy and the operator can fix a silently-broken RSS URL before news
+        quality degrades.
+
+        Returns the snapshot dict (also persisted) so callers can use it directly.
         """
-        now_ts = datetime.now(IST).isoformat()
+        from core.redis_client import set_value
+        from core.redis_keys import NEWS_HEALTH_KEY
+
+        now_ist = datetime.now(IST)
+        now_ts = now_ist.isoformat()
+
+        # ── Build the probe set: RSS feeds + Google-News broad + one sample stock ──
         feed_names = list(self.FEEDS.keys())
-        feed_urls  = list(self.FEEDS.values())
+        feed_urls = list(self.FEEDS.values())
+
+        _sample_symbol = "RELIANCE"
+        _sample_term = self._STOCK_SEARCH_TERMS.get(_sample_symbol, f"{_sample_symbol} NSE")
+        _broad_query = "NSE NIFTY RBI SEBI India stock market"
+
+        # Descriptor tuples: (name, type, coroutine)
+        probes: list[tuple[str, str, Any]] = [
+            (name, "rss", self._fetch_rss_feed(name, url))
+            for name, url in zip(feed_names, feed_urls)
+        ]
+        probes.append((
+            "google_news_broad", "google_news",
+            self._fetch_google_news(_broad_query, None, _MAX_BROAD_QUERY),
+        ))
+        probes.append((
+            f"google_news_stock ({_sample_symbol})", "google_news",
+            self._fetch_google_news(_sample_term, _sample_symbol, _MAX_PER_STOCK_QUERY),
+        ))
 
         results = await asyncio.gather(
-            *[self._fetch_rss_feed(name, url) for name, url in zip(feed_names, feed_urls)],
+            *[coro for (_n, _t, coro) in probes],
             return_exceptions=True,
         )
 
-        for source_name, result in zip(feed_names, results):
+        sources: list[dict] = []
+        healthy = 0
+        for (name, source_type, _coro), result in zip(probes, results):
+            record: dict[str, Any] = {
+                "name": name,
+                "type": source_type,
+                "checked_at": now_ts,
+            }
             if isinstance(result, Exception):
-                msg = f"News feed '{source_name}' health check failed: {result}"
+                record.update(status="DOWN", items=0, last_ok=None, error=str(result))
+                msg = f"News feed '{name}' health check failed: {result}"
                 logger.warning(msg)
                 await publish("system_alerts", {"type": "warning", "message": msg, "timestamp": now_ts})
             elif isinstance(result, list) and result:
-                logger.info("Feed health OK: %s (%d items)", source_name, len(result))
+                record.update(status="OK", items=len(result), last_ok=now_ts, error=None)
+                healthy += 1
+                logger.info("Feed health OK: %s (%d items)", name, len(result))
             else:
-                msg = f"News feed '{source_name}' returned 0 fresh entries — may be down or stale"
+                # Reachable but returned 0 fresh entries — URL may have changed or feed is stale.
+                record.update(
+                    status="STALE", items=0, last_ok=None,
+                    error="Reachable but 0 fresh entries — URL may have changed or feed is stale",
+                )
+                msg = f"News feed '{name}' returned 0 fresh entries — may be down or stale"
                 logger.warning(msg)
                 await publish("system_alerts", {"type": "warning", "message": msg, "timestamp": now_ts})
+            sources.append(record)
+
+        snapshot = {
+            "checked_at": now_ts,
+            "healthy_count": healthy,
+            "total_count": len(sources),
+            "sources": sources,
+        }
+
+        # Best-effort persist — a Redis hiccup must never break the 6 AM run.
+        try:
+            import json as _json
+            await set_value(NEWS_HEALTH_KEY, _json.dumps(snapshot))
+        except Exception as exc:
+            logger.warning("Could not persist news health snapshot to Redis: %s", exc)
+
+        return snapshot
