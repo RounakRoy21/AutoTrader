@@ -8,14 +8,16 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Security
-from fastapi.security import APIKeyHeader
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from core.config import get_settings
 from core.database import check_db_health, get_db_context
-from core.redis_client import check_redis_health, get_redis, get_value, set_value
+from core.redis_client import check_redis_health, get_redis, get_value
+from core.risk_state import clear_halt, set_halt_strict
+from core.security import require_api_key
 from core.redis_keys import (
-    HALT_KEY,
+    halt_key,
+    halt_reason_key,
     GROWW_TOKEN_KEY,
     RESEARCH_STATUS_KEY,
     TRADING_STATUS_KEY,
@@ -34,7 +36,6 @@ from core.redis_keys import (
     DECISION_FEED_KEY,
     DATA_API_STATUS_KEY,
     DATA_API_DETAIL_KEY,
-    DATA_API_LAST_OK_KEY,
     SCANNER_FEED_CONNECTED_AT_KEY,
     SCANNER_NIFTY_FILTER_KEY,
     LATEST_MARKET_BRIEF_KEY,
@@ -50,20 +51,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["System"])
 
 # ── API Key authentication ─────────────────────────────────────────────────────
-_api_key_header = APIKeyHeader(name="X-Api-Key", auto_error=False)
-
-
-async def _require_api_key(api_key: str = Security(_api_key_header)) -> None:
-    """Dependency that enforces the admin API key on trading-control endpoints.
-
-    When ADMIN_API_KEY is empty (dev / paper-trading mode), the check is skipped.
-    In production, every caller must supply the matching key in the X-Api-Key header.
-    """
-    expected = get_settings().admin_api_key
-    if not expected:
-        return  # No key configured — open access (development only)
-    if api_key != expected:
-        raise HTTPException(status_code=403, detail="Invalid or missing X-Api-Key")
+# Shared constant-time dependency (core/security.py, audit R1).  Every POST in
+# this router depends on it; GET dashboard routes are read-only and stay open
+# (reachable only via localhost / nginx in the supported deployments).
+_require_api_key = require_api_key
 
 
 def _envelope(success: bool, data=None, error=None):
@@ -81,7 +72,7 @@ async def get_agent_status():
     keys = [
         RESEARCH_STATUS_KEY,            # 0
         TRADING_STATUS_KEY,             # 1
-        HALT_KEY,                       # 2
+        halt_key(),                     # 2 (date-scoped, audit R7)
         RESEARCH_STEP_KEY,              # 3
         RESEARCH_LAST_BIAS_KEY,         # 4
         RESEARCH_LAST_CONFIDENCE_KEY,   # 5
@@ -99,12 +90,14 @@ async def get_agent_status():
         SCANNER_FEED_CONNECTED_AT_KEY,  # 17
         LATEST_MARKET_BRIEF_KEY,        # 18
         SCANNER_NIFTY_FILTER_KEY,       # 19
+        halt_reason_key(),              # 20
     ]
     try:
         r = await get_redis()
         values = await asyncio.gather(*[r.get(k) for k in keys])
     except Exception:
         values = [None] * len(keys)
+        values[2] = "TRUE"  # risk state unreadable → report halted (fail closed, C8)
 
     import json as _json
     settings = get_settings()
@@ -205,6 +198,7 @@ async def get_agent_status():
         "trading_agent": {
             "status": values[1] or "INACTIVE",
             "trading_halted": (values[2] or "FALSE") == "TRUE",
+            "halt_reason": values[20],
             "daily_trade_count": int(values[7]) if values[7] else 0,
             "last_signal_stock": values[8],
             "last_signal_time": values[9],
@@ -256,17 +250,35 @@ async def get_agent_status():
 
 @router.post("/api/trading/halt", dependencies=[Depends(_require_api_key)])
 async def halt_trading():
-    """Manually set the HALT flag — stops all new trade entries."""
-    await set_value(HALT_KEY, "TRUE")
+    """Manually set the HALT flag — stops all new trade entries.
+
+    The flag is written and read back; if it cannot be confirmed the endpoint
+    returns 503 instead of reporting a halt that did not persist.
+    """
+    try:
+        await set_halt_strict("manual halt via API")
+    except Exception as exc:
+        logger.critical("Manual HALT could NOT be persisted: %s", exc)
+        raise HTTPException(
+            status_code=503, detail=f"Halt NOT confirmed (Redis): {exc} — retry immediately",
+        ) from exc
     logger.warning("Trading manually halted via API")
     return _envelope(True, {"trading_halted": True})
 
 
 @router.post("/api/trading/resume", dependencies=[Depends(_require_api_key)])
 async def resume_trading():
-    """Clear the HALT flag — allows trading to resume."""
-    await set_value(HALT_KEY, "FALSE")
-    logger.info("Trading resumed via API")
+    """Clear today's HALT flag — allows trading to resume.
+
+    This explicit (API-key-protected) call is the ONLY way to clear a manual,
+    broker-stop-failure, unknown-order or circuit-breaker halt; restarts and
+    session starts never clear it (audit R7 / C8).
+    """
+    try:
+        await clear_halt()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Could not clear halt (Redis): {exc}") from exc
+    logger.warning("Trading resumed via API")
     return _envelope(True, {"trading_halted": False})
 
 

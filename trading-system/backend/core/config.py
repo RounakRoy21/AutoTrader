@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     paper_trading: bool = True
     paper_risk_use_broker_ltp: bool = True
+    # RiskManager LTP sanity (audit R2): a broker LTP more than this fraction
+    # away from the latest WebSocket tick is treated as implausible and skipped.
+    risk_ltp_sanity_band_pct: float = 0.05
+    # Alert (Telegram + log) after this many consecutive unusable LTPs for a position.
+    risk_ltp_miss_alert_threshold: int = 3
+    # Periodic broker ⇄ DB reconciliation cadence in seconds (audit C7; 30-60 s).
+    reconcile_interval_s: float = 45.0
 
     # ── PostgreSQL ─────────────────────────────────
     postgres_host: str = "postgres"
@@ -40,6 +47,9 @@ class Settings(BaseSettings):
     # ── Redis ──────────────────────────────────────
     redis_host: str = "redis"
     redis_port: int = 6379
+    # Optional Redis AUTH password (matches `requirepass` set from REDIS_PASSWORD in
+    # docker-compose.yml).  Used when REDIS_URL carries no password of its own,
+    # so REDIS_URL can stay redis://redis:6379/0.  Empty = no auth (dev default).
     redis_password: str = ""
     redis_url: str = "redis://redis:6379/0"
 
@@ -61,10 +71,14 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     # ── API Security ──────────────────────────
-    # Required in production: set ADMIN_API_KEY in .env to a strong random secret.
-    # All trading-control endpoints (halt, resume, start, stop) require the caller
-    # to supply this value in the X-Api-Key request header when non-empty.
-    # An empty string disables the check (development / paper-trading only).
+    # Required in live mode: set ADMIN_API_KEY in .env to a strong random secret
+    # (python -c "import secrets; print(secrets.token_urlsafe(32))").
+    # Every mutating route (trade close, broker login/logout, market-brief run,
+    # halt/resume, trading start/stop, on-demand checks) requires it in the
+    # X-Api-Key header, and /ws/live requires it as the first message
+    # (core/security.py).  Read-only GET routes stay open.
+    # An empty string disables the check — paper trading only: the backend
+    # refuses to start with PAPER_TRADING=false and an empty/placeholder key.
     admin_api_key: str = ""
     # ── CORS ──────────────────────────────────────
     cors_origins: str = "http://localhost:4200,http://localhost:4201"

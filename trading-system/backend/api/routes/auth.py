@@ -17,12 +17,13 @@ import asyncio
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from core.config import get_settings
 from core.redis_client import delete_value, get_value, set_value
 from core.redis_keys import GROWW_TOKEN_KEY
+from core.security import redact_secrets, require_api_key
 from integrations.groww_client import get_groww_client
 
 logger = logging.getLogger(__name__)
@@ -55,7 +56,8 @@ async def groww_token_status():
     }
 
 
-@router.post("/groww/login")
+# Mints a TOTP from the server secret — admin API key required (audit R1).
+@router.post("/groww/login", dependencies=[Depends(require_api_key)])
 async def groww_login(body: LoginRequest):
     """
     Perform TOTP-based Groww login and store the session token in Redis.
@@ -90,7 +92,9 @@ async def groww_login(body: LoginRequest):
             import pyotp
             totp_code = pyotp.TOTP(settings.groww_totp_secret).now()
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"TOTP generation failed: {exc}")
+            raise HTTPException(
+                status_code=500, detail=f"TOTP generation failed: {redact_secrets(exc)}"
+            )
 
     try:
         from growwapi import GrowwAPI
@@ -117,11 +121,14 @@ async def groww_login(body: LoginRequest):
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error("Groww login failed: %s", exc)
-        raise HTTPException(status_code=500, detail=f"Groww login failed: {exc}")
+        # Never echo the TOTP / client id / token back in logs or the response.
+        safe = redact_secrets(exc, extra=(client_id, totp_code, body.password))
+        logger.error("Groww login failed: %s", safe)
+        raise HTTPException(status_code=500, detail=f"Groww login failed: {safe}")
 
 
-@router.post("/groww/logout")
+# Kills the broker session mid-day — admin API key required (audit R1).
+@router.post("/groww/logout", dependencies=[Depends(require_api_key)])
 async def groww_logout():
     """Remove the Groww session token from Redis and invalidate the in-memory cache."""
     await delete_value(GROWW_TOKEN_KEY)

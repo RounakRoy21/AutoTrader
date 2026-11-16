@@ -18,7 +18,7 @@ import logging
 import time
 from datetime import datetime
 from collections import deque
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -35,6 +35,8 @@ from integrations.instrument_service import get_instrument_map, get_symbol, NIFT
 from integrations.ltp_store import set_ltp
 from integrations.mock_tick_generator import MockTickGenerator
 from schemas.trade import ScannerSignal
+
+from . import signal_rules
 
 logger = logging.getLogger(__name__)
 
@@ -396,14 +398,11 @@ class Scanner:
     are met: Price > VWAP, RSI between 45-65, Volume > 1.5x average.
     """
 
-    # How long to suppress repeat signals for the same stock (seconds)
-    SIGNAL_COOLDOWN_SECS = 1800  # 30 minutes
-    # Hard cutoff — no new signals after this time (HH, MM)
-    SIGNAL_CUTOFF = (15, 15)    # 3:15 PM IST
-    # Minimum ticks before indicators are statistically meaningful
-    MIN_TICKS_FOR_SIGNAL = 50
-    # Minimum completed 1-minute candles for candle-based indicators
-    MIN_CANDLES_FOR_INDICATORS = 15
+    # Gate constants live in agents.signal_rules (shared with the backtest).
+    SIGNAL_COOLDOWN_SECS = signal_rules.SIGNAL_COOLDOWN_SECS
+    SIGNAL_CUTOFF = signal_rules.SIGNAL_CUTOFF
+    MIN_TICKS_FOR_SIGNAL = signal_rules.MIN_TICKS_FOR_SIGNAL
+    MIN_CANDLES_FOR_INDICATORS = signal_rules.MIN_CANDLES_FOR_INDICATORS
 
     def __init__(self, signal_queue: asyncio.Queue) -> None:
         self._settings = get_settings()
@@ -447,27 +446,27 @@ class Scanner:
         The cap clamps qty so that qty × ltp ≤ total_capital / max_open_positions,
         keeping every position within its designated capital envelope.
         """
-        settings = self._settings
-        max_loss = settings.total_capital * settings.max_loss_per_trade_pct
-        # SH3: require ≥45 completed 1m candles before trusting the intraday ATR
-        if atr > 0 and n_candles >= 45:
-            sl_distance = atr * settings.atr_sl_multiplier
-        else:
-            sl_distance = ltp * settings.stop_loss_pct
-        if sl_distance <= 0:
-            return 0
+        return signal_rules.size_position(ltp, atr, n_candles, self._settings)
 
-        qty_from_risk = max(1, int(max_loss / sl_distance))
-
-        # A1: Hard capital cap — each position must fit within its capital envelope.
-        # Without this, the risk formula produces notional values far exceeding
-        # available capital, resulting in Groww margin rejections and silent order loss.
-        if ltp > 0 and settings.max_open_positions > 0:
-            max_notional_per_position = settings.total_capital / settings.max_open_positions
-            qty_from_capital = max(1, int(max_notional_per_position / ltp))
-            return min(qty_from_risk, qty_from_capital)
-
-        return qty_from_risk
+    def _update_nifty_filter_flag(self, ev: "signal_rules.EntryEvaluation") -> None:
+        """Log + mirror to Redis the NIFTY trend filter's ACTIVE / CLEARED
+        transitions (dashboard visibility).  Never blocks the signal path."""
+        if ev.nifty_suppressed is None or ev.nifty_suppressed == self._nifty_filter_active:
+            return
+        self._nifty_filter_active = ev.nifty_suppressed
+        logger.info(
+            "[Scanner] NIFTY trend filter %s (drift=%.2f%%, bias=%s, NIFTY open=%.2f ltp=%.2f)",
+            "ACTIVE — all long signals suppressed" if ev.nifty_suppressed else "CLEARED — signals resuming",
+            (ev.nifty_drift or 0.0) * 100, self._market_bias, self._nifty_open_price, self._nifty_ltp,
+        )
+        try:
+            from core.redis_client import set_value as _sv
+            from core.redis_keys import SCANNER_NIFTY_FILTER_KEY as _NK
+            flag = "TRUE" if ev.nifty_suppressed else "FALSE"
+            loop = self._loop or asyncio.get_event_loop()
+            loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_sv(_NK, flag, ttl=86400)))
+        except Exception:
+            pass  # non-critical
 
     def _check_signal(self, store: TickDataStore) -> Optional[ScannerSignal]:
         """Check if all entry conditions are met for a given stock.
@@ -494,34 +493,10 @@ class Scanner:
         """
         now_ist = datetime.now(IST)
 
-        # Hard market-hours cutoff: no new signals after 3:15 PM IST
-        cutoff_h, cutoff_m = self.SIGNAL_CUTOFF
-        if (now_ist.hour, now_ist.minute) >= (cutoff_h, cutoff_m):
+        # Clock / warm-up / cooldown gates (shared with the backtest).
+        if signal_rules.pre_gate(store, now_ist, self._signal_cooldown.get(store.symbol)):
             return None
-
-        # SM5: On Fridays, stop generating signals after 14:00 IST so the
-        # DecisionEngine never even calls the LLM on soon-to-expire positions.
-        # (The DecisionEngine also rejects Friday-14:00 signals, but filtering
-        # here prevents wasteful queue entries and LLM call avoidance work.)
-        if now_ist.weekday() == 4 and now_ist.hour >= 14:
-            return None
-
-        # Require minimum data points for statistically meaningful indicators
-        if len(store.ticks) < self.MIN_TICKS_FOR_SIGNAL:
-            return None
-
-        # Require minimum completed 1m candles for candle-based indicators.
-        candles_1m_df = store._candles_1m.completed_df
-        n_candles = len(candles_1m_df) if candles_1m_df is not None else 0
-        if n_candles < self.MIN_CANDLES_FOR_INDICATORS:
-            return None
-
-        # Per-symbol cooldown: suppress repeats within SIGNAL_COOLDOWN_SECS
-        last_fired = self._signal_cooldown.get(store.symbol)
-        if last_fired is not None:
-            elapsed = (now_ist - last_fired).total_seconds()
-            if elapsed < self.SIGNAL_COOLDOWN_SECS:
-                return None
+        n_candles = signal_rules.completed_candles(store)
 
         # ── BN1: OHLCV freshness gate ────────────────────────────────────────────
         # When GrowwFeed is active (credentials present), skip signal generation
@@ -539,184 +514,24 @@ class Scanner:
                 )
                 return None
         _t4_start = time.perf_counter_ns()
-        ltp = store.ltp
-        vwap = store.compute_vwap()
-        rsi = store.compute_rsi()
-        vol_ratio = store.compute_volume_ratio()
-
-
-        # A2: Intraday NIFTY 50 macro trend filter.
-        # Suppress all long signals when NIFTY has drifted below the configured
-        # threshold from its session open.  An individual stock can satisfy all
-        # technical conditions while NIFTY is in a broad intraday downtrend — the
-        # stock-level indicators cannot see this because VWAP and RSI both reset
-        # at the session open and carry no information about index direction.
-        # In paper mode or when NIFTY data hasn't arrived yet, skip the check
-        # (open=0 means no tick received) to avoid blocking all signals at startup.
-        #
-        # Bias modulation: on bullish days widen the threshold so the filter only
-        # triggers on genuinely severe index drops; on bearish days tighten it so
-        # even a mild drift suppresses long entries.
-        #   BULLISH: -0.8%   NEUTRAL: -0.5%   BEARISH: -0.3%
-        _nifty_thresh = {
-            "BULLISH": -0.008,
-            "NEUTRAL": self._settings.nifty_trend_filter_pct,   # -0.005 from config
-            "BEARISH": -0.003,
-        }.get(self._market_bias, self._settings.nifty_trend_filter_pct)
-        if self._nifty_open_price > 0 and self._nifty_ltp > 0:
-            nifty_drift = (self._nifty_ltp - self._nifty_open_price) / self._nifty_open_price
-            if nifty_drift < _nifty_thresh:
-                logger.debug(
-                    "[Scanner] %s REJECT NIFTY-TREND drift=%.3f%% < threshold=%.3f%% (%s bias) — suppressing long signals",
-                    store.symbol, nifty_drift * 100, _nifty_thresh * 100, self._market_bias,
-                )
-                # On first transition into suppressed state: log INFO + write Redis key.
-                if not self._nifty_filter_active:
-                    self._nifty_filter_active = True
-                    logger.info(
-                        "[Scanner] NIFTY trend filter ACTIVE — all long signals suppressed "
-                        "(drift=%.2f%%, threshold=%.1f%%, bias=%s, NIFTY open=%.2f ltp=%.2f)",
-                        nifty_drift * 100, _nifty_thresh * 100, self._market_bias,
-                        self._nifty_open_price, self._nifty_ltp,
-                    )
-                    try:
-                        from core.redis_client import set_value as _sv
-                        from core.redis_keys import SCANNER_NIFTY_FILTER_KEY as _NK
-                        import asyncio as _asyncio
-                        loop = self._loop or _asyncio.get_event_loop()
-                        loop.call_soon_threadsafe(
-                            lambda: _asyncio.ensure_future(_sv(_NK, "TRUE", ttl=86400))
-                        )
-                    except Exception:
-                        pass  # non-critical — never block signal path
-                return None
-            # NIFTY recovered: clear the filter flag on transition.
-            if self._nifty_filter_active:
-                self._nifty_filter_active = False
-                logger.info(
-                    "[Scanner] NIFTY trend filter CLEARED — signals resuming "
-                    "(drift=%.2f%%, threshold=%.1f%%, bias=%s)",
-                    nifty_drift * 100, _nifty_thresh * 100, self._market_bias,
-                )
-                try:
-                    from core.redis_client import set_value as _sv
-                    from core.redis_keys import SCANNER_NIFTY_FILTER_KEY as _NK
-                    import asyncio as _asyncio
-                    loop = self._loop or _asyncio.get_event_loop()
-                    loop.call_soon_threadsafe(
-                        lambda: _asyncio.ensure_future(_sv(_NK, "FALSE", ttl=86400))
-                    )
-                except Exception:
-                    pass  # non-critical
-
-        # Condition 1: Price > VWAP
-        if ltp <= vwap:
-            logger.debug("[Scanner] %s REJECT C1 ltp=%.2f <= vwap=%.2f", store.symbol, ltp, vwap)
-            return None
-        # Condition 2: RSI between bias-modulated band (scanner pre-filter; see docstring)
-        #   BULLISH: 42–68   NEUTRAL: 45–65   BEARISH: 48–63
-        _rsi_lo, _rsi_hi = {
-            "BULLISH": (45.0, 68.0),
-            "NEUTRAL": (50.0, 65.0),
-            "BEARISH": (50.0, 63.0),
-        }.get(self._market_bias, (50.0, 65.0))
-        if not (_rsi_lo <= rsi <= _rsi_hi):
-            logger.debug(
-                "[Scanner] %s REJECT C2 rsi=%.1f not in [%.0f,%.0f] bias=%s",
-                store.symbol, rsi, _rsi_lo, _rsi_hi, self._market_bias,
-            )
-            return None
-        # Early-session tighter RSI (9:15–9:44 IST).
-        # Indicators warm up over the first 15–30 candles; momentum is noisiest
-        # right after open.  A ±5-point tighter band rejects borderline entries
-        # before the market establishes its intraday direction.
-        if now_ist.hour == 9 and now_ist.minute < 45:
-            _early_lo, _early_hi = _rsi_lo + 5, _rsi_hi - 5
-            if not (_early_lo <= rsi <= _early_hi):
-                logger.debug(
-                    "[Scanner] %s REJECT EARLY-RSI rsi=%.1f not in tight band [%.0f,%.0f] (pre-9:45)",
-                    store.symbol, rsi, _early_lo, _early_hi,
-                )
-                return None
-        # Condition 3: Volume > bias-modulated minimum (skip when historical data unavailable)
-        #   BULLISH: 1.3×   NEUTRAL: 1.5×   BEARISH: 2.0×
-        _vol_min = {
-            "BULLISH": 1.3,
-            "NEUTRAL": 1.5,
-            "BEARISH": 2.0,
-        }.get(self._market_bias, 1.5)
-        if store.avg_volume_20d > 0 and vol_ratio < _vol_min:
-            logger.debug(
-                "[Scanner] %s REJECT C3 vol_ratio=%.2f < %.1fx bias=%s",
-                store.symbol, vol_ratio, _vol_min, self._market_bias,
-            )
-            return None
-
-        # Condition 7: Gap-at-open filter (SH2)
-        # Reject signals when the stock gapped up beyond the configured threshold
-        # vs the previous session's close.  Stocks already extended at open are
-        # prone to intraday mean-reversion even when momentum indicators look green.
-        # Bias modulation: on bearish days lower the gap tolerance (less room for
-        # extended stocks); on bullish days relax it slightly.
-        #   BULLISH: 2.0%   NEUTRAL: 1.5%   BEARISH: 1.0%
-        _gap_max = {
-            "BULLISH": 2.0,
-            "NEUTRAL": self._settings.gap_filter_pct,   # 1.5 from config
-            "BEARISH": 1.0,
-        }.get(self._market_bias, self._settings.gap_filter_pct)
-        if store._prev_close > 0 and store._open_price > 0:
-            gap_pct = (store._open_price - store._prev_close) / store._prev_close * 100
-            if gap_pct > _gap_max:
-                logger.debug(
-                    "[Scanner] %s REJECT C7 gap_pct=%.2f%% > max %.1f%% bias=%s",
-                    store.symbol, gap_pct, _gap_max, self._market_bias,
-                )
-                return None
-
-        # ── Candle-based indicators (1m) ───────────
-        ema_9 = store.compute_ema(9)
-        ema_21 = store.compute_ema(21)
-        macd_hist = store.compute_macd_histogram()
-        atr = store.compute_atr()
+        ev = signal_rules.evaluate_indicators(
+            store, now_ist,
+            signal_rules.bias_thresholds(self._market_bias, self._settings),
+            nifty_open=self._nifty_open_price,
+            nifty_ltp=self._nifty_ltp,
+        )
         _t4_end = time.perf_counter_ns()
         logger.log(_PERF, "[PERF T3→T4] all indicators %s: %.0f μs",
                    store.symbol, (_t4_end - _t4_start) / 1_000)
-        # Stock-level intraday trend bias: suppress long signals when price is
-        # >1% below EMA(21).  Complements the NIFTY macro filter (A2 above) by
-        # catching single-stock downtrends on mixed or bullish market days
-        # (e.g. TATASTEEL falling while NIFTY is flat).  Safe below 21 candles
-        # because compute_ema() returns 0.0 and the ema_21 > 0 guard skips it.
-        if ema_21 > 0 and ltp < ema_21 * 0.99:
+        self._update_nifty_filter_flag(ev)
+        if not ev.passed:
             logger.debug(
-                "[Scanner] %s REJECT EMA21-TREND ltp=%.2f < ema21*0.99=%.2f",
-                store.symbol, ltp, ema_21 * 0.99,
+                "[Scanner] %s REJECT %s ltp=%.2f vwap=%.2f rsi=%.1f volR=%.2f bias=%s",
+                store.symbol, ev.reason, ev.ltp, ev.vwap, ev.rsi, ev.vol_ratio, self._market_bias,
             )
             return None
-        # Conditions 4 + 5: EMA trend and MACD momentum — enforced from ≥26 candles
-        # (MACD minimum) so the filter is active from ~9:41 AM rather than ~9:50 AM.
-        # Both checks share the same threshold so MACD is never silently skipped
-        # while EMA is already being evaluated.  (SM2)
-        if n_candles >= 26:
-            if ema_9 > 0 and ema_21 > 0 and ema_9 <= ema_21:
-                logger.debug(
-                    "[Scanner] %s REJECT C4 ema9=%.2f <= ema21=%.2f",
-                    store.symbol, ema_9, ema_21,
-                )
-                return None
-            if macd_hist <= 0:
-                logger.debug(
-                    "[Scanner] %s REJECT C5 macd_hist=%.4f", store.symbol, macd_hist
-                )
-                return None
-
-        # ── Higher timeframe filter (5m) ───────────
-        rsi_5m = store.compute_rsi_htf()
-        # Condition 6: 5-min RSI in neutral-bullish range (45–72, tightened from 35–70)
-        if rsi_5m is not None and (rsi_5m < 45 or rsi_5m > 72):
-            logger.debug(
-                "[Scanner] %s REJECT C6 rsi_5m=%.1f not in [45,72]", store.symbol, rsi_5m
-            )
-            return None
+        ltp, vwap, rsi, vol_ratio = ev.ltp, ev.vwap, ev.rsi, ev.vol_ratio
+        ema_9, ema_21, macd_hist, atr, rsi_5m = ev.ema_9, ev.ema_21, ev.macd_hist, ev.atr, ev.rsi_5m
 
         # Record cooldown timestamp before returning
         self._signal_cooldown[store.symbol] = now_ist
@@ -1010,7 +825,7 @@ class Scanner:
           • Credentials present → GrowwFeed WebSocket (real market ticks).
                                    This applies to BOTH paper trading and live
                                    trading.  paper_trading only gates order
-                                   placement and GTT — never data collection.
+                                   placement and the broker stop — never data collection.
         """
         self._running = True
         self._loop = asyncio.get_running_loop()

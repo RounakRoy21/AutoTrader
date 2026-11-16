@@ -21,7 +21,7 @@ import asyncio
 import logging
 import random
 from datetime import datetime, time as dtime
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List
 
 import pytz
 
@@ -114,9 +114,9 @@ class MockTickGenerator:
                     self._open_prices[sym] = price
                     self._day_high[sym] = price
                     self._day_low[sym] = price
-            logger.info("[MockTick] Seeded %d prices from Kite LTP", len(ltp_data))
+            logger.info("[MockTick] Seeded %d prices from Groww LTP", len(ltp_data))
         except Exception as exc:
-            logger.warning("[MockTick] Could not seed from Kite LTP: %s — using hardcoded seeds", exc)
+            logger.warning("[MockTick] Could not seed from Groww LTP: %s — using hardcoded seeds", exc)
 
     def _next_tick(self, symbol: str) -> Dict[str, Any]:
         """Generate the next synthetic tick for a symbol."""

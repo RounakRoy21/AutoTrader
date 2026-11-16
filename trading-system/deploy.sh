@@ -47,7 +47,8 @@ fi
 
 # ── 3. Firewall — open ports 80 (dashboard) and 22 (SSH) ──────────────────────
 # Note: Oracle Cloud also has VCN Security List / NSG rules.
-# You MUST also open TCP port 80 (and optionally 8000) in the OCI console under:
+# You MUST also open TCP port 80 in the OCI console under (never 8000/5432/6379 —
+# Docker's NAT rules bypass ufw, so only nginx on 80 should be reachable):
 #   Networking → Virtual Cloud Networks → your VCN → Security Lists → Ingress Rules
 info "Configuring host firewall..."
 if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
@@ -85,6 +86,22 @@ if grep -q "CHANGE_ME" .env; then
     error ".env still contains CHANGE_ME placeholders. Fill in all secrets first:\n  nano .env && ./deploy.sh"
 fi
 
+# Guard: default / placeholder database password (audit R2).
+if grep -Eq '^POSTGRES_PASSWORD=(changeme.*)?[[:space:]]*$' .env || ! grep -q '^POSTGRES_PASSWORD=' .env; then
+    error "POSTGRES_PASSWORD in .env is missing, empty or the 'changeme' default. Set a strong value:\n  nano .env && ./deploy.sh"
+fi
+if ! grep -Eq '^REDIS_PASSWORD=.+' .env; then
+    warning "REDIS_PASSWORD is not set — Redis (broker token, HALT state) runs without AUTH."
+    warning "Recommended: add REDIS_PASSWORD=<random> to .env (requirepass is enabled automatically)."
+fi
+
+# Guard: `!reset []` in docker-compose.prod.yml needs Compose >= 2.24; older
+# versions would refuse the file (good) — say why up front.
+COMPOSE_VER=$(docker compose version --short 2>/dev/null | sed 's/^v//')
+if [ -n "$COMPOSE_VER" ] && [ "$(printf '%s\n2.24.0\n' "$COMPOSE_VER" | sort -V | head -n1)" != "2.24.0" ]; then
+    error "docker compose $COMPOSE_VER is too old — docker-compose.prod.yml uses '!reset' (needs >= 2.24)."
+fi
+
 info ".env found and looks configured."
 
 # ── 5. Build & start production stack ────────────────────────────────────────
@@ -117,7 +134,7 @@ echo "  Dashboard  :  http://${SERVER_IP}/"
 echo "  API docs   :  http://${SERVER_IP}/api/docs"
 echo ""
 echo "  Groww one-time auth:"
-echo "    curl -X POST http://${SERVER_IP}/api/auth/groww/login"
+echo "    curl -X POST -H \"X-Api-Key: \$ADMIN_API_KEY\" http://${SERVER_IP}/api/auth/groww/login"
 echo "    (only needed once — TOTP tokens do not expire)"
 echo "    Set GROWW_CLIENT_ID, GROWW_PASSWORD, GROWW_TOTP_SECRET in .env to auto-generate the TOTP."
 echo ""

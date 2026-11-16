@@ -8,7 +8,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class Decision(str, Enum):
@@ -17,9 +17,14 @@ class Decision(str, Enum):
     REJECT = "REJECT"
 
 
+# MIS (NSE intraday margin) is the ONLY allowed product type (audit R11): the
+# delivery product is deliberately absent so it never appears in the
+# forced-tool JSON schema sent to the LLM (a class docstring here would be
+# copied into that schema, hence a comment).  Any other value the model returns
+# is coerced to MIS by ``DecisionOutput._force_mis`` and enforced again at
+# execution.
 class ProductType(str, Enum):
     MIS = "MIS"
-    CNC = "CNC"
 
 
 class SignalAudit(BaseModel):
@@ -121,4 +126,14 @@ class DecisionOutput(BaseModel):
         max_length=500,
         description="One-sentence reason citing which thresholds passed/failed.",
     )
+
+    @field_validator("product_type", mode="before")
+    @classmethod
+    def _force_mis(cls, value):
+        """Coerce any product type (CNC, NRML, garbage, None) to MIS (audit R11).
+
+        Coercing instead of rejecting keeps a stray LLM value from failing the
+        whole decision while guaranteeing it can never become a DELIVERY order.
+        """
+        return ProductType.MIS
 

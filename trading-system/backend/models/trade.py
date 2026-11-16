@@ -30,7 +30,8 @@ class Trade(Base):
     __tablename__ = "trades"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    kite_order_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
+    # Broker order id of the entry BUY.
+    entry_order_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
     stock: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
     exchange: Mapped[str] = mapped_column(String(10), nullable=False, default="NSE")
     direction: Mapped[str] = mapped_column(String(4), nullable=False)  # BUY / SELL
@@ -42,16 +43,25 @@ class Trade(Base):
     exit_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     exit_reason: Mapped[Optional[str]] = mapped_column(
         String(20), nullable=True
-    )  # TARGET_HIT / STOP_LOSS_HIT / MANUAL / EOD_CLOSE
+    )  # TARGET_HIT / STOP_LOSS_HIT / TRAILING_SL / BREAKEVEN / MANUAL / EOD_CLOSE / PARTIAL_BOOK / RECONCILED
     realized_pnl: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(
         String(10), nullable=False, default="OPEN", index=True
-    )  # OPEN / CLOSING / CLOSED
+    )  # PENDING / OPEN / CLOSING / CLOSED / REJECTED
     trade_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     entry_time: Mapped[time] = mapped_column(Time, nullable=False)
     exit_time: Mapped[Optional[time]] = mapped_column(Time, nullable=True)
     decision_rationale: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    gtt_trigger_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Full raw broker order id of the resting protective SL SELL (audit R1 / C1).
+    # Every exit path cancels-and-confirms this order before selling.
+    sl_order_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # How the stop was last moved (audit R14): NULL = initial stop, TRAILING,
+    # BREAKEVEN.  Drives the exit reason of a stop-out (STOP_LOSS_HIT /
+    # TRAILING_SL / BREAKEVEN).
+    stop_kind: Mapped[Optional[str]] = mapped_column(String(12), nullable=True)
+    # order_reference_id of the entry BUY, written with the PENDING row before
+    # the order is sent (audit C9); the reconciler resolves stranded rows by it.
+    entry_order_ref: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, unique=True, index=True)
     # ── Partial profit-booking / scale-out ────────────────────────────────────
     # original_quantity preserves the full entry size for auditing once `quantity`
     # is reduced to the remaining position after a partial book.  partial_target_price

@@ -122,7 +122,7 @@ FastAPI surface the dashboard consumes.
 | `core/redis_keys.py` | central key registry | a `StateKeys` object + typed `StateStore` wrapper |
 | `core/nse_calendar.py` | NSE holiday + IST today | port the holiday list to Kotlin; `LocalDate.now(istZone)` |
 | `agents/trading_agent_manager.py` | session lifecycle, trade-count restore, halt reset | `TradingSessionManager` (singleton) coordinating coroutine `Job`s |
-| `agents/trading_agent.py` | orchestrates Scanner/Decision/Risk, order placement, fill verify, GTT, DB persist, state recovery | `TradingOrchestrator` coroutine; same order→fill→SL→persist sequence |
+| `agents/trading_agent.py` | orchestrates Scanner/Decision/Risk, order placement, fill verify, broker stop, DB persist, state recovery | `TradingOrchestrator` coroutine; same order→fill→SL→persist sequence |
 | `agents/scanner.py` (pandas OHLCV, VWAP/RSI/EMA/MACD/ATR, signal conditions) | tick→indicator→signal | `Scanner` coroutine; **TA4J** or hand-rolled Kotlin indicators over a ring buffer; **poll-driven ticks** (see §7) |
 | `agents/decision_engine.py` (pre-checks + Claude LLM + bias×stance matrices) | gate + size + confirm trades | `DecisionEngine`; pre-checks pure Kotlin; LLM via Anthropic REST (OkHttp) |
 | `agents/risk_manager.py` (thread + 5s poll loop) | SL/target/trailing/ROI-decay/partial/EOD/drawdown | `RiskManager` coroutine with `delay(5_000)` loop; identical rule order |
@@ -130,7 +130,6 @@ FastAPI surface the dashboard consumes.
 | `agents/nifty50_monitor.py` | monthly NIFTY 50 constituent drift detection | `Nifty50Monitor` — `WorkManager` periodic (monthly) task; diff live constituents vs registry, alert on drift |
 | `core/nifty50.py` (coverage registry + `diff_constituents`) | tracked symbols + index diff | Kotlin `object Nifty50` with `TRACKED_SYMBOLS` + `diffConstituents()` |
 | `integrations/groww_client.py` (SDK wrapper + feed adapter) | broker I/O | **`GrowwRestClient`** (Retrofit) — see §5 & §6; **no websocket** |
-| `integrations/kite_client.py` | **DEPRECATED** legacy Zerodha Kite wrapper | not ported (kept in source for reference only) |
 | `integrations/instrument_service.py` (symbol↔token) | instrument map | download public CSV, parse (kotlin-csv), build map; keep `FALLBACK_TOKEN_MAP` |
 | `integrations/anthropic_client.py` | Claude calls | OkHttp + Anthropic Messages REST |
 | `integrations/alpha_vantage_client.py` | macro data | OkHttp REST (Yahoo Finance chart endpoints for VIX/DXY/USD-INR/Nikkei/crude/gold/earnings; Alpha Vantage as US-close fallback) |
@@ -164,12 +163,11 @@ body `{"key_type":"totp","totp":"<6digit>"}` → `{token, expiry, ...}`.
 | `groww_client.py` method | REST endpoint | Notes |
 |---|---|---|
 | `place_order()` | `POST /v1/order/create` | body: trading_symbol, quantity, price?, trigger_price?, validity=DAY, exchange=NSE, segment=CASH, product=CNC\|MIS\|NRML, order_type=MARKET\|LIMIT\|SL\|SL_M, transaction_type=BUY\|SELL, order_reference_id (8–20 alnum, ≤2 hyphens). Response: `payload.groww_order_id`, `order_status`. |
-| `place_gtt()` (SL exit) | `POST /v1/order/create` `order_type=SL`/`SL_M` | OCO smart order **not supported for CASH** → keep degrade-to-plain-SL behavior. (GTT single-trigger IS available for CASH if ever needed via `/v1/order-advance/create`.) |
-| `delete_gtt()` | `POST /v1/order/cancel` | `{segment, groww_order_id}` |
+| `place_stop_loss_order()` (SL exit) | `POST /v1/order/create` `order_type=SL`/`SL_M` | OCO smart order **not supported for CASH** → keep the plain-SL behavior. (GTT single-trigger IS available for CASH if ever needed via `/v1/order-advance/create`.) |
+| `cancel_order()` | `POST /v1/order/cancel` | `{segment, groww_order_id}` |
 | `get_positions()` | `GET /v1/positions/user?segment=CASH` | `payload.positions[]`: `quantity`(net), `credit_quantity`, `debit_quantity`, `net_price`, `realised_pnl`, `product` |
 | `get_orders()` | `GET /v1/order/list?segment=CASH&page=0&page_size=100` | `payload.order_list[]` |
-| `get_order_history()` / status | `GET /v1/order/detail/{groww_order_id}?segment=CASH` or `GET /v1/order/status/{id}?segment=CASH` | `order_status`, `filled_quantity`, `average_fill_price` |
-| `get_holdings()` | `GET /v1/holdings/user` | `payload.holdings[]` |
+| `get_order_state()` | `GET /v1/order/detail/{groww_order_id}?segment=CASH` or `GET /v1/order/status/{id}?segment=CASH` | `order_status`, `filled_quantity`, `average_fill_price` |
 | `get_ltp()` | `GET /v1/live-data/ltp?segment=CASH&exchange_symbols=NSE_RELIANCE,NSE_TCS` | up to **50 symbols/call**; returns `{"NSE_RELIANCE":2334.2,...}` |
 | OHLCV/volume snapshot (scanner) | `GET /v1/live-data/quote?exchange=NSE&segment=CASH&trading_symbol=RELIANCE` | **quote has volume**; the `/ohlc` endpoint does **not** → use `/quote` for volume ratio. Single-symbol → 1 call/symbol. Also exposes `upper_circuit_limit` used by the order circuit-guard. |
 | historical candles | `GET /v1/historical/candles?exchange=NSE&segment=CASH&groww_symbol=NSE-WIPRO&start_time=&end_time=&candle_interval=1minute` | `payload.candles[[ts,o,h,l,c,volume,oi]]`. Limits: 1min=30d, 10/15/30min=90d, 1h/4h/day/week/month=180d. (Old `/v1/historical/candle/range` is **deprecated**.) |
@@ -193,13 +191,12 @@ product CNC/MIS/NRML · transaction BUY/SELL · validity DAY · candle_interval 
    CNC←DELIVERY** at the client boundary. (The risk manager already keys MIS square-off on
    `product_type == "MIS"`, so internal values should standardize on the REST set.)
 2. **Order id field name.** REST response is `groww_order_id` (not the SDK's `order_id`/`orderId`).
-   The DB column is currently `kite_order_id` (legacy name) and stores `str(order_id)` — keep the
-   column, store `groww_order_id` in it.
+   The DB column is `entry_order_id` and stores `str(order_id)` — store `groww_order_id` in it.
 3. **Positions schema.** REST uses `credit_quantity`/`debit_quantity` + net `quantity`, **not** the
    SDK's `buy_quantity`/`sell_quantity`. State-recovery code reads `p["tradingsymbol"]` and
    `p.get("quantity")` from a normalized `{"net":[...]}` shape — the Kotlin client must normalize
    REST positions into that same shape (net qty, tradingsymbol).
-4. **OCO not supported for CASH.** Current `place_gtt()` already degrades to a plain SL order — this
+4. **OCO not supported for CASH.** The broker stop is a plain SL order (`place_stop_loss_order()`) — this
    is correct and must be retained. Do **not** attempt OCO smart orders for equities.
 5. **No websocket.** GrowwFeed is Python-SDK-only and absent from the cURL docs. Replace with
    **REST polling** (see §7). This is the single biggest architectural change.
@@ -356,9 +353,10 @@ max 3 open positions / 6 trades-per-day baseline (scaled by matrices); max 2 tra
 `market_brief`, `system_alerts`, `decision_feed`, plus the 2 s `ltp_update` snapshot. The Ktor
 WebSocket subscribes to these flows and forwards them to the dashboard unchanged.
 
-**PostgreSQL → Room entities/DAOs:** `Trade` (incl. `kite_order_id`, `partial_target_price`,
-`gtt_trigger_id`, status OPEN/CLOSING/CLOSED, trade_date/entry_time), `MarketBrief`
-(unique per date), `DailyPnl`, `AgentLog`. Port the 3 Alembic migrations as the initial Room schema
+**PostgreSQL → Room entities/DAOs:** `Trade` (incl. `entry_order_id`, `entry_order_ref`,
+`sl_order_id`, `partial_target_price`, status PENDING/OPEN/CLOSING/CLOSED/REJECTED,
+trade_date/entry_time), `MarketBrief`
+(unique per date), `DailyPnl`, `AgentLog`. Port the Alembic migrations' end state as the initial Room schema
 (no need for incremental migrations on day one).
 
 ---

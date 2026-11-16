@@ -11,9 +11,10 @@ import json
 import logging
 from typing import Set
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
 from core.redis_client import get_redis
+from core.security import API_KEY_HEADER_NAME, api_key_matches
 from integrations import ltp_store
 
 logger = logging.getLogger(__name__)
@@ -112,14 +113,59 @@ def start_ws_background_tasks() -> None:
     logger.info("WebSocket background tasks started (Redis relay + LTP broadcaster)")
 
 
+# Seconds a client has to send its auth message after the handshake.
+WS_AUTH_TIMEOUT_S = 5.0
+
+
+async def _authenticate(ws: WebSocket) -> bool:
+    """Return True when the client presented a valid admin key.
+
+    Accepts an ``X-Api-Key`` handshake header (also covers the open,
+    no-key-configured paper mode) or a first message
+    ``{"channel": "auth", "data": {"api_key": "..."}}``.
+    """
+    if api_key_matches(ws.headers.get(API_KEY_HEADER_NAME)):
+        return True
+    try:
+        raw = await asyncio.wait_for(ws.receive_text(), timeout=WS_AUTH_TIMEOUT_S)
+        msg = json.loads(raw)
+    except Exception:
+        return False
+    if not isinstance(msg, dict) or msg.get("channel") != "auth":
+        return False
+    data = msg.get("data")
+    provided = data.get("api_key") if isinstance(data, dict) else None
+    return api_key_matches(provided if isinstance(provided, str) else None)
+
+
 @router.websocket("/ws/live")
 async def websocket_live(ws: WebSocket):
     """
     WebSocket endpoint for the Angular frontend.
     Streams real-time events: TRADE_OPENED, TRADE_CLOSED, PNL_UPDATE,
     AGENT_STATUS, SYSTEM_ALERT, and ltp_update snapshots.
+
+    Auth (audit R1): the stream carries positions, P&L and LLM rationale, so the
+    admin key is required.  Browsers cannot set headers on a WebSocket
+    handshake and a query-string key would leak into uvicorn / nginx access
+    logs, so the dashboard sends it as the FIRST message:
+    ``{"channel": "auth", "data": {"api_key": "..."}}``.  Non-browser clients
+    may instead send an ``X-Api-Key`` header on the handshake.  When no key is
+    configured (paper mode only — live mode refuses to boot) no auth message is
+    needed.  A failed / missing auth closes with 1008 (policy violation) before
+    the client is added to the broadcast set.
     """
     await ws.accept()
+    if not await _authenticate(ws):
+        logger.warning(
+            "WebSocket connection rejected: invalid or missing api_key (client=%s)",
+            ws.client.host if ws.client else "?",
+        )
+        try:
+            await ws.close(code=status.WS_1008_POLICY_VIOLATION)
+        except Exception:
+            pass
+        return
     _connections.add(ws)
     # Ensure background tasks are running (idempotent — safe to call every connect)
     start_ws_background_tasks()

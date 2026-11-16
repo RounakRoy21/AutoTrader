@@ -9,9 +9,22 @@ A to-the-point guide to get AutoTrader running on any Windows machine and keep i
 Install these once, in order:
 
 1. **Git** — https://git-scm.com/download/win
-2. **Docker Desktop** — https://www.docker.com/products/docker-desktop
-   - During install: enable "Start Docker Desktop when you log in"
-   - After install: open Docker Desktop, go to **Settings → General**, confirm "Start Docker Desktop when you log in" is ticked
+2. **Podman** (CLI or Podman Desktop) — https://podman.io / https://podman-desktop.io
+   - Create the Linux VM once, with enough memory for the Angular build (2 GB can OOM):
+     ```powershell
+     podman machine init --memory 4096   # new machine
+     # existing machine instead: podman machine stop; podman machine set --memory 4096
+     podman machine start
+     ```
+3. **A compose provider** — `podman compose` delegates to one of these:
+   ```powershell
+   winget install Docker.DockerCompose   # recommended: best compatibility (healthcheck conditions, build targets)
+   # or
+   pip install podman-compose
+   ```
+   Open a new terminal afterwards and check: `podman compose version`
+
+> Docker Desktop still works: `start.ps1` uses Podman when it is installed and falls back to Docker otherwise. Force one with `.\start.ps1 -Engine docker` or `$env:CONTAINER_ENGINE = "docker"`.
 
 ---
 
@@ -67,7 +80,7 @@ Optional but recommended for live trading:
 ALPHA_VANTAGE_API_KEY=your_key  # for news sentiment in market briefs
 ```
 
-Leave everything else at its default. PostgreSQL and Redis are fully self-contained inside Docker — no external database setup needed.
+Leave everything else at its default. PostgreSQL and Redis are fully self-contained inside containers — no external database setup needed.
 
 ---
 
@@ -77,7 +90,7 @@ Leave everything else at its default. PostgreSQL and Redis are fully self-contai
 .\start.ps1 -Build
 ```
 
-This builds all Docker images and starts four containers: `postgres`, `redis`, `backend`, `frontend`. Takes 3–5 minutes the first time. On subsequent starts it's under 30 seconds.
+This starts the Podman machine if needed, builds all container images and starts four containers: `postgres`, `redis`, `backend`, `frontend`. Takes 3–5 minutes the first time. On subsequent starts it's under 30 seconds.
 
 When complete, open your browser:
 
@@ -109,7 +122,7 @@ Do these once to make the laptop self-managing:
 Settings → System → Power & Sleep → set both dropdowns to **Never** (plugged in).
 
 ### Auto-login after reboot
-Press `Win + R`, type `netplwiz`, untick "Users must enter a username and password". This lets Docker start automatically after a power cut or forced reboot without needing someone at the keyboard.
+Press `Win + R`, type `netplwiz`, untick "Users must enter a username and password". This lets the scheduled task below bring Podman and the app back up automatically after a power cut or forced reboot without needing someone at the keyboard.
 
 ### Auto-start the app on login
 Open **Task Scheduler** → Create Basic Task:
@@ -118,6 +131,8 @@ Open **Task Scheduler** → Create Basic Task:
   - Program: `powershell.exe`
   - Arguments: `-NonInteractive -File "C:\AutoTrader\trading-system\start.ps1"`
 - **Conditions**: untick "Start only if the computer is on AC power"
+
+This task matters more with Podman than it did with Docker Desktop: the Podman machine does **not** start by itself at login, and `start.ps1` is what starts it.
 
 ### Disable automatic restart from Windows Update
 Settings → Windows Update → Advanced Options → set "Notify to schedule restart" (not automatic). Apply updates manually on Saturday when the system is off.
@@ -165,26 +180,29 @@ Install **Tailscale** (free, https://tailscale.com) on both the laptop and your 
 | **Monday morning** | Power on the laptop. If Task Scheduler is configured, nothing else to do — app starts automatically. Verify on the dashboard. |
 | **Mon–Fri** | Monitor via Telegram alerts. The market-hours gate prevents any activity before 09:15 and after 15:30 IST automatically. |
 | **Saturday** | Run `.\start.ps1 -Stop`, then shut down the laptop. |
-| **After any unexpected reboot** | Containers restart themselves via Docker's `restart: unless-stopped` policy. No manual action needed. |
+| **After any unexpected reboot** | The log-on scheduled task runs `start.ps1`, which starts the Podman machine and the containers. Without that task, run `.\start.ps1` yourself. |
 
 ---
 
 ## Troubleshooting
 
-**Docker Desktop not starting?**
-Right-click the Docker icon in the system tray → Restart. Or reboot the PC.
+**Podman machine won't start?**
+`podman machine stop; podman machine start`. If it is corrupted: `podman machine rm`, then `podman machine init --memory 4096`. Volumes live inside the machine, so this wipes the database.
 
-**`start.ps1` says "docker not found"?**
-Log out and log back in after installing Docker Desktop. The PATH update requires a fresh session.
+**`start.ps1` says "podman not found" or "no compose provider"?**
+Open a fresh terminal after installing (PATH updates need a new session). Check `podman compose version`; if it fails, install a provider (see Prerequisites).
+
+**Frontend build gets killed / exits with code 137?**
+The Podman machine ran out of memory: `podman machine stop; podman machine set --memory 4096; podman machine start`.
 
 **Backend container keeps restarting?**
-Check the logs: `docker-compose logs backend --tail=50`. Usually a missing or wrong value in `.env`.
+Check the logs: `podman compose logs backend --tail=50`. Usually a missing or wrong value in `.env`.
 
 **Dashboard shows "Disconnected"?**
-The WebSocket connects to the backend. Refresh the page once the backend is fully up (~10 seconds after `docker-compose up`).
+The WebSocket connects to the backend. Refresh the page once the backend is fully up (~10 seconds after `podman compose up`).
 
 **Forgot to stop before shutdown?**
-Docker handles this gracefully. The containers will resume on next start via `restart: unless-stopped`.
+Nothing is lost. Run `.\start.ps1` (or let the scheduled task do it) and the machine and containers come back with their volumes intact.
 
 **No Telegram messages arriving?**
 Verify `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env`. Send `/start` to your bot in Telegram first — bots cannot message users who haven't initiated contact.

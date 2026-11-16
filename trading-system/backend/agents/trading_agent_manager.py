@@ -38,7 +38,7 @@ from sqlalchemy import func, select
 
 from core.database import get_db_context
 from core.redis_client import publish, set_value
-from core.redis_keys import DAILY_TRADE_COUNT_KEY, HALT_KEY, RISK_STATUS_KEY, TRADING_STATUS_KEY
+from core.redis_keys import DAILY_TRADE_COUNT_KEY, RISK_STATUS_KEY, TRADING_STATUS_KEY
 from core.nse_calendar import is_nse_holiday
 from models.trade import Trade
 
@@ -232,15 +232,16 @@ class TradingAgentManager:
         into Redis.  This ensures a mid-day restart doesn't reset the counter,
         which would allow more trades than the daily maximum permits.
 
-        Also resets the trading halt flag — a drawdown halt applies to a single
-        trading day and must not carry over into the next session.
+        The halt flag / loss streak / pause / locks are date-scoped and are
+        never reset here (audit R7 / C8) — see ``_restore_risk_state``.
         """
         try:
             today = ist_today()
             async with get_db_context() as session:
                 result = await session.execute(
                     select(func.count()).select_from(Trade).where(
-                        Trade.trade_date == today
+                        Trade.trade_date == today,
+                        Trade.status != "REJECTED",
                     )
                 )
                 count = result.scalar() or 0
@@ -254,14 +255,66 @@ class TradingAgentManager:
             logger.error("[Manager] Failed to restore trade count from DB: %s — defaulting to 0", exc)
             await set_value(TRADE_COUNT_KEY, "0", ttl=_secs_until_midnight_ist())
 
-        # Reset the daily halt flag so yesterday's drawdown halt doesn't block today
-        await set_value(HALT_KEY, "FALSE")
-        logger.info("[Manager] Reset trading halt flag for new session")
+        # Audit R7 / C8: NEVER reset the halt flag, loss streak, pause or stock
+        # locks here.  They are date-scoped (see core.redis_keys), so a new
+        # trading day starts clean on its own while a restart / same-day
+        # session start keeps today's state.  Rebuild it from today's DB rows
+        # in case Redis lost it.
+        await self._restore_risk_state()
 
-        # Reset consecutive loss counter — yesterday's streak should not penalise today
-        await set_value("consecutive_losses", "0")
-        await set_value("consecutive_loss_pause_until", "")
-        logger.info("[Manager] Reset consecutive loss counter for new session")
+    async def _restore_risk_state(self) -> None:
+        """Re-derive today's loss streak, pause, stock locks and drawdown halt
+        from today's CLOSED trades (audit R7 / C8).
+
+        Only ever makes the state STRICTER: a halt is set, never cleared; the
+        streak / pause / locks are (re)written from the DB, which is the source
+        of truth for realised outcomes.  On a DB failure the session still
+        starts, but new entries are halted until an operator resumes.
+        """
+        from core.risk_state import compute_daily_risk_state, set_halt  # noqa: PLC0415
+        from core.config import get_settings  # noqa: PLC0415
+        from core.redis_keys import (  # noqa: PLC0415
+            RISK_STATE_TTL_S, consecutive_losses_key, loss_pause_until_key, stock_lock_key,
+        )
+
+        settings = get_settings()
+        today = ist_today()
+        try:
+            async with get_db_context() as session:
+                result = await session.execute(
+                    select(Trade).where(Trade.trade_date == today, Trade.status == "CLOSED")
+                )
+                closed = list(result.scalars().all())
+        except Exception as exc:
+            logger.error("[Manager] Risk-state rebuild failed (DB): %s — halting new entries", exc)
+            await set_halt(f"risk-state rebuild failed on session start: {exc}")
+            return
+
+        state = compute_daily_risk_state(
+            closed,
+            today,
+            pause_threshold=settings.consecutive_loss_pause_threshold,
+            pause_minutes=settings.consecutive_loss_pause_minutes,
+            lock_after_loss=settings.stock_lock_after_sl,
+        )
+
+        await set_value(consecutive_losses_key(today), str(state.streak), ttl=RISK_STATE_TTL_S)
+        if state.pause_until is not None and state.pause_until > datetime.now(_IST):
+            await set_value(
+                loss_pause_until_key(today), state.pause_until.isoformat(), ttl=RISK_STATE_TTL_S,
+            )
+        for sym in state.locked_stocks:
+            await set_value(stock_lock_key(sym, today), "TRUE", ttl=RISK_STATE_TTL_S)
+
+        limit = settings.daily_drawdown_limit
+        if limit > 0 and state.realized_loss >= limit:
+            await set_halt(
+                f"daily drawdown ₹{state.realized_loss:.2f} >= ₹{limit:.2f} (rebuilt on session start)"
+            )
+        logger.info(
+            "[Manager] Restored risk state from DB: streak=%d pause_until=%s locks=%s realised_loss=₹%.2f",
+            state.streak, state.pause_until, sorted(state.locked_stocks), state.realized_loss,
+        )
 
 
 # ── Module-level singleton ────────────────────────────────────────────

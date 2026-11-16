@@ -1,23 +1,36 @@
-﻿# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+﻿# -----------------------------------------------------------------------------
 # AutoTrader single launch script (Windows / local dev)
 #
+# Works with Podman (preferred) or Docker. The engine is auto-detected:
+# podman if it is on PATH, otherwise docker. Override with -Engine or the
+# CONTAINER_ENGINE environment variable.
+#
 # Usage:
-#   .\start.ps1           # start all services (no image rebuild)
-#   .\start.ps1 -Build    # rebuild images first (use after code changes)
-#   .\start.ps1 -Stop     # gracefully stop all services
-#   .\start.ps1 -Status   # print container status and exit
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+#   .\start.ps1                 # start all services (no image rebuild)
+#   .\start.ps1 -Build          # rebuild images first (use after code changes)
+#   .\start.ps1 -Stop           # gracefully stop all services
+#   .\start.ps1 -Status         # print container status and exit
+#   .\start.ps1 -Engine docker  # force a specific container engine
+#
+# Podman notes:
+#   - Needs a running Podman machine; this script starts it if it is stopped.
+#   - `podman compose` needs a compose provider: docker-compose (recommended,
+#     `winget install Docker.DockerCompose`) or podman-compose
+#     (`pip install podman-compose`).
+# -----------------------------------------------------------------------------
 [CmdletBinding()]
 param(
     [switch]$Build,
     [switch]$Stop,
-    [switch]$Status
+    [switch]$Status,
+    [ValidateSet("auto", "podman", "docker")]
+    [string]$Engine = $(if ($env:CONTAINER_ENGINE) { $env:CONTAINER_ENGINE } else { "auto" })
 )
 
 $ErrorActionPreference = "Stop"
 Push-Location $PSScriptRoot
 
-# â”€â”€ Colour helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- Colour helpers -----------------------------------------------------------
 function Write-Info { param($msg) Write-Host "[INFO]  $msg" -ForegroundColor Cyan   }
 function Write-Ok   { param($msg) Write-Host "[ OK ]  $msg" -ForegroundColor Green  }
 function Write-Warn { param($msg) Write-Host "[WARN]  $msg" -ForegroundColor Yellow }
@@ -35,29 +48,87 @@ function Write-Banner {
     Write-Host ""
 }
 
-# â”€â”€ Pre-checks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-    Write-Err "docker not found. Install Docker Desktop."
+# Run a native command without letting stderr chatter trip $ErrorActionPreference.
+# Returns $true when the command exits 0.
+function Test-Native {
+    param([scriptblock]$Cmd)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { $null = & $Cmd 2>&1 } catch { }
+    $ok = ($LASTEXITCODE -eq 0)
+    $ErrorActionPreference = $prev
+    return $ok
 }
 
-# â”€â”€ --Stop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- Resolve container engine -------------------------------------------------
+if ($Engine -eq "auto") {
+    if (Get-Command podman -ErrorAction SilentlyContinue)     { $Engine = "podman" }
+    elseif (Get-Command docker -ErrorAction SilentlyContinue) { $Engine = "docker" }
+    else { Write-Err "Neither podman nor docker found on PATH. Install Podman Desktop (https://podman-desktop.io) or Docker Desktop." }
+} elseif (-not (Get-Command $Engine -ErrorAction SilentlyContinue)) {
+    Write-Err "$Engine not found on PATH."
+}
+
+if ($Engine -eq "podman") {
+    # Silence the ">>>> Executing external compose provider" banner podman prints.
+    $env:PODMAN_COMPOSE_WARNING_LOGS = "false"
+}
+
+function Invoke-Compose {
+    & $Engine compose @args
+    if ($LASTEXITCODE -ne 0) { Write-Err "'$Engine compose $args' failed (exit $LASTEXITCODE)." }
+}
+
+# -- Make sure the engine is reachable ----------------------------------------
+function Confirm-EngineRunning {
+    if ($Engine -eq "podman") {
+        if (-not (Test-Native { podman info })) {
+            Write-Info "Podman machine is not running - starting it..."
+            $prev = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+            podman machine start 2>&1 | Out-Host
+            $ErrorActionPreference = $prev
+            if (-not (Test-Native { podman info })) {
+                Write-Err "Podman machine could not be started. Run 'podman machine list' / 'podman machine init' and retry."
+            }
+        }
+        Write-Ok "Podman is running"
+    } else {
+        if (-not (Test-Native { docker info })) {
+            Write-Err "Docker daemon is not running. Start Docker Desktop first."
+        }
+        Write-Ok "Docker is running"
+    }
+
+    if (-not (Test-Native { & $Engine compose version })) {
+        if ($Engine -eq "podman") {
+            Write-Err ("'podman compose' has no compose provider. Install one, then open a new terminal:`n" +
+                       "         winget install Docker.DockerCompose     (recommended)`n" +
+                       "         pip install podman-compose               (alternative)")
+        }
+        Write-Err "'docker compose' is not available. Install the Docker Compose plugin."
+    }
+}
+
+# -- -Stop --------------------------------------------------------------------
 if ($Stop) {
-    Write-Banner "Stopping"
-    docker compose down
+    Write-Banner "Stopping ($Engine)"
+    Confirm-EngineRunning
+    Invoke-Compose down
     Write-Ok "All containers stopped (database volume preserved)."
     Pop-Location; exit 0
 }
 
-# â”€â”€ --Status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- -Status ------------------------------------------------------------------
 if ($Status) {
-    docker compose ps
+    Confirm-EngineRunning
+    Invoke-Compose ps
     Pop-Location; exit 0
 }
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-Write-Banner "Starting (local dev)"
+# =============================================================================
+Write-Banner "Starting (local dev, $Engine)"
 
-# â”€â”€ 1. Pre-flight checks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- 1. Pre-flight checks -----------------------------------------------------
 Write-Info "Running pre-flight checks..."
 
 if (-not (Test-Path ".env")) {
@@ -69,26 +140,20 @@ if ($envContent -match '<[^>]+>') {
 }
 Write-Ok ".env looks populated"
 
-$ErrorActionPreference = "Continue"
-$null = docker info 2>&1
-$ErrorActionPreference = "Stop"
-if ($LASTEXITCODE -ne 0) {
-    Write-Err "Docker daemon is not running. Start Docker Desktop first."
-}
-Write-Ok "Docker is running"
+Confirm-EngineRunning
 
-# â”€â”€ 2. Start containers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# depends_on: condition: service_healthy ensures postgres and redis are ready
-# before the backend starts no manual health-wait loops needed.
+# -- 2. Start containers ------------------------------------------------------
+# depends_on: condition: service_healthy makes postgres and redis ready before
+# the backend starts, so no manual health-wait loops are needed here.
 Write-Info "Starting containers$(if ($Build) { ' (with image rebuild)' })..."
 if ($Build) {
-    docker compose up -d --build
+    Invoke-Compose up -d --build
 } else {
-    docker compose up -d
+    Invoke-Compose up -d
 }
 Write-Host ""
 
-# â”€â”€ 3. Wait for backend API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- 3. Wait for backend API --------------------------------------------------
 Write-Info "Waiting for backend API (up to 90 s)..."
 $backendUp = $false
 for ($i = 1; $i -le 45; $i++) {
@@ -99,22 +164,22 @@ for ($i = 1; $i -le 45; $i++) {
     Start-Sleep -Seconds 2
 }
 if (-not $backendUp) {
-    Write-Warn "Backend health check timed out. Migrations will still be attempted. Run: docker compose logs backend"
+    Write-Warn "Backend health check timed out. Migrations will still be attempted. Run: $Engine compose logs backend"
 }
 
-# â”€â”€ 4. Database migrations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- 4. Database migrations ---------------------------------------------------
 Write-Info "Applying database migrations..."
-docker exec autotrader-backend alembic upgrade head
+Invoke-Compose exec -T backend alembic upgrade head
 Write-Ok "Migrations applied"
 
-# â”€â”€ 5. Summary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- 5. Summary ---------------------------------------------------------------
 $envLines = Get-Content ".env" | Where-Object { $_ -match '^PAPER_TRADING=' }
 $paper = if ($envLines) { (($envLines[0] -split '=',2)[1] + '').Trim() } else { "unknown" }
 if (-not $paper) { $paper = "unknown" }
 
 Write-Host ""
 Write-Host "  ============================================" -ForegroundColor Green
-Write-Host "  AutoTrader is running" -ForegroundColor Green
+Write-Host "  AutoTrader is running ($Engine)" -ForegroundColor Green
 Write-Host "  ============================================" -ForegroundColor Green
 Write-Host ""
 Write-Host "  Mode:       $paper"                                     -ForegroundColor White
@@ -125,12 +190,12 @@ Write-Host ""
 Write-Host "  Groww auth (one-time): POST http://localhost:8000/api/auth/groww/login" -ForegroundColor Yellow
 Write-Host "  (only needed once - TOTP tokens do not expire)"         -ForegroundColor Yellow
 Write-Host ""
-Write-Host "  Useful commands:"                                        -ForegroundColor DarkGray
-Write-Host "    docker compose logs -f backend           # live backend logs"   -ForegroundColor DarkGray
-    Write-Host "    docker compose logs -f backend | Select-String scanner"        -ForegroundColor DarkGray
-Write-Host "    .\start.ps1 -Stop                       # graceful shutdown"    -ForegroundColor DarkGray
+Write-Host "  Useful commands:"                                                   -ForegroundColor DarkGray
+Write-Host "    $Engine compose logs -f backend           # live backend logs"   -ForegroundColor DarkGray
+Write-Host "    $Engine compose logs -f backend | Select-String scanner"         -ForegroundColor DarkGray
+Write-Host "    .\start.ps1 -Stop                        # graceful shutdown"    -ForegroundColor DarkGray
 Write-Host ""
 
-docker compose ps
+Invoke-Compose ps
 
 Pop-Location

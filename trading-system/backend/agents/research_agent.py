@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, time
 
 import pytz
 from sqlalchemy import select
@@ -562,17 +562,6 @@ def _parse_news_flags(headlines: list) -> list[NewsFlagSchema]:
 _FALLBACK_WATCHLIST = ["RELIANCE", "HDFCBANK", "INFY", "TCS", "ICICIBANK", "AXISBANK", "WIPRO"]
 
 
-def _load_prior_watchlist() -> list[str]:
-    """Synchronous shim — always returns the fallback list.
-
-    The real async version is _async_load_prior_watchlist(), called from
-    generate_market_brief() before _generate_mock_brief() is invoked.
-    This stub is kept so any external import (e.g. the Docker import check)
-    doesn't break.
-    """
-    return _FALLBACK_WATCHLIST
-
-
 async def _async_load_prior_watchlist() -> list[str]:
     """Async-safe: reads TODAY_WATCHLIST_KEY from Redis, falls back to FALLBACK."""
     try:
@@ -832,14 +821,13 @@ async def generate_market_brief(raw_data: dict) -> MarketBriefLLMOutput | None:
     return brief
 
 
-def _parse_generated_at(value: str) -> "time":
+def _parse_generated_at(value: str) -> time:
     """Parse HH:MM:SS from the LLM-supplied generated_at string.
 
     The LLM occasionally returns microseconds (``HH:MM:SS.ffffff``) or a
     full ISO timestamp; slice to the first 8 characters so strptime never
     raises on unexpected suffixes.
     """
-    from datetime import time as _time
     try:
         return datetime.strptime(value[:8], "%H:%M:%S").time()
     except (ValueError, TypeError):

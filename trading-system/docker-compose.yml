@@ -1,17 +1,18 @@
-version: "3.9"
 
 services:
   # ── PostgreSQL ────────────────────────────────────
   postgres:
-    image: postgres:16-alpine
+    image: docker.io/library/postgres:16-alpine
     container_name: autotrader-postgres
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-autotrader}
       POSTGRES_USER: ${POSTGRES_USER:-autotrader}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_postgres_password}
+    # Dev only — bound to loopback so the DB is never published on the LAN.
+    # docker-compose.prod.yml removes this binding entirely (!reset).
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -22,15 +23,28 @@ services:
 
   # ── Redis ─────────────────────────────────────────
   redis:
-    image: redis:7-alpine
+    image: docker.io/library/redis:7-alpine
     container_name: autotrader-redis
     restart: unless-stopped
+    # Optional AUTH: set REDIS_PASSWORD in .env to enable `requirepass` (off by
+    # default for local dev).  The backend reads the same REDIS_PASSWORD via
+    # env_file, so REDIS_URL can stay redis://redis:6379/0.  `$$` defers
+    # expansion to the container shell (works in docker compose and podman-compose).
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    command:
+      - sh
+      - -c
+      # Re-enter the image's entrypoint so it still drops to the redis user and
+      # applies its usual protected-mode handling.
+      - 'if [ -n "$$REDIS_PASSWORD" ]; then exec docker-entrypoint.sh redis-server --requirepass "$$REDIS_PASSWORD"; else exec docker-entrypoint.sh redis-server; fi'
+    # Dev only — loopback bind; removed in docker-compose.prod.yml (!reset).
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", 'if [ -n "$$REDIS_PASSWORD" ]; then export REDISCLI_AUTH="$$REDIS_PASSWORD"; fi; redis-cli ping | grep -q PONG']
       interval: 10s
       timeout: 5s
       retries: 5
@@ -44,8 +58,12 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    # Dev only — loopback bind: in paper mode with no ADMIN_API_KEY the API is
+    # unauthenticated, yet /api/auth/groww/login acts on REAL broker
+    # credentials, so it must never be reachable from the LAN.  The frontend
+    # container reaches it over the compose network (backend:8000).
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -53,6 +71,14 @@ services:
         condition: service_healthy
     volumes:
       - ./backend:/app
+    # Declared here (not only in the Dockerfile) because Podman builds OCI-format
+    # images by default, which silently drop Dockerfile HEALTHCHECK instructions.
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
     command: >
       uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
@@ -63,8 +89,10 @@ services:
       dockerfile: Dockerfile
     container_name: autotrader-frontend
     restart: unless-stopped
+    # Dev only — loopback bind (nginx proxies /api to the backend, so a LAN
+    # bind would re-expose it).  docker-compose.prod.yml overrides this.
     ports:
-      - "4201:80"
+      - "127.0.0.1:4201:80"
     depends_on:
       - backend
 

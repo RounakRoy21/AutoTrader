@@ -5,34 +5,9 @@ Pydantic schemas for trade records and scanner signals.
 from __future__ import annotations
 
 from datetime import date, time
-from enum import Enum
 from typing import Optional
 
 from pydantic import BaseModel, Field
-
-
-# ── Enums ──────────────────────────────────────────
-
-class Direction(str, Enum):
-    BUY = "BUY"
-    SELL = "SELL"
-
-
-class ProductType(str, Enum):
-    MIS = "MIS"
-    CNC = "CNC"
-
-
-class TradeStatus(str, Enum):
-    OPEN = "OPEN"
-    CLOSED = "CLOSED"
-
-
-class ExitReason(str, Enum):
-    TARGET_HIT = "TARGET_HIT"
-    STOP_LOSS_HIT = "STOP_LOSS_HIT"
-    MANUAL = "MANUAL"
-    EOD_CLOSE = "EOD_CLOSE"
 
 
 # ── Scanner Signal ─────────────────────────────────
@@ -55,28 +30,12 @@ class ScannerSignal(BaseModel):
     rsi_5m: Optional[float] = None    # higher timeframe RSI (5-minute candles)
 
 
-# ── Trade Request / Response ───────────────────────
-
-class TradeCreate(BaseModel):
-    """Schema for creating a new trade record after order confirmation."""
-    kite_order_id: Optional[str] = None
-    stock: str
-    exchange: str = "NSE"
-    direction: Direction
-    product_type: ProductType
-    quantity: int
-    entry_price: float
-    stop_loss_price: float
-    target_price: float
-    trade_date: date
-    entry_time: time
-    decision_rationale: Optional[str] = None
-
+# ── Trade Response ─────────────────────────────────
 
 class TradeResponse(BaseModel):
     """Schema for trade records returned by the API."""
     id: int
-    kite_order_id: Optional[str]
+    entry_order_id: Optional[str]
     stock: str
     exchange: str
     direction: str
@@ -96,10 +55,3 @@ class TradeResponse(BaseModel):
 
     class Config:
         from_attributes = True
-
-
-class TradeCloseRequest(BaseModel):
-    """Schema for closing a trade (exit)."""
-    exit_price: float
-    exit_reason: ExitReason
-    exit_time: time

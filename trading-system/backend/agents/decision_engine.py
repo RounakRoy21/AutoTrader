@@ -24,10 +24,19 @@ except ImportError:  # fallback until image rebuild includes orjson
 from sqlalchemy import func, select
 
 from core.config import get_settings
+from core.tick_size import ceil_to_tick, floor_to_tick, get_tick_size
 from core.nse_calendar import ist_today
 from core.database import get_db_context
-from core.redis_client import get_redis, get_value, increment, publish, set_value
-from core.redis_keys import DAILY_TRADE_COUNT_KEY, DECISION_FEED_KEY, HALT_KEY
+from core.redis_client import get_redis, get_value, get_value_strict, increment, publish, set_value
+from core.redis_keys import (
+    DAILY_TRADE_COUNT_KEY,
+    DECISION_FEED_KEY,
+    RISK_STATE_TTL_S,
+    consecutive_losses_key,
+    halt_key,
+    loss_pause_until_key,
+    stock_lock_key,
+)
 from integrations.anthropic_client import get_anthropic_client
 from integrations.groww_client import get_groww_client
 from integrations.instrument_service import get_token as _get_instrument_token
@@ -233,7 +242,7 @@ class DecisionEngine:
                 result = await session.execute(
                     select(func.count()).select_from(Trade).where(
                         Trade.trade_date == today,
-                        Trade.status == "OPEN",
+                        Trade.status.in_(["PENDING", "OPEN"]),
                     )
                 )
                 return result.scalar() or 0
@@ -342,12 +351,14 @@ class DecisionEngine:
         can apply the same hard rules even in paper mode.
         """
         from schemas.decision import ProductType as DecisionProductType
+        # SL floored / target ceiled to the exchange tick (audit R10).
+        tick = get_tick_size(signal.stock)
         if signal.atr and signal.atr > 0:
-            sl  = round(signal.ltp - signal.atr * self._settings.atr_sl_multiplier, 2)
-            tgt = round(signal.ltp + signal.atr * self._settings.atr_target_multiplier, 2)
+            sl  = floor_to_tick(signal.ltp - signal.atr * self._settings.atr_sl_multiplier, tick)
+            tgt = ceil_to_tick(signal.ltp + signal.atr * self._settings.atr_target_multiplier, tick)
         else:
-            sl  = round(signal.ltp * (1 - self._settings.stop_loss_pct), 2)
-            tgt = round(signal.ltp * (1 + self._settings.min_target_pct), 2)
+            sl  = floor_to_tick(signal.ltp * (1 - self._settings.stop_loss_pct), tick)
+            tgt = ceil_to_tick(signal.ltp * (1 + self._settings.min_target_pct), tick)
 
         # Compute SignalAudit from actual signal values
         vwap_dev = ((signal.ltp - signal.vwap) / signal.vwap * 100) if signal.vwap else 0.0
@@ -422,20 +433,32 @@ class DecisionEngine:
         lock_val: Optional[str] = None
         consec_str: Optional[str] = None
         trade_count_str: Optional[str] = None
+        # Risk-state keys are date-scoped (audit R7 / C8) and read FAIL-CLOSED:
+        # if neither the pipeline nor strict sequential reads succeed, the
+        # signal is rejected as if trading were halted.
+        _halt_k = halt_key()
+        _lock_k = stock_lock_key(signal.stock)
+        _consec_k = consecutive_losses_key()
         try:
             _r = await get_redis()
             async with _r.pipeline(transaction=False) as _pipe:
-                _pipe.get(HALT_KEY)
-                _pipe.get(f"stock_lock:{signal.stock}")
-                _pipe.get("consecutive_losses")
+                _pipe.get(_halt_k)
+                _pipe.get(_lock_k)
+                _pipe.get(_consec_k)
                 _pipe.get(TRADE_COUNT_KEY)
                 halt, lock_val, consec_str, trade_count_str = await _pipe.execute()
         except Exception as _exc:
             logger.warning("[DecisionEngine] Redis pipeline failed, using sequential reads: %s", _exc)
-            halt = await get_value(HALT_KEY)
-            lock_val = await get_value(f"stock_lock:{signal.stock}")
-            consec_str = await get_value("consecutive_losses")
-            trade_count_str = await get_value(TRADE_COUNT_KEY)
+            try:
+                halt = await get_value_strict(_halt_k)
+                lock_val = await get_value_strict(_lock_k)
+                consec_str = await get_value_strict(_consec_k)
+                trade_count_str = await get_value_strict(TRADE_COUNT_KEY)
+            except Exception as _strict_exc:
+                logger.error(
+                    "[DecisionEngine] Risk state unreadable (%s) — failing CLOSED", _strict_exc,
+                )
+                return False, "Risk state unreadable (Redis) — treated as halted", signal
         _t7_end = time.perf_counter_ns()
         logger.log(_PERF, "[PERF T7] pre-check Redis pipeline: %.0f μs",
                    (_t7_end - _t7_start) / 1_000)
@@ -451,7 +474,11 @@ class DecisionEngine:
         # Check consecutive loss pause
         consec_count = int(consec_str) if consec_str else 0
         if consec_count >= self._settings.consecutive_loss_pause_threshold:
-            pause_until_str = await get_value("consecutive_loss_pause_until")  # rare path
+            try:
+                pause_until_str = await get_value_strict(loss_pause_until_key())  # rare path
+            except Exception as _pause_exc:
+                logger.error("[DecisionEngine] Loss-pause state unreadable (%s) — failing CLOSED", _pause_exc)
+                return False, "Loss-pause state unreadable (Redis) — treated as paused", signal
             if pause_until_str:
                 try:
                     pause_until = datetime.fromisoformat(pause_until_str)
@@ -459,7 +486,7 @@ class DecisionEngine:
                         remaining = int((pause_until - now_ist).total_seconds() / 60)
                         return False, f"Paused: {consec_count} consecutive losses — {remaining} min left", signal
                     else:
-                        await set_value("consecutive_losses", "0")
+                        await set_value(consecutive_losses_key(), "0", ttl=RISK_STATE_TTL_S)
                 except (ValueError, TypeError):
                     pass
 
@@ -554,7 +581,7 @@ class DecisionEngine:
                     select(func.count()).select_from(Trade).where(
                         Trade.stock == signal.stock,
                         Trade.trade_date == ist_today(),
-                        Trade.status.in_(["OPEN", "CLOSING"]),
+                        Trade.status.in_(["PENDING", "OPEN", "CLOSING"]),
                     )
                 )
                 if (dup_result.scalar() or 0) > 0:
@@ -571,6 +598,7 @@ class DecisionEngine:
                     select(func.count()).select_from(Trade).where(
                         Trade.stock == signal.stock,
                         Trade.trade_date == ist_today(),
+                        Trade.status != "REJECTED",
                     )
                 )
                 sym_count = sym_result.scalar() or 0
@@ -721,16 +749,6 @@ class DecisionEngine:
                 return _orjson.dumps(obj).decode()
             return json.dumps(obj, default=str)
 
-        sl_rule = (
-            f"ATR-based: entry − ATR({signal.atr:.2f}) × {self._settings.atr_sl_multiplier}"
-            if signal.atr and signal.atr > 0
-            else "0.8% below entry price"
-        )
-        tgt_rule = (
-            f"ATR-based: entry + ATR({signal.atr:.2f}) × {self._settings.atr_target_multiplier}"
-            if signal.atr and signal.atr > 0
-            else "1.6% above entry price (min 1:2 risk-reward)"
-        )
         # Highlight if this stock has upcoming earnings in the brief
         earnings_alert = ""
         if self._market_brief and self._market_brief.earnings_drift_candidates:
@@ -807,20 +825,35 @@ class DecisionEngine:
         settings = self._settings
         audit = decision.signal_audit
 
+        # ── Step 0: product type is ALWAYS MIS (audit R11) ──────────────────
+        # This system is intraday-only: a CNC/DELIVERY buy would skip the 15:00
+        # square-off and drop out of monitoring the next day.  The schema only
+        # allows MIS, but model_copy()/construct() bypass validators, so force it.
+        from schemas.decision import ProductType as DecisionProductType
+        if getattr(decision.product_type, "value", decision.product_type) != DecisionProductType.MIS.value:
+            logger.warning(
+                "Decision for %s had product_type=%s — forced to MIS",
+                signal.stock, decision.product_type,
+            )
+        decision = decision.model_copy(update={"product_type": DecisionProductType.MIS})
+
         # ── Step 1: SL / target / qty — always compute from signal ──────────
         # stop_loss_price / target_price default to 0.0 when the LLM omits them;
         # we always recompute from ATR (or % fallback) so the values are correct
         # regardless of what the LLM returned.
+        # SL floored / target ceiled to the exchange tick (audit R10) so the
+        # stored levels match what is sent to the broker.
+        tick = get_tick_size(signal.stock)
         if signal.atr and signal.atr > 0:
-            min_sl = round(signal.ltp - signal.atr * settings.atr_sl_multiplier, 2)
+            min_sl = floor_to_tick(signal.ltp - signal.atr * settings.atr_sl_multiplier, tick)
         else:
-            min_sl = round(signal.ltp * (1 - settings.stop_loss_pct), 2)
+            min_sl = floor_to_tick(signal.ltp * (1 - settings.stop_loss_pct), tick)
         decision = decision.model_copy(update={"stop_loss_price": min_sl})
 
         if signal.atr and signal.atr > 0:
-            min_target = round(signal.ltp + signal.atr * settings.atr_target_multiplier, 2)
+            min_target = ceil_to_tick(signal.ltp + signal.atr * settings.atr_target_multiplier, tick)
         else:
-            min_target = round(signal.ltp * (1 + settings.min_target_pct), 2)
+            min_target = ceil_to_tick(signal.ltp * (1 + settings.min_target_pct), tick)
         decision = decision.model_copy(update={"target_price": min_target})
 
         if decision.decision != Decision.REJECT and decision.adjusted_qty < 1:

@@ -1,4 +1,4 @@
-"""Regression tests for the GrowwFeed -> KiteTicker adapter.
+"""Regression tests for the GrowwFeed ticker adapter.
 
 These tests target scanner crash paths that are hard to catch via pure indicator tests:
 - callback payload parsing
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional
 
-from integrations.groww_client import _GrowwFeedKiteTicker
+from integrations.groww_client import _GrowwFeedTicker
 from integrations.instrument_service import NIFTY50_TOKEN
 
 
@@ -45,7 +45,7 @@ class _FakeFeed:
 
 def test_stock_callback_uses_inline_ltp_without_snapshot_lookup():
     feed = _FakeFeed()
-    ticker = _GrowwFeedKiteTicker(feed=feed)
+    ticker = _GrowwFeedTicker(feed=feed)
 
     seen_ticks: List[Dict[str, Any]] = []
 
@@ -80,7 +80,7 @@ def test_stock_callback_uses_inline_ltp_without_snapshot_lookup():
 
 def test_stock_callback_snapshot_failure_does_not_crash_connect():
     feed = _FakeFeed()
-    ticker = _GrowwFeedKiteTicker(feed=feed)
+    ticker = _GrowwFeedTicker(feed=feed)
 
     seen_ticks: List[Dict[str, Any]] = []
 
@@ -115,7 +115,7 @@ def test_stock_callback_snapshot_failure_does_not_crash_connect():
 
 def test_index_callback_emits_nifty_tick_from_inline_value():
     feed = _FakeFeed()
-    ticker = _GrowwFeedKiteTicker(feed=feed)
+    ticker = _GrowwFeedTicker(feed=feed)
 
     seen_ticks: List[Dict[str, Any]] = []
 

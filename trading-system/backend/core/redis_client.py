@@ -49,6 +49,9 @@ async def get_redis() -> aioredis.Redis:
     try:
         _redis = aioredis.from_url(
             settings.redis_url,
+            # Only applied when REDIS_URL has no password of its own
+            # (URL credentials take precedence in redis-py's from_url).
+            password=settings.redis_password or None,
             decode_responses=True,
             socket_connect_timeout=5,
             retry_on_timeout=True,
@@ -126,6 +129,17 @@ async def get_value(key: str) -> Optional[str]:
     except Exception as exc:
         logger.error("Redis GET failed for %s: %s", key, exc)
         return None
+
+
+async def get_value_strict(key: str) -> Optional[str]:
+    """Get a value from Redis, RAISING on any Redis error.
+
+    Safety gates (halt / lock / pause) must use this so an unreadable state
+    can be treated as HALTED instead of "not set" (audit C8: fail closed).
+    ``None`` therefore always means "the key genuinely does not exist".
+    """
+    r = await get_redis()
+    return await r.get(key)
 
 
 async def set_value(key: str, value: str, ttl: Optional[int] = None) -> None:

@@ -20,8 +20,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from core.config import get_settings
-from core.database import check_db_health, dispose_engine, get_engine, Base, get_db_context
-from core.redis_client import check_redis_health, close_redis, get_redis, get_value, set_value, publish
+from core.database import check_db_health, dispose_engine, get_db_context
+from core.redis_client import close_redis, get_redis, get_value, set_value, publish
 from core.redis_keys import (
     GROWW_TOKEN_KEY,
     RESEARCH_LAST_RUN_COMPLETED_KEY,
@@ -30,6 +30,7 @@ from core.redis_keys import (
     RISK_STATUS_KEY,
     DAILY_TRADE_COUNT_KEY,
 )
+from core.security import SecretRedactingFilter, enforce_live_mode_api_key, redact_secrets
 from core.scheduler import (
     schedule_cron,
     schedule_monthly,
@@ -61,6 +62,14 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
+# Mask configured secrets (TOTP secret, API keys, bot token, passwords) in every
+# record that reaches the root handler — catch-all for exception messages that
+# embed credentials (audit R1 / cluster D).
+for _h in logging.getLogger().handlers:
+    _h.addFilter(SecretRedactingFilter())
+# httpx logs every request URL at INFO; the Telegram URL embeds the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("autotrader")
 
 
@@ -71,6 +80,11 @@ logger = logging.getLogger("autotrader")
 async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle for the FastAPI application."""
     logger.info("═══ AutoTrader starting up ═══")
+
+    # 0. Live-mode safety: refuse to boot with PAPER_TRADING=false and an empty
+    #    or placeholder ADMIN_API_KEY (audit R1).  Raising here aborts the
+    #    lifespan, so uvicorn exits instead of serving an open live-order API.
+    enforce_live_mode_api_key(settings)
 
     _IST = pytz.timezone("Asia/Kolkata")
 
@@ -210,12 +224,13 @@ async def lifespan(app: FastAPI):
             logger.info("✅ Groww auto-authenticated on startup")
             await _alert("success", "Groww authenticated — fresh session token stored")
         except Exception as _auth_exc:
+            _safe_exc = redact_secrets(_auth_exc)
             logger.error(
                 "❌ Groww auto-authentication failed: %s — "
                 "Scanner cannot connect GrowwFeed; call POST /api/auth/groww/login",
-                _auth_exc,
+                _safe_exc,
             )
-            await _alert("error", f"Groww auto-authentication failed: {_auth_exc}")
+            await _alert("error", f"Groww auto-authentication failed: {_safe_exc}")
 
     # 4. Load instrument token map (Groww API → Redis → hardcoded fallback)
     try:

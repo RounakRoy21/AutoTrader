@@ -9,21 +9,31 @@ daily loss limits, and handles intraday square-off at 3:00 PM IST.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import threading
 import time
-from datetime import date, datetime, time as dt_time, timedelta
+from datetime import datetime, time as dt_time, timedelta
 from typing import Dict, List, Optional
 
 import pytz
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 from core.nse_calendar import ist_today
 
 from core.config import get_settings
 from core.database import get_db_context
+from core.tick_size import get_tick_size
 from core.redis_client import get_value, publish, set_value
-from core.redis_keys import HALT_KEY
+from core.redis_keys import (
+    RISK_STATE_TTL_S,
+    consecutive_losses_key,
+    halt_key,
+    loss_pause_until_key,
+    stock_lock_key,
+)
+from core.risk_state import set_halt
+from integrations.broker import get_broker
 from integrations.groww_client import get_groww_client
 from integrations import ltp_store
 from integrations.telegram_client import (
@@ -38,6 +48,9 @@ from integrations.telegram_client import (
 from models.daily_pnl import DailyPnl
 from models.trade import Trade
 
+from . import exit_policy, order_lifecycle
+from .position_service import PositionDeps, PositionService, stop_exit_reason
+
 logger = logging.getLogger(__name__)
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -45,8 +58,55 @@ POLL_INTERVAL = 5  # seconds
 
 # Intraday close times
 MIS_CLOSE_START = dt_time(15, 0)   # 3:00 PM IST
-MIS_FORCE_CLOSE = dt_time(15, 20)  # 3:20 PM IST
+MIS_FORCE_CLOSE = dt_time(15, 20)  # 3:20 PM IST — escalation for anything still open
 EOD_REPORT_TIME = dt_time(15, 30)  # 3:30 PM IST
+
+# A CLOSING row (exit SELL state unknown / crash mid-exit) is re-checked against
+# the broker once it has been CLOSING this long (audit R9).  After
+# MIS_FORCE_CLOSE it is re-checked on every poll.
+CLOSING_RECHECK_AFTER_S = 30.0
+# Wall-clock budget for one poll before the run loop logs it as overrunning.
+# The in-flight poll is never cancelled (that could interrupt an exit between
+# the SELL and its DB write); overlapping polls are prevented instead.
+POLL_TIMEOUT_S = 30.0
+# Consecutive skipped cycles (previous poll still running) before a critical
+# "risk monitoring stalled" alert: 6 × POLL_INTERVAL ≈ 30 s.
+POLL_STUCK_ALERT_CYCLES = 6
+
+
+async def record_close_outcome(stock: str, net_pnl: float, settings, now_ist: datetime) -> None:
+    """Update today's per-stock lock and consecutive-loss streak after a close.
+
+    Audit R14: driven by the SIGN of the trade's net realised P&L, never by the
+    exit reason — a profitable trailing / breakeven exit is a win, a losing
+    manual or EOD exit is a loss.
+
+      * net < 0  → lock the stock for the rest of the day (if enabled) and
+                   advance the streak; pause new entries at the threshold.
+      * net > 0  → reset the streak.
+      * net == 0 → neutral.
+
+    All keys are date-scoped (audit R7 / C8) so they survive restarts and lapse
+    on the next trading day.
+    """
+    if net_pnl < 0:
+        if getattr(settings, "stock_lock_after_sl", False):
+            await set_value(stock_lock_key(stock), "TRUE", ttl=RISK_STATE_TTL_S)
+            logger.info("Stock locked for today after a net loss: %s", stock)
+        try:
+            count = int(await get_value(consecutive_losses_key()) or "0") + 1
+        except (TypeError, ValueError):
+            count = 1
+        await set_value(consecutive_losses_key(), str(count), ttl=RISK_STATE_TTL_S)
+        if count >= settings.consecutive_loss_pause_threshold:
+            pause_until = now_ist + timedelta(minutes=settings.consecutive_loss_pause_minutes)
+            await set_value(loss_pause_until_key(), pause_until.isoformat(), ttl=RISK_STATE_TTL_S)
+            logger.warning(
+                "%d consecutive losses — trading paused until %s",
+                count, pause_until.strftime("%H:%M"),
+            )
+    elif net_pnl > 0:
+        await set_value(consecutive_losses_key(), "0", ttl=RISK_STATE_TTL_S)
 
 
 def _transaction_costs(entry_price: float, exit_price: float, qty: int, product_type: str) -> float:
@@ -118,6 +178,19 @@ class RiskManager:
         self._eod_reported_today = False
         self._intraday_close_initiated = False
         self._drawdown_soft_alerted = False
+        # Consecutive unusable-LTP counter per symbol (audit R2) and the set of
+        # symbols already alerted for the current miss streak.
+        self._ltp_miss_counts: Dict[str, int] = {}
+        self._ltp_miss_alerted: set = set()
+        # Single-flight guard (audit R6 / C4): only one poll may run at a time.
+        self._poll_in_flight = False
+        self._poll_future = None
+        self._poll_skips = 0
+        # CLOSING reconciliation (audit R9): first time each CLOSING trade id
+        # was seen (monotonic seconds) and the ids already alerted.
+        self._closing_seen: Dict[int, float] = {}
+        self._closing_alerted: set = set()
+        self._force_close_escalated = False
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         """Start the risk manager on a separate daemon thread."""
@@ -130,6 +203,14 @@ class RiskManager:
         self._eod_reported_today = now_time >= EOD_REPORT_TIME
         self._intraday_close_initiated = now_time >= MIS_CLOSE_START
         self._drawdown_soft_alerted = False
+        self._force_close_escalated = False
+        # A poll left hung by a previous session must not block this one forever.
+        prev = getattr(self, "_poll_future", None)
+        if prev is not None and not prev.done():
+            logger.error("Risk Manager restart: previous poll still hung — no longer waiting for it")
+        self._poll_in_flight = False
+        self._poll_future = None
+        self._poll_skips = 0
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="RiskManager")
         self._thread.start()
         # Publish status so the dashboard can show it
@@ -150,14 +231,69 @@ class RiskManager:
         logger.info("Risk Manager stopped")
 
     def _run_loop(self) -> None:
-        """Main polling loop — runs every POLL_INTERVAL seconds."""
+        """Main polling loop — runs every POLL_INTERVAL seconds.
+
+        Non-reentrant (audit R6 / C4): a poll that overruns ``POLL_TIMEOUT_S``
+        is NOT cancelled (cancelling could interrupt an exit between its SELL
+        and its DB write) and no new poll is submitted until it finishes.
+        ``_poll_once`` additionally refuses to start while one is in flight.
+        """
         while self._running:
             try:
-                future = asyncio.run_coroutine_threadsafe(self._poll(), self._loop)
-                future.result(timeout=30)
+                prev = self._poll_future
+                if prev is not None and not prev.done():
+                    self._poll_skips += 1
+                    logger.warning(
+                        "Risk Manager: previous poll still running — skipping this cycle (%d)",
+                        self._poll_skips,
+                    )
+                    if self._poll_skips == POLL_STUCK_ALERT_CYCLES:
+                        asyncio.run_coroutine_threadsafe(
+                            self._alert_poll_stuck(self._poll_skips * POLL_INTERVAL), self._loop,
+                        )
+                else:
+                    self._poll_skips = 0
+                    self._poll_future = asyncio.run_coroutine_threadsafe(self._poll_once(), self._loop)
+                    self._poll_future.result(timeout=POLL_TIMEOUT_S)
+            except concurrent.futures.TimeoutError:
+                logger.error(
+                    "Risk Manager poll exceeded %.0fs — left running; next poll waits for it",
+                    POLL_TIMEOUT_S,
+                )
             except Exception as exc:
                 logger.exception("Risk Manager poll error: %s", exc)
             time.sleep(POLL_INTERVAL)
+
+    async def _alert_poll_stuck(self, stalled_s: float) -> None:
+        """Critical alert: one poll has been running so long that SL / target /
+        square-off / drawdown monitoring is stalled."""
+        msg = (
+            f"Risk Manager poll STALLED for ~{stalled_s:.0f}s (a broker call is hanging). "
+            f"Client-side SL / target / square-off monitoring is NOT running — "
+            f"check open positions in Groww now."
+        )
+        logger.critical(msg)
+        try:
+            await publish("system_alerts", {
+                "type": "critical",
+                "message": msg,
+                "timestamp": datetime.now(IST).isoformat(),
+            })
+            await send_telegram(f"\U0001f6a8 {msg}")
+        except Exception as exc:
+            logger.warning("Poll-stalled alert failed: %s", exc)
+
+    async def _poll_once(self) -> bool:
+        """Run one poll unless another is already in flight.  Returns True if it ran."""
+        if self._poll_in_flight:
+            logger.warning("Risk Manager poll already in flight — overlapping poll skipped")
+            return False
+        self._poll_in_flight = True
+        try:
+            await self._poll()
+        finally:
+            self._poll_in_flight = False
+        return True
 
     def _paper_fallback_price(self, trade: Trade) -> float:
         """Read paper LTP from scanner tick store, falling back to entry price."""
@@ -170,12 +306,69 @@ class RiskManager:
             )
         return price
 
+    def _validate_broker_ltp(self, stock: str, price) -> Optional[float]:
+        """Return a usable broker LTP or None (audit R2).
+
+        Rejects missing / non-numeric / non-positive prices and prices more
+        than ``risk_ltp_sanity_band_pct`` away from the latest WebSocket tick
+        in ``ltp_store`` (when a tick is available).  A rejected price must
+        never drive an exit.
+        """
+        try:
+            ltp = float(price)
+        except (TypeError, ValueError):
+            return None
+        if ltp != ltp or ltp <= 0:
+            return None
+        band = getattr(self._settings, "risk_ltp_sanity_band_pct", 0.05)
+        try:
+            ws_tick = ltp_store.get_ltp(stock)
+        except Exception:
+            ws_tick = None
+        if ws_tick and ws_tick > 0 and band and abs(ltp - ws_tick) / ws_tick > band:
+            logger.warning(
+                "[RiskManager] Implausible LTP for %s: broker ₹%.2f vs WS tick ₹%.2f "
+                "(> %.1f%% apart) — ignored",
+                stock, ltp, ws_tick, band * 100,
+            )
+            return None
+        return ltp
+
+    def _record_ltp_ok(self, stock: str) -> None:
+        self._ltp_miss_counts.pop(stock, None)
+        self._ltp_miss_alerted.discard(stock)
+
+    async def _record_ltp_miss(self, stock: str) -> None:
+        """Count a skipped poll for *stock*; alert once after N consecutive misses."""
+        count = self._ltp_miss_counts.get(stock, 0) + 1
+        self._ltp_miss_counts[stock] = count
+        threshold = getattr(self._settings, "risk_ltp_miss_alert_threshold", 3)
+        if count >= threshold and stock not in self._ltp_miss_alerted:
+            self._ltp_miss_alerted.add(stock)
+            logger.error(
+                "[RiskManager] No usable LTP for %s for %d consecutive polls — "
+                "position NOT being monitored client-side (broker SL still resting)",
+                stock, count,
+            )
+            try:
+                await send_telegram(
+                    f"\u26a0\ufe0f No usable price for {stock} for {count} consecutive "
+                    f"risk polls — client-side SL/target checks are paused. "
+                    f"Check the position manually."
+                )
+            except Exception as exc:
+                logger.warning("LTP-miss Telegram alert failed: %s", exc)
+
     async def _build_ltp_map(self, open_trades: List[Trade]) -> Dict[str, float]:
         """Build symbol → LTP mapping for the current poll cycle.
 
         Live mode always uses broker LTP.
         Paper mode uses broker LTP when enabled and falls back per symbol to
         scanner ticks (or entry price when no tick is available).
+
+        Every broker price is validated (``_validate_broker_ltp``).  In live
+        mode a symbol without a usable price is left OUT of the map, so the
+        poll skips it instead of exiting on a bogus value (audit R2).
         """
         settings = self._settings
         use_broker = (not settings.paper_trading) or settings.paper_risk_use_broker_ltp
@@ -186,10 +379,12 @@ class RiskManager:
             try:
                 groww = get_groww_client()
                 instruments = [f"NSE:{t.stock}" for t in open_trades]
-                raw = await groww.get_ltp(instruments)
+                raw = await groww.get_ltp(instruments) or {}
             except Exception as exc:
                 if not settings.paper_trading:
                     logger.error("Failed to fetch LTP for risk check: %s", exc)
+                    for t in open_trades:
+                        await self._record_ltp_miss(t.stock)
                     raise
                 logger.warning(
                     "Paper broker LTP fetch failed for risk check: %s — falling back to scanner ticks",
@@ -198,17 +393,29 @@ class RiskManager:
 
         for trade in open_trades:
             key = f"NSE:{trade.stock}"
-            if key in raw and raw[key].get("last_price") is not None:
-                ltp_map[trade.stock] = raw[key]["last_price"]
+            ltp = None
+            if key in raw:
+                ltp = self._validate_broker_ltp(trade.stock, (raw[key] or {}).get("last_price"))
+            if ltp is not None:
+                ltp_map[trade.stock] = ltp
+                self._record_ltp_ok(trade.stock)
                 continue
 
             if settings.paper_trading:
-                ltp_map[trade.stock] = self._paper_fallback_price(trade)
+                fallback = self._paper_fallback_price(trade)
+                if fallback is not None and fallback > 0:
+                    ltp_map[trade.stock] = fallback
+                    continue
+
+            await self._record_ltp_miss(trade.stock)
 
         return ltp_map
 
     async def _get_trade_ltp(self, trade: Trade) -> Optional[float]:
-        """Get a single-trade LTP with the same source preference as main poll."""
+        """Get a single-trade LTP with the same source preference as main poll.
+
+        Returns None (never 0.0) when no usable price is available.
+        """
         settings = self._settings
         use_broker = (not settings.paper_trading) or settings.paper_risk_use_broker_ltp
 
@@ -216,7 +423,9 @@ class RiskManager:
             try:
                 groww = get_groww_client()
                 raw = await groww.get_ltp([f"NSE:{trade.stock}"])
-                ltp = raw.get(f"NSE:{trade.stock}", {}).get("last_price")
+                ltp = self._validate_broker_ltp(
+                    trade.stock, (raw or {}).get(f"NSE:{trade.stock}", {}).get("last_price")
+                )
                 if ltp is not None:
                     return ltp
             except Exception:
@@ -224,7 +433,8 @@ class RiskManager:
                 pass
 
         if settings.paper_trading:
-            return ltp_store.get_ltp(trade.stock)
+            price = ltp_store.get_ltp(trade.stock)
+            return price if price is not None and price > 0 else None
 
         return None
 
@@ -237,9 +447,16 @@ class RiskManager:
         if current_time < dt_time(9, 15) or current_time > dt_time(15, 35):
             return
 
-        # Fetch open positions from DB
-        open_trades = await self._get_open_trades()
-        if not open_trades:
+        # Fetch OPEN and CLOSING positions from DB.  CLOSING rows stay
+        # monitored (audit R9) and are reconciled against the broker below.
+        managed = await self._get_open_trades()
+        open_trades = [t for t in managed if getattr(t, "status", "OPEN") == "OPEN"]
+        closing_trades = [t for t in managed if getattr(t, "status", "OPEN") == "CLOSING"]
+        if not managed:
+            self._closing_seen.clear()
+            # Re-assert the drawdown halt even with no open positions so a
+            # restart can never let a new entry through first (audit C8).
+            await self._check_daily_drawdown({})
             # Check if it's EOD report time
             if current_time >= EOD_REPORT_TIME and not self._eod_reported_today:
                 await self._generate_eod_report()
@@ -249,32 +466,66 @@ class RiskManager:
         #   • Live mode   → Groww REST LTP (real market data)
         #   • Paper mode  → Groww REST LTP (optional), then tick-store fallback
         settings = self._settings
+        ltp_ok = True
         try:
-            ltp_map = await self._build_ltp_map(open_trades)
+            ltp_map = await self._build_ltp_map(managed)
         except Exception:
-            return
+            # No prices this cycle.  SL / target / trailing are skipped, but the
+            # MIS square-off and CLOSING reconciliation still run: a market
+            # exit does not need an LTP (audit R18).
+            ltp_map = {}
+            ltp_ok = False
+            if current_time < MIS_CLOSE_START and not closing_trades:
+                return
+
+        if closing_trades:
+            await self._reconcile_closing_trades(closing_trades, ltp_map, now_ist)
 
         for trade in open_trades:
-            if trade.stock not in ltp_map:
+            ltp = ltp_map.get(trade.stock)
+            square_off_due = exit_policy.square_off_due(trade, current_time)
+            # Never act on a missing / non-positive price (audit R2) — except
+            # the MIS square-off, which exits at market (audit R18).
+            if ltp is None or ltp <= 0:
+                if square_off_due:
+                    await self._square_off(trade, None, open_trades, ltp_map, now_ist)
                 continue
-            ltp = ltp_map[trade.stock]
 
             # ── Stop Loss Check ────────────────────
-            if ltp <= trade.stop_loss_price:
-                await self._close_position(trade, ltp, "STOP_LOSS_HIT")
-                loss = (trade.entry_price - ltp) * trade.quantity
-                await send_stop_loss_alert(
-                    trade.stock, ltp, loss,
-                    entry_price=trade.entry_price,
-                    entry_time=trade.entry_time,
-                    quantity=trade.quantity,
-                    paper=settings.paper_trading,
-                )
-                await publish("system_alerts", {
-                    "type": "danger",
-                    "message": f"Stop-loss hit: {trade.stock} @ ₹{ltp:.2f} | Loss: ₹{loss:.2f}",
-                    "timestamp": now_ist.isoformat(),
-                })
+            # The exit reason reflects how the stop was last moved (audit R14):
+            # STOP_LOSS_HIT (initial), TRAILING_SL or BREAKEVEN.
+            if exit_policy.stop_hit(trade, ltp):
+                sl_reason = stop_exit_reason(trade)
+                if not await self._close_position(trade, ltp, sl_reason):
+                    continue  # exit not confirmed — still managed / alerted
+                exit_reason = getattr(trade, "exit_reason", None) or sl_reason
+                ltp = getattr(trade, "exit_price", None) or ltp
+                move = (ltp - trade.entry_price) * trade.quantity
+                if exit_reason == "STOP_LOSS_HIT" or move < 0:
+                    loss = -move
+                    await send_stop_loss_alert(
+                        trade.stock, ltp, loss,
+                        entry_price=trade.entry_price,
+                        entry_time=trade.entry_time,
+                        quantity=trade.quantity,
+                        paper=settings.paper_trading,
+                    )
+                    await publish("system_alerts", {
+                        "type": "danger",
+                        "message": f"Stop-loss hit ({exit_reason}): {trade.stock} @ ₹{ltp:.2f} | Loss: ₹{loss:.2f}",
+                        "timestamp": now_ist.isoformat(),
+                    })
+                else:
+                    label = "Trailing stop" if exit_reason == "TRAILING_SL" else "Breakeven stop"
+                    await send_telegram(
+                        f"✅ {label} exit: {trade.stock} @ ₹{ltp:.2f} | P&L: ₹{move:.2f}"
+                        + (" (paper)" if settings.paper_trading else "")
+                    )
+                    await publish("system_alerts", {
+                        "type": "success",
+                        "message": f"{label} exit: {trade.stock} @ ₹{ltp:.2f} | P&L: ₹{move:.2f}",
+                        "timestamp": now_ist.isoformat(),
+                    })
                 continue
 
             # ── Partial Profit-Booking / Scale-Out ──
@@ -285,14 +536,10 @@ class RiskManager:
             # same cycle.  `_book_partial` reduces `trade.quantity` in place, so
             # every downstream rule (target, trailing, MTM, drawdown, final close)
             # automatically operates on the remainder.
-            if (
-                settings.partial_booking_enabled
-                and not trade.partial_booked
-                and trade.partial_target_price
-                and trade.quantity >= 2
-                and ltp >= trade.partial_target_price
-            ):
+            if exit_policy.partial_due(trade, ltp, settings):
                 await self._book_partial(trade, ltp)
+                if getattr(trade, "status", "OPEN") != "OPEN":
+                    continue  # the scale-out closed / parked the trade
 
             # ── ROI Decay (time-based target reduction) ──
             # Evaluated BEFORE target check so the reduced target takes effect
@@ -308,48 +555,33 @@ class RiskManager:
             #   > 35 min → 1.0 %  (captures most of the expected intraday move)
             #   > 50 min → 0.5 %  (late-move urgency; MIS force-close is at 15:00)
             if settings.roi_decay_enabled and trade.entry_time:
-                entry_dt = IST.localize(datetime.combine(trade.trade_date, trade.entry_time))
-                elapsed_min = (now_ist - entry_dt).total_seconds() / 60
-                if elapsed_min > 50:
-                    # ATR-based floor: max(0.5%, 0.4 × ATR_pct) so the decay target
-                    # never falls below the stock's typical noise level.
-                    # ATR is stored in Redis by trading_agent.py at order placement time.
-                    atr_floor_pct = 0.005   # 0.5% default
+                # ATR (stored at entry) only matters for the > 50 min floor.
+                atr_val = None
+                if exit_policy.minutes_in_trade(trade, now_ist) > 50:
                     try:
                         atr_str = await get_value(f"trade_atr:{trade.stock}")
-                        if atr_str:
-                            atr_val = float(atr_str)
-                            if atr_val > 0 and trade.entry_price > 0:
-                                atr_floor_pct = max(0.005, 0.4 * atr_val / trade.entry_price)
+                        atr_val = float(atr_str) if atr_str else None
                     except Exception:
-                        pass  # non-critical — fall back to 0.5% default
-                    decayed = round(trade.entry_price * (1 + atr_floor_pct), 2)
-                elif elapsed_min > 35:
-                    decayed = round(trade.entry_price * 1.010, 2)   # 1.0%
-                elif elapsed_min > 20:
-                    decayed = round(trade.entry_price * 1.015, 2)   # 1.5%
-                else:
-                    decayed = None
-                # Guard: never let the decayed target fall below or equal to
-                # the current stop-loss (which may have trailed upward).
-                # Without this, trailing SL + ROI decay can invert the
-                # SL/target corridor, trapping the position with no exit path.
-                if (
-                    decayed is not None
-                    and decayed < trade.target_price
-                    and decayed > trade.stop_loss_price
-                ):
+                        atr_val = None  # non-critical — 0.5% floor applies
+                decayed = exit_policy.roi_decay_target(
+                    trade, now_ist, atr_val, get_tick_size(trade.stock),
+                )
+                if decayed is not None:
                     old_tgt = trade.target_price
                     await self._update_target(trade, decayed)
                     logger.info(
                         "ROI decay: %s target ₹%.2f → ₹%.2f (%.0f min elapsed)",
-                        trade.stock, old_tgt, decayed, elapsed_min,
+                        trade.stock, old_tgt, decayed, exit_policy.minutes_in_trade(trade, now_ist),
                     )
 
             # ── Target Check ───────────────────────
             # Runs AFTER ROI decay so the possibly-reduced target is used.
-            if ltp >= trade.target_price:
-                await self._close_position(trade, ltp, "TARGET_HIT")
+            if exit_policy.target_hit(trade, ltp):
+                if not await self._close_position(trade, ltp, "TARGET_HIT"):
+                    continue  # exit not confirmed — still managed / alerted
+                if getattr(trade, "exit_reason", None) not in (None, "TARGET_HIT"):
+                    continue  # the broker stop had already executed instead
+                ltp = getattr(trade, "exit_price", None) or ltp
                 profit = (ltp - trade.entry_price) * trade.quantity
                 await send_target_hit_alert(
                     trade.stock, ltp, profit,
@@ -369,44 +601,264 @@ class RiskManager:
             # Once price moves above an activation threshold, trail the SL
             # upward with LTP to lock in profits.  The SL is only ever moved
             # *up*, never back down.
-            activation = trade.entry_price * (1 + settings.trailing_sl_activation_pct)
-            if ltp >= activation:
-                trailing_sl = round(ltp * (1 - settings.trailing_sl_trail_pct), 2)
-                if trailing_sl > trade.stop_loss_price:
-                    old_sl = trade.stop_loss_price
-                    await self._update_stop_loss(trade, trailing_sl)
-                    logger.info(
-                        "Trailing SL: %s ₹%.2f → ₹%.2f (LTP=₹%.2f)",
-                        trade.stock, old_sl, trailing_sl, ltp,
-                    )
+            trailing_sl = exit_policy.trailing_stop(trade, ltp, settings, get_tick_size(trade.stock))
+            if trailing_sl is not None:
+                old_sl = trade.stop_loss_price
+                await self._update_stop_loss(trade, trailing_sl, kind="TRAILING")
+                logger.info(
+                    "Trailing SL: %s ₹%.2f → ₹%.2f (LTP=₹%.2f)",
+                    trade.stock, old_sl, trailing_sl, ltp,
+                )
 
             # ── MIS Intraday Close (3:00 PM) ──────
-            if trade.product_type == "MIS" and current_time >= MIS_CLOSE_START:
-                if not self._intraday_close_initiated:
-                    mis_count = sum(1 for t in open_trades if t.product_type == "MIS")
-                    running_pnl = sum(
-                        (ltp_map.get(t.stock, t.entry_price) - t.entry_price) * t.quantity
-                        for t in open_trades
-                    )
-                    await send_intraday_close_alert(n_positions=mis_count, running_pnl=running_pnl, paper=settings.paper_trading)
-                    await publish("system_alerts", {
-                        "type": "warning",
-                        "message": "MIS square-off initiated — all intraday positions closing",
-                        "timestamp": now_ist.isoformat(),
-                    })
-                    self._intraday_close_initiated = True
-                await self._close_position(trade, ltp, "EOD_CLOSE")
+            # Retried on EVERY poll until the position is flat (audit R18): a
+            # failed / unfilled exit reverts the row to OPEN, so the next cycle
+            # lands here again.
+            if square_off_due:
+                await self._square_off(trade, ltp, open_trades, ltp_map, now_ist)
                 continue
 
+        # ── 15:20 escalation for anything still open / closing ──
+        if current_time >= MIS_FORCE_CLOSE:
+            await self._escalate_force_close(now_ist)
+
         # ── Daily Drawdown Halt ───────────────────
-        await self._check_daily_drawdown(ltp_map)
+        if ltp_ok:
+            await self._check_daily_drawdown(ltp_map)
 
         # ── EOD Report ────────────────────────────
         if current_time >= EOD_REPORT_TIME and not self._eod_reported_today:
             await self._generate_eod_report()
 
+    async def _square_off(
+        self,
+        trade: Trade,
+        ltp: Optional[float],
+        open_trades: List[Trade],
+        ltp_map: Dict[str, float],
+        now_ist: datetime,
+    ) -> bool:
+        """MIS square-off exit for one position (from 15:00, every poll until flat).
+
+        Does not need an LTP (audit R18): live exits are booked from the broker
+        fill; *ltp* is only the fallback booking estimate.
+        """
+        settings = self._settings
+        if not self._intraday_close_initiated:
+            mis_count = sum(1 for t in open_trades if t.product_type == "MIS")
+            running_pnl = sum(
+                (ltp_map.get(t.stock, t.entry_price) - t.entry_price) * t.quantity
+                for t in open_trades
+            )
+            await send_intraday_close_alert(n_positions=mis_count, running_pnl=running_pnl, paper=settings.paper_trading)
+            await publish("system_alerts", {
+                "type": "warning",
+                "message": "MIS square-off initiated — all intraday positions closing",
+                "timestamp": now_ist.isoformat(),
+            })
+            self._intraday_close_initiated = True
+        estimate = ltp
+        if estimate is None or estimate <= 0:
+            estimate = (
+                self._paper_fallback_price(trade) if settings.paper_trading else trade.entry_price
+            )
+            logger.warning(
+                "MIS square-off for %s without a usable LTP — exiting at market anyway", trade.stock,
+            )
+        return await self._close_position(trade, estimate, "EOD_CLOSE")
+
+    async def _escalate_force_close(self, now_ist: datetime) -> None:
+        """At/after MIS_FORCE_CLOSE (15:20): loudly escalate anything still not flat.
+
+        The square-off and CLOSING reconciliation keep retrying every poll; this
+        makes sure a human knows before the broker's own auto-square-off.
+        """
+        if self._force_close_escalated:
+            return
+        remaining = await self._get_open_trades()
+        if not remaining:
+            return
+        self._force_close_escalated = True
+        names = [f"{t.stock}#{t.id}({getattr(t, 'status', 'OPEN')})" for t in remaining]
+        msg = (
+            f"{len(remaining)} position(s) still not flat at "
+            f"{MIS_FORCE_CLOSE.strftime('%H:%M')}: {names}. Exits are being retried every poll — "
+            f"CHECK GROWW NOW before the broker auto-square-off."
+        )
+        logger.critical("MIS force-close escalation: %s", msg)
+        try:
+            await publish("system_alerts", {
+                "type": "critical",
+                "message": msg,
+                "timestamp": now_ist.isoformat(),
+            })
+            await send_telegram(f"\U0001f6a8 {msg}")
+        except Exception as exc:
+            logger.warning("Force-close escalation alert failed: %s", exc)
+
+    # ── CLOSING reconciliation (audit R9) ─────────────────────────────────────
+
+    async def _reconcile_closing_trades(
+        self, closing: List[Trade], ltp_map: Dict[str, float], now_ist: datetime,
+    ) -> None:
+        """Re-check CLOSING rows against the broker instead of abandoning them."""
+        live_ids = {t.id for t in closing}
+        for tid in list(self._closing_seen):
+            if tid not in live_ids:
+                self._closing_seen.pop(tid, None)
+                self._closing_alerted.discard(tid)
+        now_mono = time.monotonic()
+        escalate = now_ist.time() >= MIS_FORCE_CLOSE
+        for trade in closing:
+            first = self._closing_seen.setdefault(trade.id, now_mono)
+            if order_lifecycle.is_exit_in_flight(trade.id):
+                # Another closer (manual-close API / this manager) still owns
+                # the exit — even after 15:20 it must not be second-guessed.
+                self._closing_seen[trade.id] = now_mono
+                continue
+            if not escalate and now_mono - first < CLOSING_RECHECK_AFTER_S:
+                continue
+            try:
+                await self._reconcile_closing(trade, ltp_map.get(trade.stock), now_ist)
+            except Exception as exc:
+                logger.error("CLOSING reconciliation failed for %s: %s", trade.stock, exc)
+
+    async def _alert_closing_once(self, trade: Trade, detail: str, critical: bool = True) -> None:
+        if trade.id in self._closing_alerted:
+            return
+        self._closing_alerted.add(trade.id)
+        await self._alert_exit_problem(trade, "CLOSING", detail, critical=critical)
+
+    async def _reconcile_closing(
+        self, trade: Trade, ltp: Optional[float], now_ist: datetime,
+    ) -> None:
+        """Resolve one CLOSING row against the broker (paper: the PaperBroker).
+
+        * Broker still holds shares and no SELL is working: the exit never
+          executed — re-place the stop and return the row to OPEN (the normal
+          exit logic retries it).  A SELL still working → wait.
+        * Broker flat: the exit DID execute — book it from the broker fill
+          (resting-stop fill, else the order book's last SELL fill, else an LTP
+          estimate flagged for verification).  Never booked at entry / zero P&L.
+        """
+        groww = get_broker(self._settings)
+        held = await order_lifecycle.broker_net_qty(groww, trade.stock)
+        if held is None:
+            await self._alert_closing_once(
+                trade, "broker positions unreadable — CLOSING row not reconciled yet (retrying)",
+            )
+            return
+
+        if held > 0:
+            own_sl = getattr(trade, "sl_order_id", None)
+            pending = await order_lifecycle.has_pending_sell(
+                groww, trade.stock, exclude_order_id=own_sl,
+            )
+            if pending is None or pending:
+                await self._alert_closing_once(
+                    trade,
+                    "broker still holds shares and an exit SELL is still working (or the order "
+                    "book is unreadable) — waiting before any retry",
+                )
+                return
+            if own_sl and not order_lifecycle.is_unresolved_stop(own_sl):
+                own = await order_lifecycle.read_order(groww, str(own_sl))
+                if own is None:
+                    await self._alert_closing_once(
+                        trade, "the row's broker stop state is unreadable — waiting before any retry",
+                    )
+                    return
+                if not own.terminal:
+                    # Crash between the CLOSING claim and the stop release: the
+                    # original stop still protects the shares — keep it.
+                    await self._revert_to_open(trade)
+                    self._closing_seen.pop(trade.id, None)
+                    self._closing_alerted.discard(trade.id)
+                    await self._alert_exit_problem(
+                        trade, "CLOSING",
+                        f"exit did NOT execute at the broker ({held} still held) — position back "
+                        f"to OPEN under its resting broker stop; exit will be retried",
+                    )
+                    return
+            # Release whatever the row still points at (a terminal stop, or an
+            # ambiguous ``ref:`` placement) before placing a fresh one, so the
+            # broker never holds two stops for the same shares.
+            release = await order_lifecycle.release_stop(groww, trade)
+            if release.outcome == "UNCONFIRMED":
+                await self._alert_closing_once(
+                    trade, "the row's broker stop could not be confirmed cancelled — waiting",
+                )
+                return
+            if release.filled_qty:
+                after = await order_lifecycle.broker_net_qty(groww, trade.stock)
+                held = after if after is not None else max(0, held - int(release.filled_qty))
+        if held > 0:
+            qty = min(int(trade.quantity), int(held))
+            sl_id = await order_lifecycle.place_stop(
+                groww, trade.stock, getattr(trade, "exchange", None) or "NSE", qty, trade.stop_loss_price,
+            )
+            await self._revert_to_open(trade, sl_order_id=sl_id)
+            self._closing_seen.pop(trade.id, None)
+            self._closing_alerted.discard(trade.id)
+            stop_ok = bool(sl_id) and not order_lifecycle.is_unresolved_stop(sl_id)
+            await self._alert_exit_problem(
+                trade, "CLOSING",
+                f"exit did NOT execute at the broker ({held} still held) — position back to OPEN"
+                + (" with a fresh broker stop; exit will be retried" if stop_ok else
+                   " with NO confirmed broker stop — exit will be retried"),
+                critical=not stop_ok,
+            )
+            return
+
+        if held < 0:
+            await set_halt(f"net short {held} in {trade.stock} found while reconciling a CLOSING row")
+            await self._alert_exit_problem(
+                trade, "CLOSING",
+                f"broker shows a NET SHORT of {held} — trading HALTED, flatten manually",
+                critical=True,
+            )
+
+        # Flat at the broker: the exit executed.  Cancel any stale resting stop
+        # (if it EXECUTED, its fill is the exit).
+        release = await order_lifecycle.release_stop(groww, trade)
+        if release.outcome == "UNCONFIRMED":
+            await self._alert_closing_once(
+                trade, "flat at the broker but the resting stop's state is unconfirmed — not booked yet",
+            )
+            return
+        price: Optional[float] = None
+        reason = "RECONCILED"
+        source = "broker order book"
+        if release.outcome == "EXECUTED" and release.average_price:
+            price = float(release.average_price)
+            reason = stop_exit_reason(trade)
+            source = "broker stop fill"
+        if price is None:
+            price = await order_lifecycle.last_sell_fill_price(groww, trade.stock)
+        estimated = False
+        if price is None and ltp:
+            price, estimated, source = float(ltp), True, "LTP ESTIMATE"
+        if price is None:
+            await self._alert_closing_once(
+                trade, "flat at the broker but no fill price is available — left CLOSING for manual booking",
+            )
+            return
+
+        if await self._finalise_close(trade, price, reason, int(trade.quantity), now_ist):
+            self._closing_seen.pop(trade.id, None)
+            self._closing_alerted.discard(trade.id)
+            await self._alert_exit_problem(
+                trade, "CLOSING",
+                f"reconciled from {source}: booked CLOSED @ ₹{price:.2f} ({reason})"
+                + (" — P&L ESTIMATED, verify against the Groww trade book" if estimated else ""),
+                critical=estimated,
+            )
+
     async def _get_open_trades(self) -> List[Trade]:
-        """Fetch all OPEN trades for today from the database.
+        """Fetch today's OPEN and CLOSING trades from the database.
+
+        CLOSING rows are included so they stay monitored until the broker
+        confirms the exit (audit R9); callers split them by ``status``.
 
         Scoped to today to prevent cross-session unrealised MTM from stale
         paper trades (status=OPEN, trade_date<today) triggering a false
@@ -415,366 +867,74 @@ class RiskManager:
         today = ist_today()
         async with get_db_context() as session:
             result = await session.execute(
-                select(Trade).where(Trade.status == "OPEN", Trade.trade_date == today)
+                select(Trade).where(
+                    Trade.status.in_(["OPEN", "CLOSING"]),
+                    Trade.trade_date == today,
+                )
             )
             return list(result.scalars().all())
 
-    async def _close_position(self, trade: Trade, exit_price: float, reason: str) -> None:
-        """Close a position: mark CLOSING in DB, place sell order, then mark CLOSED.
+    # ── Position state changes: all owned by PositionService ────────────────
 
-        The two-phase DB update prevents double-sell: if the process crashes after
-        SELL but before the final CLOSED update, the position stays ``CLOSING`` and
-        will be retried — but the Risk Manager only picks up ``OPEN`` positions, so
-        a reconciliation job should handle orphaned ``CLOSING`` rows at EOD.
-        """
-        now_ist = datetime.now(IST)
-        settings = self._settings
+    def _positions(self) -> PositionService:
+        """PositionService wired to this module's IO (resolved per call)."""
+        return PositionService(self._settings, PositionDeps(
+            db_context=get_db_context,
+            broker=lambda: get_broker(self._settings),
+            publish=publish,
+            notify=send_telegram,
+            costs=_transaction_costs,
+            record_outcome=record_close_outcome,
+        ))
 
-        # Phase 1 — Atomically mark CLOSING so no other poll cycle picks this up
-        async with get_db_context() as session:
-            await session.execute(
-                update(Trade)
-                .where(Trade.id == trade.id, Trade.status == "OPEN")
-                .values(status="CLOSING")
-            )
+    async def _close_position(
+        self,
+        trade: Trade,
+        exit_price: float,
+        reason: str,
+        exit_result: Optional[order_lifecycle.ExitResult] = None,
+    ) -> bool:
+        """Close a position (see ``PositionService.close``).  True only when
+        the trade was finalised CLOSED."""
+        return bool(await self._positions().close(trade, exit_price, reason, exit_result))
 
-        # Phase 1b — Cancel GTT stop-loss order (live mode only)
-        # Must cancel BEFORE placing the sell to avoid the GTT firing in
-        # the window between sell and cancellation, which would double-sell.
-        if not settings.paper_trading and getattr(trade, "gtt_trigger_id", None):
-            try:
-                groww = get_groww_client()
-                await groww.delete_gtt(trade.gtt_trigger_id)
-                logger.info("Cancelled GTT trigger_id=%s for %s", trade.gtt_trigger_id, trade.stock)
-            except Exception as gtt_exc:
-                # Non-fatal: GTT may have already been triggered or expired
-                logger.warning(
-                    "Could not cancel GTT trigger_id=%s for %s: %s",
-                    trade.gtt_trigger_id, trade.stock, gtt_exc,
-                )
-
-        # Phase 2 — Place sell order via Groww
-        try:
-            if not settings.paper_trading:
-                groww = get_groww_client()
-                await groww.place_order(
-                    tradingsymbol=trade.stock,
-                    transaction_type="SELL",
-                    quantity=trade.quantity,
-                    product=trade.product_type,
-                    order_type="MARKET",
-                )
-        except Exception as exc:
-            logger.error("Failed to place SELL for %s: %s — keeping CLOSING (manual review needed)", trade.stock, exc)
-            # Do NOT revert to OPEN — the sell may have been sent but the
-            # response timed out.  Reverting would cause a double-sell on the
-            # next poll cycle.  Leave as CLOSING; EOD reconciliation or
-            # manual intervention will handle it.
-            return
-
-        # Phase 3 — Calculate net P&L (gross less transaction costs) and finalise as CLOSED
-        # `booked_pnl` carries the net realised P&L of any earlier partial scale-out
-        # leg(s); fold it in so realized_pnl reflects the entire entry/exit cycle.
-        gross_pnl = (exit_price - trade.entry_price) * trade.quantity
-        costs = _transaction_costs(trade.entry_price, exit_price, trade.quantity, trade.product_type)
-        booked = getattr(trade, "booked_pnl", 0.0) or 0.0
-        pnl = round(gross_pnl - costs + booked, 2)
-
-        async with get_db_context() as session:
-            await session.execute(
-                update(Trade)
-                .where(Trade.id == trade.id)
-                .values(
-                    exit_price=exit_price,
-                    exit_reason=reason,
-                    exit_time=now_ist.time(),
-                    realized_pnl=pnl,
-                    status="CLOSED",
-                )
-            )
-
-        logger.info(
-            "%s: %s @ ₹%.2f → gross P&L: ₹%.2f | costs: ₹%.2f | booked: ₹%.2f | net P&L: ₹%.2f",
-            reason, trade.stock, exit_price, gross_pnl, costs, booked, pnl,
-        )
-
-        # Publish event to Redis
-        await publish("trade_events", {
-            "type": "TRADE_CLOSED",
-            "stock": trade.stock,
-            "exit_price": exit_price,
-            "exit_reason": reason,
-            "pnl": pnl,
-            "timestamp": now_ist.isoformat(),
-        })
-
-        # ── Per-stock lock after SL hit ────────────
-        # TTL of 28800s (8h) ensures the lock always expires before the next
-        # market open (earliest SL=9:15am + 8h = 5:15pm; next open=9:15am).
-        if reason == "STOP_LOSS_HIT" and settings.stock_lock_after_sl:
-            await set_value(f"stock_lock:{trade.stock}", "TRUE", ttl=28800)
-            logger.info("Stock locked after SL: %s (expires in 8h)", trade.stock)
-
-        # ── Consecutive loss tracking ──────────────
-        # Only SL hits advance the streak; target hits reset it.
-        # EOD_CLOSE and other exits are neutral — they neither advance nor
-        # reset the streak, so a morning SL run isn't artificially extended
-        # by forced EOD exits.
-        if reason == "STOP_LOSS_HIT":
-            count = 0
-            try:
-                count_str = await get_value("consecutive_losses") or "0"
-                count = int(count_str) + 1
-                await set_value("consecutive_losses", str(count))
-            except Exception as redis_exc:
-                logger.warning(
-                    "Redis unavailable for consecutive loss tracking: %s — falling back to DB count",
-                    redis_exc,
-                )
-                # B-5: Count today's SL-hit trades from DB as a conservative approximation
-                # of the consecutive streak.  This may overcount if there were target hits
-                # interleaved today, but it is safer to pause too early than to miss a needed
-                # pause when Redis is degraded.
-                try:
-                    async with get_db_context() as session:
-                        result = await session.execute(
-                            select(Trade).where(
-                                Trade.trade_date == now_ist.date(),
-                                Trade.status == "CLOSED",
-                                Trade.exit_reason == "STOP_LOSS_HIT",
-                            )
-                        )
-                        count = len(list(result.scalars().all()))
-                except Exception as db_exc:
-                    logger.error("DB fallback for consecutive loss count failed: %s", db_exc)
-            if count >= settings.consecutive_loss_pause_threshold:
-                pause_until = now_ist + timedelta(minutes=settings.consecutive_loss_pause_minutes)
-                try:
-                    await set_value("consecutive_loss_pause_until", pause_until.isoformat())
-                except Exception:
-                    pass  # Non-fatal; new-trade decision path will recheck when Redis recovers
-                logger.warning(
-                    "%d consecutive losses — trading paused until %s",
-                    count, pause_until.strftime("%H:%M"),
-                )
-        elif reason == "TARGET_HIT":
-            try:
-                await set_value("consecutive_losses", "0")
-            except Exception:
-                pass  # Non-critical; streak resets naturally from next SL-hit DB count
+    async def _finalise_close(
+        self,
+        trade: Trade,
+        exit_price: float,
+        reason: str,
+        qty_closed: int,
+        now_ist: datetime,
+    ) -> bool:
+        return await self._positions().finalise_close(trade, exit_price, reason, qty_closed, now_ist)
 
     async def _book_partial(self, trade: Trade, ltp: float) -> None:
-        """Scale out a fraction of the position once price reaches the partial target.
+        """Scale out part of the position (see ``PositionService.book_partial``)."""
+        await self._positions().book_partial(trade, ltp)
 
-        Books ``partial_booking_fraction`` of the *current* quantity at market,
-        accumulates the net realised P&L of the leg into ``booked_pnl``, reduces
-        ``trade.quantity`` to the remainder (so every downstream rule — target,
-        trailing SL, MTM, drawdown and the final close — automatically operates on
-        the smaller size), and optionally raises the stop to breakeven.
+    # ── Exit-lifecycle DB / alert helpers (audit R1 / R4) ──────────────────────
 
-        Safety invariants for live trading:
-          * The server-side GTT is cancelled BEFORE the partial SELL, so it can
-            never fire on the remaining shares mid-operation.  If the cancel fails
-            the scale-out is aborted with the position left fully intact.
-          * If the SELL fails after the GTT was cancelled, a full-size GTT is
-            re-placed to restore the stop before returning.
-          * A fresh GTT for the remaining quantity is placed after the SELL.
-        """
-        settings = self._settings
-        now_ist = datetime.now(IST)
+    _KEEP = object()
 
-        qty = trade.quantity
-        book_qty = max(1, int(qty * settings.partial_booking_fraction))
-        remaining = qty - book_qty
-        if remaining < 1:
-            # Position too small to split while leaving a runner — skip silently.
-            return
+    async def _revert_to_open(self, trade: Trade, sl_order_id=_KEEP) -> None:
+        """Return a CLOSING trade to OPEN so the poll keeps managing it."""
+        if sl_order_id is RiskManager._KEEP:
+            await self._positions().revert_to_open(trade)
+        else:
+            await self._positions().revert_to_open(trade, sl_order_id=sl_order_id)
 
-        # Breakeven stop for the remaining position (only ever raised, never lowered).
-        new_sl = trade.stop_loss_price
-        if (
-            settings.partial_booking_move_sl_to_breakeven
-            and trade.entry_price > trade.stop_loss_price
-        ):
-            new_sl = trade.entry_price
+    async def _alert_exit_problem(
+        self, trade: Trade, reason: str, detail: str, critical: bool = False,
+    ) -> None:
+        await self._positions().alert_exit_problem(trade, reason, detail, critical=critical)
 
-        new_gtt_id = getattr(trade, "gtt_trigger_id", None)
-
-        if not settings.paper_trading:
-            groww = get_groww_client()
-
-            # 1) Cancel the existing full-size GTT first.  Abort if this fails so
-            #    we never end up holding fewer shares than the GTT would sell.
-            if getattr(trade, "gtt_trigger_id", None):
-                try:
-                    await groww.delete_gtt(trade.gtt_trigger_id)
-                except Exception as exc:
-                    logger.warning(
-                        "Partial book: GTT cancel failed for %s: %s — aborting scale-out",
-                        trade.stock, exc,
-                    )
-                    return
-                new_gtt_id = None
-
-            # 2) Sell the booked leg.
-            try:
-                await groww.place_order(
-                    tradingsymbol=trade.stock,
-                    transaction_type="SELL",
-                    quantity=book_qty,
-                    product=trade.product_type,
-                    order_type="MARKET",
-                )
-            except Exception as exc:
-                logger.error(
-                    "Partial book: SELL failed for %s: %s — restoring full-size stop",
-                    trade.stock, exc,
-                )
-                # Re-place a GTT for the full original quantity to restore the stop.
-                try:
-                    restored = await groww.place_gtt(
-                        tradingsymbol=trade.stock,
-                        exchange=trade.exchange,
-                        trigger_type="single",
-                        trigger_values=[trade.stop_loss_price],
-                        last_price=ltp,
-                        orders=[{
-                            "exchange": trade.exchange,
-                            "tradingsymbol": trade.stock,
-                            "transaction_type": "SELL",
-                            "quantity": qty,
-                            "order_type": "MARKET",
-                            "product": trade.product_type,
-                        }],
-                    )
-                    await self._set_gtt_id(trade, int(restored) if restored else None)
-                except Exception as restore_exc:
-                    logger.error(
-                        "Partial book: failed to restore GTT for %s: %s — RiskManager poll "
-                        "will enforce the stop",
-                        trade.stock, restore_exc,
-                    )
-                    await self._set_gtt_id(trade, None)
-                return
-
-            # 3) Place a fresh GTT for the remaining quantity at the (possibly raised) stop.
-            try:
-                placed = await groww.place_gtt(
-                    tradingsymbol=trade.stock,
-                    exchange=trade.exchange,
-                    trigger_type="single",
-                    trigger_values=[new_sl],
-                    last_price=ltp,
-                    orders=[{
-                        "exchange": trade.exchange,
-                        "tradingsymbol": trade.stock,
-                        "transaction_type": "SELL",
-                        "quantity": remaining,
-                        "order_type": "MARKET",
-                        "product": trade.product_type,
-                    }],
-                )
-                new_gtt_id = int(placed) if placed else None
-            except Exception as exc:
-                logger.error(
-                    "Partial book: failed to place resized GTT for %s: %s — RiskManager poll "
-                    "will enforce the stop",
-                    trade.stock, exc,
-                )
-                new_gtt_id = None
-
-        # ── Net P&L of the booked leg (gross less transaction costs) ──
-        gross = (ltp - trade.entry_price) * book_qty
-        costs = _transaction_costs(trade.entry_price, ltp, book_qty, trade.product_type)
-        leg_pnl = round(gross - costs, 2)
-        new_booked = round((getattr(trade, "booked_pnl", 0.0) or 0.0) + leg_pnl, 2)
-
-        # ── Persist: reduce quantity, accumulate booked P&L, mark booked, raise stop ──
-        async with get_db_context() as session:
-            await session.execute(
-                update(Trade)
-                .where(Trade.id == trade.id)
-                .values(
-                    quantity=remaining,
-                    booked_pnl=new_booked,
-                    partial_booked=True,
-                    stop_loss_price=new_sl,
-                    gtt_trigger_id=new_gtt_id,
-                )
-            )
-
-        # Update in-memory so the rest of this poll cycle sees the new state.
-        trade.quantity = remaining
-        trade.booked_pnl = new_booked
-        trade.partial_booked = True
-        trade.stop_loss_price = new_sl
-        trade.gtt_trigger_id = new_gtt_id
-
-        logger.info(
-            "Partial book: %s sold %d/%d @ ₹%.2f | leg P&L: ₹%.2f | runner: %d @ SL ₹%.2f",
-            trade.stock, book_qty, qty, ltp, leg_pnl, remaining, new_sl,
-        )
-
-        await send_telegram(
-            f"\U0001f4b0 Partial book: {trade.stock}\n"
-            f"Sold {book_qty}/{qty} @ ₹{ltp:.2f} | Leg P&L: ₹{leg_pnl:.2f}\n"
-            f"Runner: {remaining} @ SL ₹{new_sl:.2f}"
-            + ("" if not settings.paper_trading else " (paper)")
-        )
-
-        await publish("trade_events", {
-            "type": "PARTIAL_BOOKED",
-            "stock": trade.stock,
-            "booked_qty": book_qty,
-            "remaining_qty": remaining,
-            "price": ltp,
-            "leg_pnl": leg_pnl,
-            "new_stop_loss": new_sl,
-            "timestamp": now_ist.isoformat(),
-        })
-
-    async def _set_gtt_id(self, trade: Trade, gtt_id: Optional[int]) -> None:
-        """Persist and mirror a new GTT trigger id on the trade (best-effort helper)."""
-        async with get_db_context() as session:
-            await session.execute(
-                update(Trade).where(Trade.id == trade.id).values(gtt_trigger_id=gtt_id)
-            )
-        trade.gtt_trigger_id = gtt_id
-
-    async def _update_stop_loss(self, trade: Trade, new_sl: float) -> None:
-        """Update the stop-loss price for a trade in the database (trailing SL)."""
-        async with get_db_context() as session:
-            await session.execute(
-                update(Trade)
-                .where(Trade.id == trade.id)
-                .values(stop_loss_price=new_sl)
-            )
-        # Update in-memory so this poll cycle uses the new value
-        trade.stop_loss_price = new_sl
-
-        await publish("trade_events", {
-            "type": "TRAILING_SL_UPDATE",
-            "stock": trade.stock,
-            "new_stop_loss": new_sl,
-            "timestamp": datetime.now(IST).isoformat(),
-        })
+    async def _update_stop_loss(self, trade: Trade, new_sl: float, kind: str = "TRAILING") -> None:
+        """Raise the stop in the DB and at the broker (see ``PositionService.update_stop_loss``)."""
+        await self._positions().update_stop_loss(trade, new_sl, kind=kind)
 
     async def _update_target(self, trade: Trade, new_target: float) -> None:
-        """Update the target price for a trade in the database (ROI decay)."""
-        async with get_db_context() as session:
-            await session.execute(
-                update(Trade)
-                .where(Trade.id == trade.id)
-                .values(target_price=new_target)
-            )
-        trade.target_price = new_target
-
-        await publish("trade_events", {
-            "type": "ROI_DECAY_UPDATE",
-            "stock": trade.stock,
-            "new_target": new_target,
-            "timestamp": datetime.now(IST).isoformat(),
-        })
+        """Lower the target (ROI decay)."""
+        await self._positions().update_target(trade, new_target)
 
     async def _check_daily_drawdown(self, ltp_map: Optional[Dict[str, float]] = None) -> None:
         """If total daily loss (realised + unrealised) exceeds 3% of capital, halt trading.
@@ -783,7 +943,7 @@ class RiskManager:
         to avoid redundant Groww API calls.  Falls back to ltp_store / Groww when
         the map is not provided or the symbol is missing.
         """
-        halt = await get_value(HALT_KEY)
+        halt = await get_value(halt_key())
         if halt == "TRUE":
             return  # already halted
 
@@ -849,7 +1009,7 @@ class RiskManager:
             })
 
         if total_loss >= limit:
-            await set_value(HALT_KEY, "TRUE")
+            await set_halt(f"daily drawdown ₹{total_loss:.2f} >= ₹{limit:.2f}")
             logger.critical(
                 "Daily drawdown limit breached: ₹%.2f >= ₹%.2f — HALTING",
                 total_loss, limit,
@@ -869,45 +1029,45 @@ class RiskManager:
 
         Uses an upsert pattern to handle process restarts: if a DailyPnl row
         for today already exists, it is updated rather than duplicated.
-        Reconciles orphaned CLOSING trades before computing the report.
+        OPEN / CLOSING rows are alerted, never force-booked (audit R9).
         """
         self._eod_reported_today = True
         today = ist_today()
 
-        # ── Reconcile orphaned CLOSING trades ─────────────────────
-        # If a process crash left trades in CLOSING state, they'll never
-        # transition to CLOSED on their own.  Force-close them at entry
-        # price (zero P&L) so the EOD report is accurate.
+        # ── Unresolved positions (audit R9) ────────────────────────
+        # CLOSING / OPEN rows at 15:30 are NOT booked here (never at entry
+        # price / zero P&L): the broker has not confirmed them flat.  They stay
+        # for broker reconciliation (``_reconcile_closing`` / next startup's
+        # state recovery) and are alerted loudly.
         async with get_db_context() as session:
-            orphan_result = await session.execute(
+            unresolved_result = await session.execute(
                 select(Trade).where(
                     Trade.trade_date == today,
-                    Trade.status == "CLOSING",
+                    Trade.status.in_(["PENDING", "OPEN", "CLOSING"]),
                 )
             )
-            orphaned = orphan_result.scalars().all()
-            if orphaned:
-                now_ist = datetime.now(IST)
-                for t in orphaned:
-                    logger.warning(
-                        "Reconciling orphaned CLOSING trade: %s (id=%d)", t.stock, t.id,
-                    )
-                    await session.execute(
-                        update(Trade)
-                        .where(Trade.id == t.id)
-                        .values(
-                            status="CLOSED",
-                            exit_price=t.entry_price,
-                            exit_reason="RECONCILED",
-                            exit_time=now_ist.time(),
-                            realized_pnl=0.0,
-                        )
-                    )
-                logger.warning("Reconciled %d orphaned CLOSING trades", len(orphaned))
+            unresolved = list(unresolved_result.scalars().all())
+        if unresolved:
+            names = [f"{t.stock}#{t.id}({t.status})" for t in unresolved]
+            msg = (
+                f"EOD: {len(unresolved)} position(s) NOT confirmed flat: {names}. "
+                f"Not booked — excluded from today's P&L until reconciled against Groww. "
+                f"CHECK THE GROWW POSITIONS / TRADE BOOK NOW."
+            )
+            logger.critical(msg)
+            try:
+                await publish("system_alerts", {
+                    "type": "critical",
+                    "message": msg,
+                    "timestamp": datetime.now(IST).isoformat(),
+                })
+                await send_telegram(f"\U0001f6a8 {msg}")
+            except Exception as exc:
+                logger.warning("EOD unresolved-position alert failed: %s", exc)
 
         async with get_db_context() as session:
             result = await session.execute(
-                select(Trade).where(Trade.trade_date == today)
+                select(Trade).where(Trade.trade_date == today, Trade.status != "REJECTED")
             )
             todays_trades = result.scalars().all()
 
@@ -985,7 +1145,7 @@ class RiskManager:
                 else:
                     losses_after_1330 += 1
 
-        halt = await get_value(HALT_KEY)
+        halt = await get_value(halt_key())
 
         # Persist to DB — upsert to survive process restarts
         async with get_db_context() as session:

@@ -16,28 +16,40 @@ Usage (from trading-system/backend/):
     python -m backtest.runner --symbols RELIANCE --start 2026-05-01 --end 2026-05-31 \\
         --avg-vol RELIANCE=12500000
 
+    # Costs/slippage, walk-forward folds, an untouched holdout and a trade file:
+    python -m backtest.runner --symbols RELIANCE INFY --start 2025-01-01 --end 2026-06-30 \\
+        --slippage-bps 5 --walk-forward 4 --holdout-from 2026-04-01 --out trades.csv
+
 How it works
 ------------
 For each symbol and each trading day in the range:
 1. 1-minute historical candles are fetched from the Groww API.
-2. Each candle is replayed as 4 synthetic ticks (O→{L,H}→{H,L}→C), preserving
-   realistic OHLC paths.  The production TickDataStore processes them identically
-   to live WebSocket ticks.
-3. After each candle the signal conditions from _check_signal are applied
-   (same thresholds, same logic; datetime.now() replaced by the candle
-   timestamp so market-hours and cooldown logic is faithful to history).
-4. When a signal fires, subsequent candles are inspected to determine
-   whether price reached the target or stop-loss first.
-5. A per-signal table and aggregate statistics are printed.
+2. Each candle is replayed as 4 synthetic ticks (O→{L,H}→{H,L}→C) through the
+   production TickDataStore.
+3. After each candle the LIVE entry gates (``agents.signal_rules`` — the same
+   functions the Scanner calls) are evaluated on the candle timestamp, with
+   thresholds from Settings and the chosen market bias.
+4. Each signal is simulated with the LIVE exit policy (``agents.exit_policy``):
+   entry at the next bar's open, production sizing, stop / scale-out +
+   breakeven / ROI decay / target / trailing / 15:00 square-off, adverse
+   slippage on every fill (more on stops), stops filled at min(stop, price),
+   and round-trip transaction costs per leg (``backtest.simulator``).
+5. The live portfolio gates are applied on one clock (max open positions,
+   daily / per-symbol trade caps, stock lock after a loss, daily drawdown halt).
+6. ₹ metrics are reported: net expectancy (₹ and R) with a bootstrap CI,
+   profit factor over all exits, max drawdown, worst day, halt days, Sharpe /
+   Sortino; plus a slippage sensitivity table (0/5/10/20 bps), optional
+   walk-forward folds and an untouched holdout period.
 
 Limitations
 -----------
-- LLM decisions (decision_engine.py) are NOT replayed — only the rule-based
-  scanner pre-filters are evaluated.  Accuracy figures therefore represent the
-  *scanner* precision, not the full pipeline.
-- Execution at the exact signal LTP is assumed (no slippage model).
-- Signals fire from the 16th candle onward (15 completed 1m candles + 50-tick
-  warmup across 4-tick-per-candle replay = ~16 minutes).
+- LLM decisions and the decision engine's deterministic pre-checks are NOT
+  replayed (they need the market brief / Redis state).  Results describe the
+  scanner + exit policy, not the full pipeline.
+- Indicators are computed on 4 synthetic ticks per candle; live they are
+  computed on real ticks, so tick-level RSI / VWAP windows differ (audit V3).
+- The NIFTY filter uses index candles; the daily EMA21 filter uses prior
+  closes from the fetched history.
 - The 30-calendar-day Groww API limit is handled by auto-chunking.
 """
 
@@ -48,41 +60,40 @@ import asyncio
 import logging
 import os
 import sys
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 # ── path setup so we can import from the backend package ──────────────────────
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import numpy as np
 import pandas as pd
 
+from agents import signal_rules
 from agents.scanner import TickDataStore          # reuse production indicator code
+from backtest.simulator import (
+    SENSITIVITY_BPS,
+    SignalCandidate,
+    SimTrade,
+    SlippageModel,
+    apply_portfolio_rules,
+    compute_metrics,
+    simulate_trade,
+    split_holdout,
+    trades_frame,
+    walk_forward_folds,
+)
+from core.config import get_settings
 from integrations.groww_client import get_groww_client, _retry_sync
 
 logger = logging.getLogger(__name__)
 
 IST = ZoneInfo("Asia/Kolkata")
 
-# ── Signal condition parameters (mirrors production defaults) ─────────────────
-# These MUST stay in sync with scanner.py and decision_engine.py constants.
-RSI_LO, RSI_HI           = 50.0, 65.0     # scanner band (NEUTRAL bias, floor raised from 45)
-VOL_RATIO_MIN             = 1.5             # minimum prorated volume ratio
-HTF_RSI_LO, HTF_RSI_HI   = 45.0, 72.0     # 5-min RSI band
-GAP_MAX_PCT               = 1.5             # max gap-at-open (%)
-ATR_SL_MULT               = 1.5             # stop-loss = entry − ATR × mult
-ATR_TGT_MULT              = 3.0             # target    = entry + ATR × mult
-STOP_LOSS_PCT             = 0.010           # fixed fallback SL  (1%)
-MIN_TARGET_PCT            = 0.020           # fixed fallback tgt (2%)
-MIN_TICKS_BT              = 50              # warmup ticks (same as production)
-MIN_CANDLES_BT            = 15             # warmup 1m candles
-SIGNAL_COOLDOWN_SECS      = 1800            # suppress repeat signals (30 min)
-SIGNAL_CUTOFF             = (15, 15)        # no new signals after 3:15 PM IST
+# Signal gates, thresholds, sizing and exits come from the live code
+# (agents.signal_rules / agents.exit_policy) and Settings — not copied here.
 SESSION_OPEN_MIN          = 9 * 60 + 15    # 9:15 AM in minutes-from-midnight
 SESSION_TOTAL_MIN         = 375             # 9:15 → 15:30 = 375 min
-NIFTY_TREND_THRESH        = -0.005          # suppress longs when NIFTY drifts −0.5% from open
 NIFTY_SYMBOL              = "NIFTY"         # Groww historical-candle symbol for NIFTY 50 index (NSE-NIFTY)
 DAILY_EMA_PERIOD          = 21              # multi-day trend filter period (mirrors decision_engine.py)
 DAILY_EMA_LOOKBACK        = 25              # daily candles to use for EMA computation (same as production)
@@ -124,30 +135,6 @@ class BacktestTickDataStore(TickDataStore):
         session_fraction = min(1.0, minutes_since_open / SESSION_TOTAL_MIN)
         prorated_avg = self.avg_volume_20d * session_fraction
         return current_volume / prorated_avg if prorated_avg > 0 else 0.0
-
-
-# ── Result dataclass ──────────────────────────────────────────────────────────
-
-@dataclass
-class BacktestResult:
-    symbol: str
-    trade_date: date
-    signal_time: str        # HH:MM (candle open time)
-    ltp: float              # entry price at signal
-    vwap: float
-    rsi: float
-    vol_ratio: float
-    rsi_5m: Optional[float]
-    ema_9: float
-    ema_21: float
-    macd_hist: float
-    atr: float
-    sl: float               # stop-loss price
-    target: float           # target price
-    rr: float               # reward:risk ratio
-    outcome: str            # WIN | LOSS | TIMEOUT
-    exit_price: float
-    pnl_pct: float          # (exit − entry) / entry × 100
 
 
 # ── Candle fetching ───────────────────────────────────────────────────────────
@@ -340,7 +327,7 @@ def _candle_to_ticks(
     return ticks
 
 
-# ── Signal condition check (backtest version) ─────────────────────────────────
+# ── Signal condition check (shared with the live Scanner) ─────────────────────
 
 def check_signal(
     store: BacktestTickDataStore,
@@ -349,169 +336,28 @@ def check_signal(
     skip_volume: bool,
     nifty_open: float = 0.0,
     nifty_ltp: float = 0.0,
-) -> Optional[BacktestResult]:
-    """Apply scanner signal conditions using the historical candle timestamp.
+    bias: str = "NEUTRAL",
+    settings=None,
+) -> Optional[signal_rules.EntryEvaluation]:
+    """Evaluate the live entry gates (``agents.signal_rules``) at the candle
+    timestamp.  Returns the passing evaluation, or None when any gate rejects.
 
-    Mirrors scanner.py _check_signal() exactly, except:
-    - datetime.now(IST) → candle_ts
-    - OHLCV staleness gate omitted (data is always fresh in backtest)
-    - Market bias fixed at NEUTRAL
-    - NIFTY macro-trend filter uses pre-fetched index candles (nifty_open/nifty_ltp)
-
-    Returns a BacktestResult (without outcome filled in) or None.
+    Only the live-only OHLCV freshness gate is omitted (replayed data is
+    always fresh).
     """
-    # Market-hours gate
-    if (candle_ts.hour, candle_ts.minute) >= SIGNAL_CUTOFF:
+    settings = settings or get_settings()
+    if signal_rules.pre_gate(store, candle_ts, last_signal_ts):
         return None
-    # Friday 14:00 cutoff
-    if candle_ts.weekday() == 4 and candle_ts.hour >= 14:
-        return None
-    # Minimum tick warmup
-    if len(store.ticks) < MIN_TICKS_BT:
-        return None
-    # Minimum completed 1m candles
-    c1m = store._candles_1m.completed_df
-    n_candles = len(c1m) if c1m is not None else 0
-    if n_candles < MIN_CANDLES_BT:
-        return None
-    # Cooldown
-    if last_signal_ts is not None:
-        elapsed = (candle_ts - last_signal_ts).total_seconds()
-        if elapsed < SIGNAL_COOLDOWN_SECS:
-            return None
-
     # Inject backtest clock into the store for volume-ratio computation
     store._bt_now = candle_ts
-
-    ltp       = store.ltp
-    vwap      = store.compute_vwap()
-    rsi       = store.compute_rsi()
-    vol_ratio = store.compute_volume_ratio()
-    ema_9     = store.compute_ema(9)
-    ema_21    = store.compute_ema(21)
-    macd_hist = store.compute_macd_histogram()
-    atr       = store.compute_atr()
-    rsi_5m    = store.compute_rsi_htf()
-
-    # Condition 1: Price > VWAP
-    if ltp <= vwap:
-        return None
-    # Condition 2: RSI band (NEUTRAL bias)
-    if not (RSI_LO <= rsi <= RSI_HI):
-        return None
-    # Early-session tighter RSI: first 30 minutes (9:15–9:44) indicators warm up
-    # over the first 15–30 candles; a ±5-point tighter band reduces whipsaw entries.
-    if candle_ts.hour == 9 and candle_ts.minute < 45:
-        if not ((RSI_LO + 5) <= rsi <= (RSI_HI - 5)):
-            return None
-    # NIFTY macro-trend filter (mirrors production _check_signal A2).
-    # Suppress long signals when NIFTY has drifted below NIFTY_TREND_THRESH from
-    # its session open.  Skip when nifty_open=0 (index data unavailable).
-    if nifty_open > 0 and nifty_ltp > 0:
-        nifty_drift = (nifty_ltp - nifty_open) / nifty_open
-        if nifty_drift < NIFTY_TREND_THRESH:
-            return None
-    # Condition 3: Volume ratio (skipped when avg_volume_20d = 0)
-    if not skip_volume and store.avg_volume_20d > 0 and vol_ratio < VOL_RATIO_MIN:
-        return None
-    # Condition 7: Gap-at-open filter
-    if store._prev_close > 0 and store._open_price > 0:
-        gap_pct = (store._open_price - store._prev_close) / store._prev_close * 100
-        if gap_pct > GAP_MAX_PCT:
-            return None
-    # Stock-level intraday trend bias: suppress long signals when price is >1%
-    # below EMA(21).  Complements the NIFTY filter by catching single-stock
-    # downtrends on mixed or bullish market days (e.g. TATASTEEL falling while
-    # NIFTY is flat).  Safe below 21 candles — compute_ema() returns 0.0 and
-    # the ema_21 > 0 guard skips the check.
-    if ema_21 > 0 and ltp < ema_21 * 0.99:
-        return None
-    # Conditions 4+5: EMA crossover + MACD momentum — enforced from ≥26 candles
-    # (MACD minimum) so the filter is active from ~9:41 AM rather than ~9:50 AM.
-    if n_candles >= 26:
-        if ema_9 > 0 and ema_21 > 0 and ema_9 <= ema_21:
-            return None
-        if macd_hist <= 0:
-            return None
-    # Condition 6: 5m RSI band
-    if rsi_5m is not None and not (HTF_RSI_LO <= rsi_5m <= HTF_RSI_HI):
-        return None
-
-    # ── Compute stop-loss and target ──────────────────────────────────────────
-    if atr > 0:
-        sl  = round(ltp - atr * ATR_SL_MULT, 2)
-        tgt = round(ltp + atr * ATR_TGT_MULT, 2)
-    else:
-        sl  = round(ltp * (1 - STOP_LOSS_PCT), 2)
-        tgt = round(ltp * (1 + MIN_TARGET_PCT), 2)
-
-    sl_dist = abs(ltp - sl)
-    rr = round((tgt - ltp) / sl_dist, 2) if sl_dist > 0 else float(ATR_TGT_MULT / ATR_SL_MULT)
-
-    return BacktestResult(
-        symbol=store.symbol,
-        trade_date=candle_ts.date(),
-        signal_time=candle_ts.strftime("%H:%M"),
-        ltp=round(ltp, 2),
-        vwap=round(vwap, 2),
-        rsi=round(rsi, 2),
-        vol_ratio=round(vol_ratio, 2),
-        rsi_5m=round(rsi_5m, 2) if rsi_5m is not None else None,
-        ema_9=round(ema_9, 2),
-        ema_21=round(ema_21, 2),
-        macd_hist=round(macd_hist, 4),
-        atr=round(atr, 2),
-        sl=sl,
-        target=tgt,
-        rr=rr,
-        outcome="",      # filled in after outcome evaluation
-        exit_price=0.0,
-        pnl_pct=0.0,
+    ev = signal_rules.evaluate_indicators(
+        store, candle_ts,
+        signal_rules.bias_thresholds(bias, settings),
+        nifty_open=nifty_open,
+        nifty_ltp=nifty_ltp,
+        check_volume=not skip_volume,
     )
-
-
-# ── Outcome evaluation ────────────────────────────────────────────────────────
-
-def evaluate_outcome(
-    signal: BacktestResult,
-    future_candles: pd.DataFrame,
-) -> BacktestResult:
-    """Determine whether a signal hit its target or stop-loss.
-
-    Scans forward through ``future_candles`` (rows after the signal candle)
-    looking for the first candle where:
-      high >= target_price  → WIN  (target hit)
-      low  <= stop_loss     → LOSS (stop hit)
-    If both conditions appear in the SAME candle, the conservative assumption
-    is applied: LOSS (stop assumed to hit before target within the candle).
-
-    When no subsequent candle satisfies either condition (trade runs to session
-    end), the outcome is TIMEOUT and exit price is the last candle's close.
-    """
-    for _, row in future_candles.iterrows():
-        hit_target = row["high"] >= signal.target
-        hit_sl     = row["low"]  <= signal.sl
-
-        if hit_sl and hit_target:
-            # Both in the same candle: conservative → LOSS
-            signal.outcome    = "LOSS"
-            signal.exit_price = signal.sl
-        elif hit_target:
-            signal.outcome    = "WIN"
-            signal.exit_price = signal.target
-        elif hit_sl:
-            signal.outcome    = "LOSS"
-            signal.exit_price = signal.sl
-
-        if signal.outcome:
-            break
-    else:
-        # Never hit target or SL — session ended
-        signal.outcome    = "TIMEOUT"
-        signal.exit_price = round(float(future_candles["close"].iloc[-1]), 2) if not future_candles.empty else signal.ltp
-
-    signal.pnl_pct = round((signal.exit_price - signal.ltp) / signal.ltp * 100, 3)
-    return signal
+    return ev if ev.passed else None
 
 
 # ── Daily trend filter ───────────────────────────────────────────────────────
@@ -563,8 +409,11 @@ def replay_day(
     skip_volume: bool,
     nifty_day_df: Optional[pd.DataFrame] = None,
     daily_uptrend: bool = True,
-) -> List[BacktestResult]:
-    """Replay one trading day of 1-minute candles and return all signals fired."""
+    bias: str = "NEUTRAL",
+    settings=None,
+) -> List[SignalCandidate]:
+    """Replay one trading day of 1-minute candles and return every signal fired
+    (with the rest of the day's candles attached for simulation)."""
     if day_df.empty:
         return []
     # Multi-day trend filter: skip this entire day when the stock is below its
@@ -573,7 +422,7 @@ def replay_day(
         return []
 
     store = BacktestTickDataStore(symbol=symbol, avg_volume_20d=avg_volume_20d)
-    results: List[BacktestResult] = []
+    results: List[SignalCandidate] = []
     last_signal_ts: Optional[datetime] = None
     cum_vol: int = 0
     day_open = float(day_df.iloc[0]["open"])
@@ -583,7 +432,7 @@ def replay_day(
     if nifty_day_df is not None and not nifty_day_df.empty:
         nifty_open = float(nifty_day_df.iloc[0]["open"])
 
-    for idx, row in day_df.iterrows():
+    for _, row in day_df.iterrows():
         ticks = _candle_to_ticks(
             row=row,
             cum_vol_before=cum_vol,
@@ -604,148 +453,163 @@ def replay_day(
             if mask.any():
                 nifty_ltp = float(nifty_day_df.loc[mask, "close"].iloc[-1])
 
-        sig = check_signal(
+        ev = check_signal(
             store=store,
             candle_ts=candle_ts,
             last_signal_ts=last_signal_ts,
             skip_volume=skip_volume,
             nifty_open=nifty_open,
             nifty_ltp=nifty_ltp,
+            bias=bias,
+            settings=settings,
         )
-        if sig is not None:
-            # Find future candles for this day to evaluate outcome
-            future = day_df[day_df["timestamp"] > candle_ts].reset_index(drop=True)
-            sig = evaluate_outcome(sig, future)
-            results.append(sig)
+        if ev is not None:
+            results.append(SignalCandidate(
+                symbol=symbol, signal_ts=candle_ts, ltp=round(ev.ltp, 2),
+                vwap=round(ev.vwap, 2), rsi=round(ev.rsi, 2), vol_ratio=round(ev.vol_ratio, 2),
+                rsi_5m=round(ev.rsi_5m, 2) if ev.rsi_5m is not None else None,
+                ema_9=round(ev.ema_9, 2), ema_21=round(ev.ema_21, 2),
+                macd_hist=round(ev.macd_hist, 4), atr=round(ev.atr, 2), n_candles=ev.n_candles,
+                future=day_df[day_df["timestamp"] > candle_ts].reset_index(drop=True),
+            ))
             last_signal_ts = candle_ts
 
     return results
 
 
-# ── Reporting ─────────────────────────────────────────────────────────────────
+# ── Evaluation + reporting ────────────────────────────────────────────────────
 
-def print_report(results: List[BacktestResult]) -> None:
-    """Print a per-signal table followed by aggregate statistics."""
-    if not results:
-        print("\nNo signals generated for the specified parameters.")
+def evaluate_candidates(
+    candidates: List[SignalCandidate], settings, slip: SlippageModel,
+) -> Tuple[List[SimTrade], Dict[str, int], set]:
+    """Simulate every signal, then apply the live portfolio gates."""
+    trades = [t for t in (simulate_trade(c, settings, slip) for c in candidates) if t is not None]
+    return apply_portfolio_rules(trades, settings)
+
+
+def _fmt_metrics(label: str, m: Dict) -> str:
+    if not m.get("trades"):
+        return f"  {label:<22} no trades"
+    pf = m["profit_factor"]
+    pf_s = "∞" if pf == float("inf") else f"{pf:.2f}"
+    return (
+        f"  {label:<22} n={m['trades']:<4} win={m['win_rate_pct']:>5.1f}%  "
+        f"net=₹{m['net_pnl']:>10,.0f}  E=₹{m['expectancy_rupees']:>7,.0f} ({m['expectancy_r']:+.2f}R)  "
+        f"PF={pf_s:>5}  maxDD={m['max_drawdown_pct']:.2f}%"
+    )
+
+
+def print_report(
+    trades: List[SimTrade],
+    metrics: Dict,
+    rejected: Dict[str, int],
+    settings,
+    slip: SlippageModel,
+) -> None:
+    """Per-trade table, ₹ metrics and portfolio-rule rejections."""
+    if not trades:
+        print("\nNo trades for the specified parameters.")
         return
 
-    # ── Per-signal table ──────────────────────────────────────────────────────
     header = (
-        f"{'Symbol':<12} {'Date':<12} {'Time':<6} {'LTP':>8} {'VWAP':>8} "
-        f"{'RSI':>6} {'VolR':>6} {'ATR':>6} {'SL':>8} {'Tgt':>8} "
-        f"{'RR':>5} {'Outcome':<8} {'Exit':>8} {'PnL%':>7}"
+        f"{'Symbol':<11} {'Date':<11} {'Sig':<6} {'Entry':<6} {'Fill':>9} {'Qty':>5} "
+        f"{'SL':>9} {'Tgt':>9} {'Exit':>9} {'Reason':<13} {'Net ₹':>10} {'R':>6}"
     )
     sep = "─" * len(header)
-    print(f"\n{sep}")
-    print(header)
-    print(sep)
-
-    for r in results:
-        outcome_label = {"WIN": "✓ WIN", "LOSS": "✗ LOSS", "TIMEOUT": "~ TMOUT"}.get(r.outcome, r.outcome)
+    print(f"\n{sep}\n{header}\n{sep}")
+    for t in sorted(trades, key=lambda x: x.entry_ts):
         print(
-            f"{r.symbol:<12} {str(r.trade_date):<12} {r.signal_time:<6} "
-            f"{r.ltp:>8.2f} {r.vwap:>8.2f} {r.rsi:>6.1f} {r.vol_ratio:>6.2f} "
-            f"{r.atr:>6.2f} {r.sl:>8.2f} {r.target:>8.2f} "
-            f"{r.rr:>5.2f} {outcome_label:<8} {r.exit_price:>8.2f} {r.pnl_pct:>+7.3f}%"
+            f"{t.symbol:<11} {str(t.trade_date):<11} {t.signal_ts:%H:%M} {t.entry_ts:%H:%M}  "
+            f"{t.entry_price:>9.2f} {t.qty:>5} {t.initial_sl:>9.2f} {t.initial_target:>9.2f} "
+            f"{t.exit_price:>9.2f} {t.exit_reason:<13} {t.net_pnl:>+10,.0f} {t.r_multiple:>+6.2f}"
         )
-
     print(sep)
 
-    # ── Aggregate stats ───────────────────────────────────────────────────────
-    total   = len(results)
-    wins    = sum(1 for r in results if r.outcome == "WIN")
-    losses  = sum(1 for r in results if r.outcome == "LOSS")
-    timeouts = sum(1 for r in results if r.outcome == "TIMEOUT")
-    win_rate = wins / total * 100
+    print(
+        f"\n{'Summary':─<60}\n"
+        f"  Capital ₹{settings.total_capital:,.0f} | slippage {slip.bps:g} bps "
+        f"(stops ×{slip.stop_mult:g}) | costs: NSE/broker round-trip per leg"
+    )
+    m = metrics
+    lo, hi = m["expectancy_ci95"]
+    print(f"  Trades             : {m['trades']}  (win {m['win_rate_pct']}%)")
+    print(f"  Net P&L            : ₹{m['net_pnl']:,.2f}  (costs ₹{m['gross_costs']:,.2f})")
+    print(f"  Expectancy         : ₹{m['expectancy_rupees']:,.2f} / trade  "
+          f"[95% CI ₹{lo:,.0f} … ₹{hi:,.0f}]  = {m['expectancy_r']:+.3f} R")
+    print(f"  Profit factor      : {m['profit_factor']}  (all exits)")
+    print(f"  Max drawdown       : ₹{m['max_drawdown']:,.2f}  ({m['max_drawdown_pct']}% of capital)")
+    print(f"  Worst / best day   : ₹{m['worst_day']:,.2f} / ₹{m['best_day']:,.2f}  over {m['days']} day(s)")
+    print(f"  Days at 3% halt    : {m['halt_days']}")
+    print(f"  Sharpe / Sortino   : {m['sharpe_daily_ann']} / {m['sortino_daily_ann']}  (daily, annualised)")
+    print(f"  Max losing streak  : {m['max_losing_streak']}")
+    print(f"  Exit reasons       : {m['exit_reasons']}")
+    if rejected:
+        print(f"  Portfolio rejects  : {rejected}")
 
-    decided  = [r for r in results if r.outcome in ("WIN", "LOSS")]
-    decided_win_rate = (sum(1 for r in decided if r.outcome == "WIN") / len(decided) * 100) if decided else 0.0
 
-    pnls     = [r.pnl_pct for r in results]
-    avg_pnl  = sum(pnls) / len(pnls)
-    total_pnl = sum(pnls)
+def print_sensitivity(candidates: List[SignalCandidate], settings, stop_mult: float) -> None:
+    """Re-simulate the same signals at 0/5/10/20 bps (audit V2)."""
+    print(f"\n{'Slippage sensitivity':─<60}")
+    for bps in SENSITIVITY_BPS:
+        slip = SlippageModel(bps=bps, stop_mult=stop_mult)
+        accepted, _, halted = evaluate_candidates(candidates, settings, slip)
+        print(_fmt_metrics(f"{bps:g} bps", compute_metrics(accepted, settings, halted)))
 
-    rrs      = [r.rr for r in results]
-    avg_rr   = sum(rrs) / len(rrs)
 
-    win_pnls  = [r.pnl_pct for r in results if r.outcome == "WIN"]
-    loss_pnls = [r.pnl_pct for r in results if r.outcome == "LOSS"]
-    avg_win   = sum(win_pnls) / len(win_pnls) if win_pnls else 0.0
-    avg_loss  = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0.0
+def print_out_of_sample(
+    trades: List[SimTrade], halted: set, settings, walk_forward: int, holdout_from: Optional[date],
+) -> None:
+    """Walk-forward folds and an untouched holdout (audit V6)."""
+    if walk_forward > 1:
+        print(f"\n{'Walk-forward folds':─<60}")
+        for start, end in walk_forward_folds([t.trade_date for t in trades], walk_forward):
+            fold = [t for t in trades if start <= t.trade_date <= end]
+            print(_fmt_metrics(f"{start}→{end}", compute_metrics(fold, settings, halted)))
+    if holdout_from is not None:
+        ins, hold = split_holdout(trades, holdout_from)
+        print(f"\n{'Holdout (do NOT tune on it)':─<60}")
+        print(_fmt_metrics(f"in-sample <{holdout_from}", compute_metrics(ins, settings, halted)))
+        print(_fmt_metrics(f"holdout  ≥{holdout_from}", compute_metrics(hold, settings, halted)))
 
-    # Profit factor: gross wins / gross losses (absolute)
-    gross_wins   = sum(win_pnls)
-    gross_losses = abs(sum(loss_pnls))
-    profit_factor = gross_wins / gross_losses if gross_losses > 0 else float("inf")
 
-    print(f"\n{'Summary':─<50}")
-    print(f"  Signals total      : {total}")
-    print(f"  Wins               : {wins}  ({win_rate:.1f}% of total)")
-    print(f"  Losses             : {losses}")
-    print(f"  Timeouts (open)    : {timeouts}")
-    print(f"  Win rate (decided) : {decided_win_rate:.1f}%  (excl. timeouts)")
-    print(f"  Avg P&L per trade  : {avg_pnl:+.3f}%")
-    print(f"  Avg win            : {avg_win:+.3f}%")
-    print(f"  Avg loss           : {avg_loss:+.3f}%")
-    print(f"  Sum P&L            : {total_pnl:+.3f}%")
-    print(f"  Avg R:R            : {avg_rr:.2f}")
-    print(f"  Profit factor      : {profit_factor:.2f}")
+def write_trades(trades: List[SimTrade], path: str) -> None:
+    df = trades_frame(trades)
+    if path.endswith(".parquet"):
+        try:
+            df.to_parquet(path, index=False)
+            print(f"\n[+] Trades written to {path}")
+            return
+        except ImportError:
+            path = path[: -len(".parquet")] + ".csv"
+            print("    ⚠ pyarrow not installed — writing CSV instead")
+    df.to_csv(path, index=False)
+    print(f"\n[+] Trades written to {path}")
 
-    # Per-symbol breakdown
-    symbols = sorted({r.symbol for r in results})
+
+def _phase(ts: datetime) -> str:
+    minutes = ts.hour * 60 + ts.minute
+    if minutes < 11 * 60 + 30:
+        return "EARLY (09:15-11:30)"
+    if minutes < 13 * 60:
+        return "DEAD ZONE (11:30-13:00)"
+    if minutes < 14 * 60 + 30:
+        return "RECOVERY (13:00-14:30)"
+    return "LATE (14:30-15:30)"
+
+
+def print_breakdowns(trades: List[SimTrade], settings, halted: set) -> None:
+    """Per-symbol and per-session-phase ₹ metrics (phase = signal time)."""
+    symbols = sorted({t.symbol for t in trades})
     if len(symbols) > 1:
-        print(f"\n{'Per-symbol':─<50}")
+        print(f"\n{'Per-symbol':─<60}")
         for sym in symbols:
-            sym_res = [r for r in results if r.symbol == sym]
-            sym_wins = sum(1 for r in sym_res if r.outcome == "WIN")
-            sym_wr   = sym_wins / len(sym_res) * 100
-            sym_pnl  = sum(r.pnl_pct for r in sym_res)
-            print(f"  {sym:<12} signals={len(sym_res)}  wins={sym_wins}  win%={sym_wr:.1f}  sum_pnl={sym_pnl:+.3f}%")
-
-    # ── Session-phase breakdown ───────────────────────────────────────────────
-    # Groups signals by the NSE intraday session phase in which they fired so we
-    # can see how win rate degrades through the day, independent of when the live
-    # system happened to be running.  This is the unbiased view the live P&L can't
-    # give us when the containers are only started after mid-day.
-    def _phase(signal_time: str) -> str:
-        hh, mm = (int(x) for x in signal_time.split(":"))
-        minutes = hh * 60 + mm
-        if minutes < 11 * 60 + 30:      # 09:15–11:29
-            return "EARLY (09:15-11:30)"
-        if minutes < 13 * 60:           # 11:30–12:59
-            return "DEAD ZONE (11:30-13:00)"
-        if minutes < 14 * 60 + 30:      # 13:00–14:29
-            return "RECOVERY (13:00-14:30)"
-        return "LATE (14:30-15:30)"
-
-    _phase_order = [
-        "EARLY (09:15-11:30)",
-        "DEAD ZONE (11:30-13:00)",
-        "RECOVERY (13:00-14:30)",
-        "LATE (14:30-15:30)",
-    ]
+            print(_fmt_metrics(sym, compute_metrics([t for t in trades if t.symbol == sym], settings)))
     print(f"\n{'Per-session-phase':─<60}")
-    print(f"  {'Phase':<24} {'Sigs':>5} {'Win%':>7} {'DecWin%':>8} {'SumPnL%':>9} {'PF':>6}")
-    for phase in _phase_order:
-        ph_res = [r for r in results if _phase(r.signal_time) == phase]
-        if not ph_res:
-            continue
-        ph_total   = len(ph_res)
-        ph_wins    = sum(1 for r in ph_res if r.outcome == "WIN")
-        ph_decided = [r for r in ph_res if r.outcome in ("WIN", "LOSS")]
-        ph_dec_wr  = (sum(1 for r in ph_decided if r.outcome == "WIN") / len(ph_decided) * 100) if ph_decided else 0.0
-        ph_wr      = ph_wins / ph_total * 100
-        ph_pnl     = sum(r.pnl_pct for r in ph_res)
-        ph_gw      = sum(r.pnl_pct for r in ph_res if r.outcome == "WIN")
-        ph_gl      = abs(sum(r.pnl_pct for r in ph_res if r.outcome == "LOSS"))
-        ph_pf      = ph_gw / ph_gl if ph_gl > 0 else float("inf")
-        ph_pf_str  = f"{ph_pf:.2f}" if ph_pf != float("inf") else "∞"
-        print(
-            f"  {phase:<24} {ph_total:>5} {ph_wr:>6.1f}% {ph_dec_wr:>7.1f}% "
-            f"{ph_pnl:>+8.2f}% {ph_pf_str:>6}"
-        )
-
+    for phase in ("EARLY (09:15-11:30)", "DEAD ZONE (11:30-13:00)",
+                  "RECOVERY (13:00-14:30)", "LATE (14:30-15:30)"):
+        ph = [t for t in trades if _phase(t.signal_ts) == phase]
+        if ph:
+            print(_fmt_metrics(phase, compute_metrics(ph, settings)))
 
 
 # ── Main orchestration ────────────────────────────────────────────────────────
@@ -757,12 +621,14 @@ async def run_backtest(
     avg_vol_overrides: Dict[str, float],
     skip_volume: bool,
     fetch_history_days: int,
-) -> List[BacktestResult]:
-    """Fetch candles, replay through scanner logic, and collect results."""
+    bias: str = "NEUTRAL",
+    settings=None,
+) -> List[SignalCandidate]:
+    """Fetch candles and replay them through the live entry gates."""
     client = get_groww_client()
     groww  = await client.get_groww()
 
-    all_results: List[BacktestResult] = []
+    all_results: List[SignalCandidate] = []
 
     # Extend the fetch window backward by ``fetch_history_days`` so we can
     # compute the 20-day average volume and have a prev_close for day 1.
@@ -845,15 +711,11 @@ async def run_backtest(
                 skip_volume=skip_volume,
                 nifty_day_df=nifty_by_date.get(bd),
                 daily_uptrend=daily_trend.get(bd, True),
+                bias=bias,
+                settings=settings,
             )
 
-            wins   = sum(1 for r in day_results if r.outcome == "WIN")
-            losses = sum(1 for r in day_results if r.outcome == "LOSS")
-            tmouts = sum(1 for r in day_results if r.outcome == "TIMEOUT")
-            print(
-                f"    {bd}  signals={len(day_results)}  "
-                f"W={wins} L={losses} T={tmouts}"
-            )
+            print(f"    {bd}  signals={len(day_results)}")
             all_results.extend(day_results)
 
     return all_results
@@ -906,6 +768,34 @@ def parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity (default: WARNING — suppresses scanner debug noise).",
     )
+    p.add_argument(
+        "--bias", default="NEUTRAL", choices=["BULLISH", "NEUTRAL", "BEARISH"],
+        help="Market bias for the bias-modulated entry thresholds (default: NEUTRAL).",
+    )
+    p.add_argument(
+        "--slippage-bps", type=float, default=5.0, metavar="BPS",
+        help="Adverse slippage per market fill in basis points (default: 5).",
+    )
+    p.add_argument(
+        "--stop-slippage-mult", type=float, default=2.0, metavar="X",
+        help="Stop / gap fills slip this many times more (default: 2).",
+    )
+    p.add_argument(
+        "--capital", type=float, default=None, metavar="RUPEES",
+        help="Override TOTAL_CAPITAL for sizing and metrics (default: Settings).",
+    )
+    p.add_argument(
+        "--walk-forward", type=int, default=0, metavar="K",
+        help="Report metrics for K contiguous date folds (stability check).",
+    )
+    p.add_argument(
+        "--holdout-from", default=None, metavar="YYYY-MM-DD",
+        help="Report trades on/after this date separately as an untouched holdout.",
+    )
+    p.add_argument(
+        "--out", default=None, metavar="PATH",
+        help="Write accepted trades to CSV (or .parquet when pyarrow is installed).",
+    )
     return p.parse_args()
 
 
@@ -949,9 +839,16 @@ def main() -> None:
         f"\nBacktest  {start_date} → {end_date}"
         f"  symbols={args.symbols}"
         f"  volume_filter={'OFF' if args.no_volume_filter else 'ON'}"
+        f"  bias={args.bias}"
     )
 
-    results = asyncio.run(
+    holdout_from = date.fromisoformat(args.holdout_from) if args.holdout_from else None
+    settings = get_settings()
+    if args.capital:
+        settings = settings.model_copy(update={"total_capital": args.capital})
+    slip = SlippageModel(bps=args.slippage_bps, stop_mult=args.stop_slippage_mult)
+
+    candidates = asyncio.run(
         run_backtest(
             symbols=args.symbols,
             start_date=start_date,
@@ -959,10 +856,20 @@ def main() -> None:
             avg_vol_overrides=avg_vol_overrides,
             skip_volume=args.no_volume_filter,
             fetch_history_days=args.history_days,
+            bias=args.bias,
+            settings=settings,
         )
     )
 
-    print_report(results)
+    trades, rejected, halted = evaluate_candidates(candidates, settings, slip)
+    print(f"\n[+] {len(candidates)} signal(s) → {len(trades)} trade(s) after portfolio rules")
+    print_report(trades, compute_metrics(trades, settings, halted), rejected, settings, slip)
+    if trades:
+        print_breakdowns(trades, settings, halted)
+        print_sensitivity(candidates, settings, args.stop_slippage_mult)
+        print_out_of_sample(trades, halted, settings, args.walk_forward, holdout_from)
+        if args.out:
+            write_trades(trades, args.out)
 
 
 if __name__ == "__main__":

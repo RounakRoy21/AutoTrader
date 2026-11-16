@@ -27,7 +27,7 @@ export interface MarketBrief {
 
 export interface Trade {
   id: number;
-  kite_order_id: string | null;
+  entry_order_id: string | null;
   stock: string;
   exchange: string;
   direction: 'BUY' | 'SELL';
@@ -39,7 +39,7 @@ export interface Trade {
   exit_price: number | null;
   exit_reason: string | null;
   realized_pnl: number | null;
-  status: 'OPEN' | 'CLOSING' | 'CLOSED';
+  status: 'PENDING' | 'OPEN' | 'CLOSING' | 'CLOSED' | 'REJECTED';
   trade_date: string;
   entry_time: string;
   exit_time: string | null;

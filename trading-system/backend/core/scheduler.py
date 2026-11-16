@@ -10,7 +10,6 @@ from typing import Callable, Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
 import pytz
 
 logger = logging.getLogger(__name__)
@@ -50,19 +49,6 @@ def schedule_cron(
         "Scheduled cron job '%s' at %02d:%02d IST (%s)",
         job_id, hour, minute, day_of_week,
     )
-
-
-def schedule_interval(
-    func: Callable,
-    job_id: str,
-    seconds: int = 5,
-    **kwargs,
-) -> None:
-    """Register an interval-triggered job (e.g. Risk Manager every 5s)."""
-    scheduler = get_scheduler()
-    trigger = IntervalTrigger(seconds=seconds, timezone=IST)
-    scheduler.add_job(func, trigger, id=job_id, replace_existing=True, **kwargs)
-    logger.info("Scheduled interval job '%s' every %ds", job_id, seconds)
 
 
 def schedule_monthly(

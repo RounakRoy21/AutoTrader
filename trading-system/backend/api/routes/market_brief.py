@@ -17,6 +17,7 @@ from core.database import get_db
 from core.nse_calendar import ist_today
 from core.redis_client import get_redis
 from core.redis_keys import LATEST_MARKET_BRIEF_KEY
+from core.security import require_api_key
 from models.market_brief import MarketBrief
 from schemas.market_brief import MarketBriefResponse
 
@@ -50,7 +51,8 @@ async def get_research_agent_status():
 
 # ── Manual trigger ──────────────────────────────────────────────────────────────
 
-@router.post("/run", status_code=202)
+# Paid LLM run — admin API key required (audit R1).
+@router.post("/run", status_code=202, dependencies=[Depends(require_api_key)])
 async def trigger_research_agent(background_tasks: BackgroundTasks):
     """
     Manually trigger the Research Agent.

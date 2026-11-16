@@ -81,7 +81,7 @@ class TestVwap:
         assert abs(vwap - 109.5) < 0.01
 
     def test_day_high_low_do_not_affect_vwap(self):
-        """Kite's cumulative day high/low should NOT influence VWAP.
+        """The feed's cumulative day high/low should NOT influence VWAP.
 
         Before the fix, typical_price was (day_high + day_low + ltp) / 3
         which would yield different results when high/low differ from ltp.
@@ -591,7 +591,7 @@ class TestMockTickBounds:
         """Return a MockTickGenerator pre-seeded with a known open price."""
         from integrations.mock_tick_generator import MockTickGenerator
         gen = MockTickGenerator(on_ticks_callback=lambda ticks: None)
-        # Manually seed so _open_prices is populated without hitting Kite
+        # Manually seed so _open_prices is populated without hitting the broker
         gen._prices[self._SYMBOL] = self._SEED
         gen._open_prices[self._SYMBOL] = self._SEED
         gen._day_high[self._SYMBOL] = self._SEED

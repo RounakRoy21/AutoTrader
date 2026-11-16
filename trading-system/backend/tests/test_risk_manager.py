@@ -433,8 +433,10 @@ class TestPaperBrokerLtpSource:
             with patch("agents.risk_manager.ltp_store.get_ltp", return_value=2499.0) as store_ltp:
                 ltp_map = await rm._build_ltp_map([trade])
 
+        # Broker price is used; the WS tick store is only consulted as a
+        # sanity cross-check (audit R2), never as the price source here.
         assert ltp_map == {"RELIANCE": 2512.5}
-        store_ltp.assert_not_called()
+        store_ltp.assert_called_with("RELIANCE")
 
     @pytest.mark.asyncio
     async def test_build_ltp_map_falls_back_to_tick_store_on_broker_error(self):
@@ -461,39 +463,6 @@ class TestPaperBrokerLtpSource:
 
         assert ltp == 2498.5
         groww_client.assert_not_called()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  GTT Cancellation on Position Close
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class TestGttCancellation:
-    """GTT trigger should be cancelled when a position is closed to prevent
-    orphaned GTT orders from creating naked short positions."""
-
-    def test_trade_model_has_gtt_trigger_id(self):
-        """Trade model must have a gtt_trigger_id field (nullable integer)."""
-        from models.trade import Trade
-        trade = Trade(
-            stock="RELIANCE", exchange="NSE", direction="BUY",
-            product_type="MIS", quantity=100, entry_price=2500.0,
-            stop_loss_price=2480.0, target_price=2540.0, status="OPEN",
-            trade_date=date.today(), entry_time=dt_time(10, 0),
-            gtt_trigger_id=12345,
-        )
-        assert trade.gtt_trigger_id == 12345
-
-    def test_trade_model_gtt_trigger_id_nullable(self):
-        """GTT trigger ID should be optional (None for paper trades)."""
-        from models.trade import Trade
-        trade = Trade(
-            stock="RELIANCE", exchange="NSE", direction="BUY",
-            product_type="MIS", quantity=100, entry_price=2500.0,
-            stop_loss_price=2480.0, target_price=2540.0, status="OPEN",
-            trade_date=date.today(), entry_time=dt_time(10, 0),
-        )
-        assert trade.gtt_trigger_id is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -727,7 +696,18 @@ class TestPartialBookingLogic:
 
 
 class TestPartialBookingExecution:
-    """Async behaviour of RiskManager._book_partial in paper mode."""
+    """Async behaviour of RiskManager._book_partial in paper mode (through the
+    PaperBroker, like live)."""
+
+    @staticmethod
+    def _paper_broker(trade, price=2525.0):
+        from integrations.paper_broker import PaperBroker
+
+        broker = PaperBroker(price_source=lambda s: price)
+        trade.sl_order_id = broker.adopt_position(
+            trade.stock, trade.quantity, trade.entry_price, stop_price=trade.stop_loss_price,
+        )
+        return patch("agents.risk_manager.get_broker", return_value=broker)
 
     @pytest.mark.asyncio
     async def test_book_partial_paper_reduces_qty_and_books_pnl(self, open_trade):
@@ -739,7 +719,8 @@ class TestPartialBookingExecution:
             partial_booking_move_sl_to_breakeven=True,
         )
         # open_trade: entry 2500, sl 2475, qty 100, product MIS
-        with patch("agents.risk_manager.get_db_context", _fake_db_context), \
+        with self._paper_broker(open_trade), \
+             patch("agents.risk_manager.get_db_context", _fake_db_context), \
              patch("agents.risk_manager.send_telegram", new=AsyncMock()) as tel, \
              patch("agents.risk_manager.publish", new=AsyncMock()) as pub, \
              patch("agents.risk_manager._transaction_costs", return_value=0.0):
@@ -761,7 +742,8 @@ class TestPartialBookingExecution:
             partial_booking_fraction=0.5,
             partial_booking_move_sl_to_breakeven=False,
         )
-        with patch("agents.risk_manager.get_db_context", _fake_db_context), \
+        with self._paper_broker(open_trade), \
+             patch("agents.risk_manager.get_db_context", _fake_db_context), \
              patch("agents.risk_manager.send_telegram", new=AsyncMock()), \
              patch("agents.risk_manager.publish", new=AsyncMock()), \
              patch("agents.risk_manager._transaction_costs", return_value=0.0):
@@ -780,7 +762,8 @@ class TestPartialBookingExecution:
             partial_booking_move_sl_to_breakeven=True,
         )
         open_trade.booked_pnl = 300.0                       # a prior leg
-        with patch("agents.risk_manager.get_db_context", _fake_db_context), \
+        with self._paper_broker(open_trade), \
+             patch("agents.risk_manager.get_db_context", _fake_db_context), \
              patch("agents.risk_manager.send_telegram", new=AsyncMock()), \
              patch("agents.risk_manager.publish", new=AsyncMock()), \
              patch("agents.risk_manager._transaction_costs", return_value=0.0):

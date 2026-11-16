@@ -1,6 +1,5 @@
 """
 Tests for integration-layer fixes:
-  - GrowwClient.delete_gtt() exists and is callable
   - Circuit breaker sends Telegram alert when halt triggers
   - ltp_store is cleared at session start (TradingAgent.start)
 """
@@ -10,51 +9,6 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  KiteClient — delete_gtt
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class TestGrowwClientDeleteGtt:
-    """GrowwClient must expose delete_gtt() so the risk manager can cancel
-    server-side GTT orders before executing a manual SELL."""
-
-    def test_delete_gtt_method_exists(self):
-        """GrowwClient must have a delete_gtt coroutine method."""
-        import inspect
-        from integrations.groww_client import GrowwClient
-        assert hasattr(GrowwClient, "delete_gtt")
-        assert inspect.iscoroutinefunction(GrowwClient.delete_gtt)
-
-    @pytest.mark.asyncio
-    async def test_delete_gtt_paper_mode_no_exception(self):
-        """In paper mode, delete_gtt should succeed without calling real API."""
-        from integrations.groww_client import GrowwClient
-
-        client = GrowwClient()
-        # Patch settings to paper_trading=True
-        with patch.object(client, "_settings") as mock_settings:
-            mock_settings.paper_trading = True
-            # Should complete without error
-            await client.delete_gtt(trigger_id=12345)
-
-    @pytest.mark.asyncio
-    async def test_delete_gtt_live_mode_calls_api(self):
-        """In live mode, delete_gtt should call the broker's delete_gtt(trigger_id)."""
-        from integrations.groww_client import GrowwClient
-
-        client = GrowwClient()
-        mock_broker = MagicMock()
-        mock_broker.cancel_order = MagicMock(return_value=None)
-
-        with patch("integrations.groww_client.get_value", new=AsyncMock(return_value="real-order-id")), \
-             patch.object(client, "_settings") as mock_settings, \
-             patch.object(client, "get_groww", new=AsyncMock(return_value=mock_broker)):
-            mock_settings.paper_trading = False
-            with patch("asyncio.to_thread", new=AsyncMock(return_value=None)):
-                await client.delete_gtt(trigger_id=99999)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -201,6 +155,7 @@ class TestCircuitBreakerAlert:
         mock_halt_alert = AsyncMock()
 
         with patch("integrations.groww_client.set_value", new=AsyncMock()), \
+             patch("integrations.groww_client.set_halt", new=AsyncMock()), \
              patch(
                  "integrations.groww_client.GrowwClient._handle_failure",
                  wraps=client._handle_failure,

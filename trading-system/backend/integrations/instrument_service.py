@@ -104,6 +104,7 @@ async def load_instrument_map() -> Dict[str, int]:
     # 1. Try Redis cache
     cached = await get_value(INSTRUMENT_MAP_KEY)
     if cached:
+        await _load_cached_tick_sizes()
         try:
             token_map: Dict[str, int] = json.loads(cached)
             logger.info(
@@ -186,12 +187,29 @@ async def _fetch_from_groww(groww_client, focus_stocks: list[str]) -> Dict[str, 
     nse_cash = df[(df["exchange"] == "NSE") & (df["segment"] == "CASH")]
 
     token_map: Dict[str, int] = {}
+    tick_sizes: Dict[str, float] = {}
+    has_tick_col = "tick_size" in nse_cash.columns
     for symbol in focus_stocks:
         rows = nse_cash[nse_cash["trading_symbol"] == symbol]
         if not rows.empty:
             token_str = rows.iloc[0]["exchange_token"]
             if token_str and str(token_str) != "nan":
                 token_map[symbol] = int(token_str)
+            if has_tick_col:
+                try:
+                    tick = float(rows.iloc[0]["tick_size"])
+                    if tick > 0:
+                        tick_sizes[symbol] = tick
+                except (TypeError, ValueError):
+                    pass
+    if tick_sizes:
+        _set_tick_sizes(tick_sizes)
+        try:
+            await set_value(
+                INSTRUMENT_TICK_SIZES_KEY, json.dumps(tick_sizes), ttl=INSTRUMENT_MAP_TTL,
+            )
+        except Exception as exc:
+            logger.debug("Could not cache instrument tick sizes: %s", exc)
     return token_map
 
 
@@ -199,6 +217,30 @@ async def _fetch_from_groww(groww_client, focus_stocks: list[str]) -> Dict[str, 
 
 _live_map: Dict[str, int] = {}
 _token_to_symbol: Dict[int, str] = {}  # reverse index — O(1) lookup per tick
+# symbol → exchange tick size (₹) from the Groww instrument CSV.  Empty when the
+# CSV was not downloaded (cache / hardcoded fallback) — callers then use the
+# core.tick_size default.
+_tick_sizes: Dict[str, float] = {}
+INSTRUMENT_TICK_SIZES_KEY = "groww_instrument_tick_sizes"
+
+
+def _set_tick_sizes(m: Dict[str, float]) -> None:
+    global _tick_sizes
+    _tick_sizes = dict(m)
+
+
+async def _load_cached_tick_sizes() -> None:
+    try:
+        raw = await get_value(INSTRUMENT_TICK_SIZES_KEY)
+        if raw:
+            _set_tick_sizes({k: float(v) for k, v in json.loads(raw).items()})
+    except Exception as exc:
+        logger.debug("Could not load cached tick sizes: %s", exc)
+
+
+def get_tick_size(symbol: str) -> Optional[float]:
+    """Return the instrument tick size for *symbol*, or None when unknown."""
+    return _tick_sizes.get(symbol)
 
 
 def _set_live_map(m: Dict[str, int]) -> None:

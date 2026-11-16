@@ -7,7 +7,51 @@ cross-module key dependencies explicit and searchable.
 """
 
 # ── Trading control ────────────────────────────────────────────────────────────
+# Base name only.  The live halt flag is DATE-SCOPED (audit R7 / C8): use
+# ``halt_key()`` → "trading_halt:YYYY-MM-DD" (IST).  A halt therefore survives
+# any restart / session start on the same trading day and lapses on its own
+# when the IST date changes — nothing ever writes "FALSE" on startup.
 HALT_KEY = "trading_halt"               # "TRUE" | "FALSE"
+HALT_REASON_KEY = "trading_halt_reason"
+CONSECUTIVE_LOSSES_KEY = "consecutive_losses"
+LOSS_PAUSE_UNTIL_KEY = "consecutive_loss_pause_until"
+STOCK_LOCK_KEY = "stock_lock"
+
+# Date-scoped risk keys expire after 48 h purely for cleanup; correctness comes
+# from the date suffix, not from the TTL.
+RISK_STATE_TTL_S = 48 * 3600
+
+
+def _ist_date_str(d=None) -> str:
+    if d is None:
+        from core.nse_calendar import ist_today
+        d = ist_today()
+    return d.isoformat()
+
+
+def halt_key(d=None) -> str:
+    """Today's (IST) trading-halt flag key: ``trading_halt:YYYY-MM-DD``."""
+    return f"{HALT_KEY}:{_ist_date_str(d)}"
+
+
+def halt_reason_key(d=None) -> str:
+    """Today's (IST) halt-reason key (free text, for operators)."""
+    return f"{HALT_REASON_KEY}:{_ist_date_str(d)}"
+
+
+def consecutive_losses_key(d=None) -> str:
+    """Today's (IST) consecutive-loss streak counter key."""
+    return f"{CONSECUTIVE_LOSSES_KEY}:{_ist_date_str(d)}"
+
+
+def loss_pause_until_key(d=None) -> str:
+    """Today's (IST) consecutive-loss pause deadline key (ISO timestamp)."""
+    return f"{LOSS_PAUSE_UNTIL_KEY}:{_ist_date_str(d)}"
+
+
+def stock_lock_key(symbol: str, d=None) -> str:
+    """Today's (IST) per-stock lock key: ``stock_lock:YYYY-MM-DD:SYMBOL``."""
+    return f"{STOCK_LOCK_KEY}:{_ist_date_str(d)}:{symbol}"
 
 # ── Groww authentication ──────────────────────────────────────────────────────
 GROWW_TOKEN_KEY = "groww_session_token"  # Groww access token (no expiry, persists until revoked)

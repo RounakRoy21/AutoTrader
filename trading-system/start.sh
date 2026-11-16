@@ -7,6 +7,9 @@
 #   ./start.sh --build   # rebuild images first, then start (use after code changes)
 #   ./start.sh --stop    # gracefully stop all services
 #   ./start.sh --status  # print container status and exit
+#
+# Container engine: podman if installed, else docker.
+# Override with CONTAINER_ENGINE=docker ./start.sh (or =podman).
 # ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -49,7 +52,18 @@ if [[ -f docker-compose.prod.yml ]]; then
     fi
 fi
 
-COMPOSE="docker compose $COMPOSE_FILES"
+# ── Container engine (podman preferred, docker fallback) ──────────────────────
+ENGINE="${CONTAINER_ENGINE:-}"
+if [[ -z "$ENGINE" ]]; then
+    if command -v podman &>/dev/null; then ENGINE=podman
+    elif command -v docker &>/dev/null; then ENGINE=docker
+    else error "Neither podman nor docker is installed. Run ./deploy.sh first."
+    fi
+fi
+command -v "$ENGINE" &>/dev/null || error "$ENGINE is not installed."
+[[ "$ENGINE" == "podman" ]] && export PODMAN_COMPOSE_WARNING_LOGS=false
+
+COMPOSE="$ENGINE compose $COMPOSE_FILES"
 
 # ── --stop ─────────────────────────────────────────────────────────────────────
 if [[ "$ACTION" == "stop" ]]; then
@@ -80,9 +94,9 @@ if grep -qE '<[^>]+>' .env 2>/dev/null; then
 fi
 ok ".env looks populated"
 
-command -v docker &>/dev/null || error "Docker is not installed. Run ./deploy.sh first."
-docker info &>/dev/null        || error "Docker daemon is not running. Start it first."
-ok "Docker is running"
+$ENGINE info &>/dev/null || error "$ENGINE is not reachable (daemon / podman machine not running?). Start it first."
+$ENGINE compose version &>/dev/null || error "'$ENGINE compose' is unavailable. Install docker-compose or podman-compose."
+ok "$ENGINE is running"
 
 # ── 2. Start containers ────────────────────────────────────────────────────────
 info "Starting containers${BUILD_FLAG:+ (with image rebuild)}..."
@@ -93,18 +107,18 @@ echo ""
 # ── 3. Wait for postgres to be healthy ────────────────────────────────────────
 info "Waiting for postgres..."
 for i in $(seq 1 30); do
-    STATUS=$(docker inspect --format='{{.State.Health.Status}}' autotrader-postgres 2>/dev/null || echo "missing")
+    STATUS=$($ENGINE inspect --format='{{.State.Health.Status}}' autotrader-postgres 2>/dev/null || echo "missing")
     [[ "$STATUS" == "healthy" ]] && { ok "postgres healthy"; break; }
-    [[ $i -eq 30 ]] && error "postgres did not become healthy within 60 s.\n       Investigate: docker compose logs postgres"
+    [[ $i -eq 30 ]] && error "postgres did not become healthy within 60 s.\n       Investigate: $ENGINE compose logs postgres"
     sleep 2
 done
 
 # ── 4. Wait for redis to be healthy ───────────────────────────────────────────
 info "Waiting for redis..."
 for i in $(seq 1 30); do
-    STATUS=$(docker inspect --format='{{.State.Health.Status}}' autotrader-redis 2>/dev/null || echo "missing")
+    STATUS=$($ENGINE inspect --format='{{.State.Health.Status}}' autotrader-redis 2>/dev/null || echo "missing")
     [[ "$STATUS" == "healthy" ]] && { ok "redis healthy"; break; }
-    [[ $i -eq 30 ]] && error "redis did not become healthy within 60 s.\n       Investigate: docker compose logs redis"
+    [[ $i -eq 30 ]] && error "redis did not become healthy within 60 s.\n       Investigate: $ENGINE compose logs redis"
     sleep 2
 done
 
@@ -115,7 +129,7 @@ for i in $(seq 1 45); do
         ok "backend API is up"
         break
     fi
-    [[ $i -eq 45 ]] && warning "Backend health check timed out — migrations will still be attempted.\n       If it keeps failing, check: docker compose logs backend"
+    [[ $i -eq 45 ]] && warning "Backend health check timed out — migrations will still be attempted.\n       If it keeps failing, check: $ENGINE compose logs backend"
     sleep 2
 done
 
@@ -142,9 +156,9 @@ echo "  Groww auth (one-time): POST http://${SERVER_IP}:8000/api/auth/groww/logi
 echo "  (only needed once — TOTP tokens do not expire)"
 echo ""
 echo "  Useful commands:"
-echo "    docker compose logs -f backend          # live backend logs"
-echo "    docker compose logs -f backend | grep scanner   # scanner only"
-echo "    docker compose exec postgres psql -U autotrader -d autotrader"
+echo "    $ENGINE compose logs -f backend          # live backend logs"
+echo "    $ENGINE compose logs -f backend | grep scanner   # scanner only"
+echo "    $ENGINE compose exec postgres psql -U autotrader -d autotrader"
 echo "    ./start.sh --stop                       # graceful shutdown"
 echo ""
 

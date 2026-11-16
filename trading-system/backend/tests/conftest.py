@@ -65,8 +65,6 @@ def settings() -> Settings:
         partial_booking_fraction=0.5,
         partial_booking_move_sl_to_breakeven=True,
         anthropic_api_key="placeholder",
-        kite_api_key="placeholder",
-        kite_api_secret="placeholder",
     )
 
 
@@ -125,7 +123,6 @@ def open_trade() -> MagicMock:
     trade.realized_pnl = None
     trade.exit_price = None
     trade.exchange = "NSE"
-    trade.gtt_trigger_id = None
     trade.original_quantity = 100
     trade.partial_target_price = 2525.0  # entry + 1R (R = 25)
     trade.partial_booked = False

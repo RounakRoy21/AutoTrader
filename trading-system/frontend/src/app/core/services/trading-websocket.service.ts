@@ -9,6 +9,7 @@ import { webSocket, WebSocketSubject } from 'rxjs/webSocket';
 import { Observable, Subject, BehaviorSubject, timer, EMPTY, Subscription } from 'rxjs';
 import { filter, map, takeUntil } from 'rxjs/operators';
 import { WsEvent, LtpMap, DecisionEntry } from '../models';
+import { getAdminApiKey } from '../auth/admin-api-key';
 
 const MAX_RETRIES = 10;
 const RECONNECT_BASE_MS = 1000;
@@ -53,6 +54,7 @@ export class TradingWebSocketService implements OnDestroy {
       openObserver: {
         next: () => {
           console.log('[WS] Connected');
+          this.sendAuth();
           this.reconnectAttempt = 0;
           this._connectionState$.next('connected');
           this.startHeartbeat();
@@ -101,6 +103,25 @@ export class TradingWebSocketService implements OnDestroy {
         this.reconnectSub = null;
         this.connect();
       });
+  }
+
+  /**
+   * First-message auth for /ws/live.  Browsers cannot set an X-Api-Key header
+   * on the WebSocket handshake, and a ?api_key= query string would end up in
+   * nginx / uvicorn access logs, so the key goes in the first frame instead.
+   * The backend closes the socket (1008) if the key is wrong or missing while
+   * ADMIN_API_KEY is configured; with no key configured nothing is sent.
+   */
+  private sendAuth(): void {
+    const apiKey = getAdminApiKey();
+    if (!apiKey) {
+      return;
+    }
+    try {
+      this.socket$?.next({ channel: 'auth', data: { api_key: apiKey } });
+    } catch {
+      // closeObserver / reconnect path handles a socket that died during open
+    }
   }
 
   private startHeartbeat(): void {

@@ -121,7 +121,7 @@ An automated NSE intraday equity trading system. Streams live tick data from Gro
 - Real-time WebSocket feed: live tick updates, decisions, trade events, market briefs
 
 **Infrastructure**
-- Docker Compose: PostgreSQL 16 + Redis 7 + FastAPI + nginx/Angular
+- Compose stack (Podman or Docker): PostgreSQL 16 + Redis 7 + FastAPI + nginx/Angular
 - Alembic migrations
 - Two-stage Docker build (non-root runtime user)
 - Production compose overlay: no hot-reload, no exposed internal ports, log rotation
@@ -145,7 +145,7 @@ An automated NSE intraday equity trading system. Streams live tick data from Gro
 | News | HybridNewsAggregator — 7 Indian financial RSS feeds + per-stock & broad Google News RSS (no API key) |
 | Alerts | Telegram Bot API |
 | Frontend | Angular 17, TypeScript |
-| Containers | Docker, Docker Compose |
+| Containers | Podman or Docker, Compose spec |
 | Server | Oracle Cloud Free Tier (Ampere A1, Ubuntu) |
 
 ---
@@ -208,7 +208,7 @@ trading-system/
 ├── docker-compose.prod.yml         # Production overrides
 ├── deploy.sh                       # Oracle Cloud one-time bootstrap script
 ├── start.sh                        # Daily launch script (Linux / Oracle Cloud)
-├── start.ps1                       # Daily launch script (Windows / Docker Desktop)
+├── start.ps1                       # Daily launch script (Windows / Podman or Docker)
 ├── PRODUCTION_SETUP.md             # Step-by-step production setup guide
 └── PREPRODUCTION_CHECKLIST.md
 ```
@@ -221,7 +221,8 @@ trading-system/
 
 | Requirement | Notes |
 |---|---|
-| [Docker Desktop](https://www.docker.com/products/docker-desktop/) | Windows / macOS — includes Compose |
+| [Podman](https://podman.io) + a compose provider (`winget install Docker.DockerCompose` or `pip install podman-compose`) | Windows (default) — `start.ps1` auto-starts the Podman machine. See [WINDOWS_SETUP.md](trading-system/WINDOWS_SETUP.md) |
+| [Docker Desktop](https://www.docker.com/products/docker-desktop/) | Alternative on Windows / macOS — used automatically if Podman is not installed |
 | Docker Engine + Compose plugin | Linux — `curl -fsSL https://get.docker.com \| sh` |
 | Git | For cloning |
 
@@ -257,7 +258,7 @@ Open `.env` and fill in the required values:
 
 ### Step 2 — Start the stack
 
-**Windows (Docker Desktop):**
+**Windows (Podman, or Docker Desktop as fallback):**
 ```powershell
 .\start.ps1
 ```
@@ -268,7 +269,7 @@ chmod +x start.sh && ./start.sh
 ```
 
 The script will:
-1. Verify `.env` is filled in and Docker is running
+1. Verify `.env` is filled in and the container engine (Podman or Docker) is running
 2. Start all 4 containers (postgres, redis, backend, frontend)
 3. Wait for each service to pass its health check
 4. Run Alembic database migrations automatically

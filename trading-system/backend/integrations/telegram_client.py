@@ -57,7 +57,11 @@ async def send_telegram(message: str) -> bool:
         logger.info("Telegram alert sent: %s", message[:80])
         return True
     except Exception as exc:
-        logger.error("Telegram send failed: %s", exc)
+        # httpx errors embed the request URL, which contains the bot token.
+        logger.error(
+            "Telegram send failed: %s",
+            str(exc).replace(settings.telegram_bot_token, "***REDACTED***"),
+        )
         return False
 
 

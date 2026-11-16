@@ -53,6 +53,22 @@ def engine(settings) -> DecisionEngine:
     return de
 
 
+@pytest.fixture(autouse=True)
+def _strict_reads_follow_get_value(monkeypatch):
+    """Risk-gate fallback reads use ``get_value_strict`` (fail closed, audit C8).
+
+    These tests stub ``agents.decision_engine.get_value``; route the strict
+    reads through whatever that stub is at call time so each test controls
+    both paths with one mock.
+    """
+    import agents.decision_engine as de
+
+    async def _strict(key):
+        return await de.get_value(key)
+
+    monkeypatch.setattr(de, "get_value_strict", _strict)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  _validate_decision  (pure logic — no I/O, no mocks)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -374,7 +390,7 @@ class TestPreCheck:
         mock_dt.now.return_value = _MARKET_DT
 
         async def side_effect(key):
-            if key == "trading_halt":
+            if key.startswith("trading_halt:"):
                 return None
             if key == "daily_trade_count":
                 return "6"
@@ -607,9 +623,9 @@ class TestProtectionPreChecks:
         mock_dt.now.return_value = _MARKET_DT
 
         async def side_effect(key):
-            if key == "trading_halt":
+            if key.startswith("trading_halt:"):
                 return None
-            if key == "stock_lock:RELIANCE":
+            if key.startswith("stock_lock:") and key.endswith(":RELIANCE"):
                 return "TRUE"
             return None
         mock_get_value.side_effect = side_effect
@@ -637,13 +653,13 @@ class TestProtectionPreChecks:
         future = (_MARKET_DT + timedelta(minutes=15)).isoformat()
 
         async def side_effect(key):
-            if key == "trading_halt":
+            if key.startswith("trading_halt:"):
                 return None
             if key.startswith("stock_lock"):
                 return None
-            if key == "consecutive_losses":
+            if key.startswith("consecutive_losses:"):
                 return "3"
-            if key == "consecutive_loss_pause_until":
+            if key.startswith("consecutive_loss_pause_until:"):
                 return future
             return None
         mock_get_value.side_effect = side_effect
@@ -651,6 +667,58 @@ class TestProtectionPreChecks:
         passed, reason, _ = await engine._pre_check(signal)
         assert not passed
         assert "consecutive" in reason.lower()
+
+    # ── Audit R7 / C8: date-scoped keys, fail-closed reads ──────────────────
+
+    @pytest.mark.asyncio
+    @patch("agents.decision_engine.datetime")
+    @patch("agents.decision_engine.get_redis", side_effect=ConnectionError("Redis down"))
+    async def test_unreadable_risk_state_fails_closed(
+        self, mock_get_redis, mock_dt, engine, signal, monkeypatch
+    ):
+        """Redis down for both the pipeline and strict reads → reject (halted)."""
+        import agents.decision_engine as de
+
+        mock_dt.now.return_value = _MARKET_DT
+        monkeypatch.setattr(de, "get_value_strict", AsyncMock(side_effect=ConnectionError("Redis down")))
+
+        passed, reason, _ = await engine._pre_check(signal)
+        assert not passed
+        assert "unreadable" in reason.lower()
+
+    @pytest.mark.asyncio
+    @patch("agents.decision_engine.datetime")
+    @patch("agents.decision_engine.get_redis", side_effect=ConnectionError("Redis down"))
+    @patch("agents.decision_engine.get_value")
+    async def test_halt_is_read_from_todays_date_scoped_key(
+        self, mock_get_value, mock_get_redis, mock_dt, engine, signal
+    ):
+        """Only today's ``trading_halt:YYYY-MM-DD`` key halts; the legacy
+        un-scoped key (and yesterday's) are ignored."""
+        from core.nse_calendar import ist_today
+        from core.redis_keys import halt_key
+
+        mock_dt.now.return_value = _MARKET_DT
+        today_key = halt_key()
+        assert today_key == f"trading_halt:{ist_today().isoformat()}"
+        yesterday_key = halt_key(ist_today() - timedelta(days=1))
+
+        async def halted_today(key):
+            return "TRUE" if key == today_key else None
+
+        mock_get_value.side_effect = halted_today
+        passed, reason, _ = await engine._pre_check(signal)
+        assert not passed and "halted" in reason.lower()
+
+        async def stale_keys_only(key):
+            return "TRUE" if key in ("trading_halt", yesterday_key) else None
+
+        mock_get_value.side_effect = stale_keys_only
+        engine._market_brief = None
+        engine._count_open_positions = AsyncMock(return_value=0)
+        with patch("agents.decision_engine.get_db_context", return_value=_mock_db_context(0)):
+            passed, reason, _ = await engine._pre_check(signal)
+        assert "halted" not in reason.lower()
 
 
 # ═══════════════════════════════════════════════════════════════════════════

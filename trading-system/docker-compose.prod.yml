@@ -1,21 +1,31 @@
 # Production overrides — use together with the base file:
 #
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#   (or: podman compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build)
 #
 # Changes vs dev:
 #   - Frontend: multi-stage build → nginx (port 80), no source-code volume mount
-#   - Backend:  no --reload, no source-code volume mount, 2 uvicorn workers
-#   - Postgres/Redis: ports NOT exposed to the host (only reachable inside Docker network)
+#   - Backend:  no --reload, no source-code volume mount, single uvicorn worker
+#   - Postgres/Redis/Backend: ports NOT exposed to the host (only reachable inside the compose network)
+#   - Set REDIS_PASSWORD (requirepass) and a non-default POSTGRES_PASSWORD in .env.
 #   - All services: restart unless-stopped + log rotation (10 MB × 5 files)
 #   - Frontend waits for backend healthcheck before nginx starts
+#
+# Why `!reset []` (audit R2): Compose MERGES sequences across -f files, so a plain
+# `ports: []` / `volumes: []` here is a no-op — the base file's 5432/6379/8000
+# bindings and the ./backend:/app source mount would silently survive into prod.
+# `!reset` removes the inherited value instead.  Requires docker compose >= 2.24
+# or podman-compose >= 1.1 (older versions fail loudly on the unknown tag rather
+# than exposing the ports).  Verify with:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml config | grep -n -A3 "ports:"
+#   (only the frontend's 80:80 should remain)
 
-version: "3.9"
 
 services:
 
   # ── PostgreSQL ──────────────────────────────────────────────────────────────
   postgres:
-    ports: []   # Remove host exposure; only backend container needs it
+    ports: !reset []   # Remove host exposure; only backend container needs it
     restart: unless-stopped
     logging:
       driver: "json-file"
@@ -25,7 +35,7 @@ services:
 
   # ── Redis ────────────────────────────────────────────────────────────
   redis:
-    ports: []   # Same — no external exposure
+    ports: !reset []   # Same — no external exposure
     restart: unless-stopped
     logging:
       driver: "json-file"
@@ -38,13 +48,13 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    volumes: []   # No live source mount; image contains the code
+    volumes: !reset []   # No live source mount; image contains the code
     # CRITICAL: must run as a single process. This system uses in-process singletons
     # (TradingAgentManager, Scanner, RiskManager, APScheduler) with no distributed
     # coordination. --workers > 1 would create duplicate trading sessions, duplicate
-    # Kite WebSocket connections, and duplicate BUY orders for every signal.
-    ports: []     # Remove host port exposure — only nginx (port 80) is publicly accessible.
-                  # The base docker-compose.yml exposes 8000:8000; this override suppresses it.
+    # GrowwFeed WebSocket connections, and duplicate BUY orders for every signal.
+    ports: !reset []   # Remove host port exposure — only nginx (port 80) is publicly accessible.
+                       # The base docker-compose.yml exposes 8000:8000; !reset drops it.
     restart: unless-stopped
     command: >
       uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
@@ -60,9 +70,10 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       target: production       # Use the nginx stage, not ng serve
-    ports:
+    # !override so the base file's dev 4201:80 binding is replaced, not appended.
+    ports: !override
       - "80:80"                # Single public port — nginx reverse-proxies /api and /ws
-    volumes: []                # No source mount; image contains the build
+    volumes: !reset []         # No source mount; image contains the build
     restart: unless-stopped
     command: ["nginx", "-g", "daemon off;"]
     depends_on:

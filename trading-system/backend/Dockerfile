@@ -1,5 +1,5 @@
 # ── Stage 1: Builder — compile wheels & install deps ─────────────────────────
-FROM python:3.14-slim AS builder
+FROM docker.io/library/python:3.14-slim AS builder
 
 WORKDIR /app
 
@@ -11,7 +11,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 # ── Stage 2: Runtime — lean image, no build tools ────────────────────────────
-FROM python:3.14-slim AS runtime
+FROM docker.io/library/python:3.14-slim AS runtime
 
 # Runtime system deps only (libpq for asyncpg, curl for healthcheck)
 RUN apt-get update && apt-get install -y --no-install-recommends \

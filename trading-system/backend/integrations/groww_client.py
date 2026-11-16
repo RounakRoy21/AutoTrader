@@ -1,31 +1,36 @@
 """
 Groww API wrapper.
 Centralised interface for order placement, position fetch, and WebSocket ticks.
+The trading code reaches it through ``integrations.groww_broker.GrowwBroker``
+(the live ``BrokerPort``); market-data readers use ``get_groww_client()``.
 
-Replaces kite_client.py — public interface is identical so all callers
-(scanner.py, risk_manager.py, trading_agent.py, trades.py) require only an
-import rename: `from integrations.groww_client import get_groww_client`.
-
-Key differences from Kite:
+Notes:
   • Auth: TOTP-based login, no daily OAuth refresh. Access tokens are stored
     in Redis with no TTL (token persists until explicitly invalidated or
     user revokes via Groww app).
-  • Orders: same REST semantics, different SDK object.
-  • GTT → OCO: Groww uses OCO (One-Cancels-the-Other) bracket orders for
-    atomic stop-loss + target. The public interface still calls them
-    place_gtt/delete_gtt for drop-in compatibility.
+  • Broker stop: a single plain SL-limit SELL order (no OCO, no target leg —
+    the target is enforced client-side by the RiskManager poll).  See
+    ``place_stop_loss_order``.
+  • Order writes (place / cancel) are NEVER retried automatically: every
+    placed order carries a unique order_reference_id and an ambiguous failure
+    (timeout / connection error) is resolved by looking the order up by that
+    reference instead of resubmitting (audit R5 / C3).
+  • Prices sent to the broker are snapped to the instrument tick size
+    (core.tick_size, audit R10 / C6).
   • WebSocket (GrowwFeed): delivers LTP + timestamp per tick. Does NOT deliver
     volume_traded or OHLC fields. The Scanner supplements these via periodic
     REST polling (see scanner.py).
   • Instruments: identified by trading symbol strings for REST calls.
-    GrowwFeed WebSocket subscriptions use integer `exchange_token` (NOT
-    Zerodha instrument tokens — different values even for the same stock).
-  • Positions: `buy_quantity` / `sell_quantity` instead of `quantity`.
-    Net position = buy_quantity - sell_quantity.
+    GrowwFeed WebSocket subscriptions use integer `exchange_token`.
+  • Positions: read with ``get_positions_for_user(segment="CASH")``; the net
+    quantity is ``quantity`` (else credit - debit, else buy - sell).
+  • Orders: read with ``get_order_list`` (paged) / ``get_order_detail``.
+    Every SDK read passes ``timeout=READ_TIMEOUT_S`` (the SDK default is
+    infinite).
   • Historical data: uses trading symbol + exchange string, not integer token.
 
-Circuit-breaker: same 60-second logic as kite_client. If the Groww API is
-unreachable for > 60s, the HALT flag is set and a Telegram alert is sent.
+Circuit-breaker: if the Groww API is unreachable for > 60s, the HALT flag is
+set and a Telegram alert is sent.
 """
 
 from __future__ import annotations
@@ -44,12 +49,172 @@ except ImportError:  # SDK only available inside Docker image
 
 from core.config import get_settings
 from core.nse_calendar import ist_today
+from core.tick_size import ceil_to_tick, floor_to_tick, get_tick_size, sl_limit_price
 from core.redis_client import get_value, set_value
-from core.redis_keys import HALT_KEY, GROWW_TOKEN_KEY
+from core.redis_keys import GROWW_TOKEN_KEY
+from core.risk_state import set_halt
 
 logger = logging.getLogger(__name__)
 MAX_RETRIES = 3
 CIRCUIT_BREAKER_SECONDS = 60
+
+# Order-write safety (audit R5 / C3 / R12)
+ORDER_WRITE_TIMEOUT_S = 10          # HTTP timeout passed to the SDK for writes
+ORDER_LOOKUP_ATTEMPTS = 3           # reference lookups after an ambiguous failure
+ORDER_LOOKUP_DELAY_S = 1.0          # async (non-blocking) delay between lookups
+SL_LIMIT_BUFFER_PCT = 0.005         # SL-limit: limit price 0.5% below the trigger
+# Every SDK READ gets an explicit HTTP timeout: the SDK default (None) waits
+# forever, and one hung read would stall the single-flight RiskManager poll.
+READ_TIMEOUT_S = 8
+ORDER_LIST_PAGE_SIZE = 25           # Groww's default order-list page size
+ORDER_LIST_MAX_PAGES = 40           # safety cap when paging the day's order list
+
+
+class OrderStateUnknownError(RuntimeError):
+    """An order write failed ambiguously and its fate could not be confirmed.
+
+    The order MAY be live at the broker.  Callers must not resubmit blindly;
+    they should treat the position as needing manual / reconciliation review.
+    """
+
+    def __init__(self, message: str, order_reference_id: str) -> None:
+        super().__init__(message)
+        self.order_reference_id = order_reference_id
+
+
+def new_order_reference_id() -> str:
+    """Return a unique Groww order_reference_id (8-20 alphanumeric chars)."""
+    return f"AT{uuid.uuid4().hex[:16].upper()}"  # 18 chars, [A-Z0-9]
+
+
+def _is_definitive_rejection(exc: Exception) -> bool:
+    """True when the broker definitely did NOT accept the order.
+
+    A Groww API exception carrying a 4xx code or a business-level FAILURE
+    code is a definitive answer from the server.  Timeouts (504), 5xx,
+    connection resets and any unknown exception are ambiguous: the request
+    may have reached the exchange.
+    """
+    code = getattr(exc, "code", None)
+    if code is None:
+        return False
+    code = str(code)
+    if not code:
+        return False
+    if code.isdigit():
+        return 400 <= int(code) < 500
+    # Non-numeric business error codes (e.g. "GA001") come from a parsed
+    # FAILURE response, i.e. the server rejected the request.
+    return True
+
+
+def _positive_price(value: Any) -> Optional[float]:
+    """Return *value* as a float if it is a finite price > 0, else None."""
+    try:
+        p = float(value)
+    except (TypeError, ValueError):
+        return None
+    if p != p or p <= 0 or p == float("inf"):
+        return None
+    return p
+
+
+# Normalised order states (audit R3 / R4).  Groww reports EXECUTED / COMPLETED
+# for a fully filled order and FAILED for a rejected one.
+TERMINAL_ORDER_STATUSES = frozenset({"COMPLETE", "REJECTED", "CANCELLED"})
+_COMPLETE_STATUSES = frozenset({"COMPLETE", "COMPLETED", "EXECUTED", "FILLED", "DELIVERY_AWAITED"})
+_REJECTED_STATUSES = frozenset({"REJECTED", "FAILED"})
+_CANCELLED_STATUSES = frozenset({"CANCELLED", "CANCELED"})
+
+
+def normalise_order_status(raw_status: Any) -> str:
+    """Map a broker order status onto COMPLETE / REJECTED / CANCELLED or the
+    raw (upper-cased) pending status; empty -> ``UNKNOWN``."""
+    status = str(raw_status or "").strip().upper()
+    if status in _COMPLETE_STATUSES:
+        return "COMPLETE"
+    if status in _REJECTED_STATUSES:
+        return "REJECTED"
+    if status in _CANCELLED_STATUSES:
+        return "CANCELLED"
+    return status or "UNKNOWN"
+
+
+def normalise_order_state(order_id: str, raw: Any) -> Dict[str, Any]:
+    """Normalise a Groww order-detail payload (see ``GrowwClient.get_order_state``)."""
+    order = raw if isinstance(raw, dict) else {}
+    if isinstance(order.get("data"), dict):
+        order = order["data"]
+
+    def _int(*keys: str) -> int:
+        for k in keys:
+            v = order.get(k)
+            if v not in (None, ""):
+                try:
+                    return int(float(v))
+                except (TypeError, ValueError):
+                    continue
+        return 0
+
+    avg = None
+    for k in ("average_fill_price", "average_price", "avg_price", "averagePrice"):
+        avg = _positive_price(order.get(k))
+        if avg is not None:
+            break
+
+    status = normalise_order_status(order.get("order_status") or order.get("status"))
+    quantity = _int("quantity", "qty")
+    filled = _int("filled_quantity", "filledQty", "filled_qty")
+    if status == "COMPLETE" and filled <= 0 and quantity > 0:
+        # A COMPLETE order is fully filled by definition; a missing / renamed
+        # filled-quantity field must not read as "nothing sold".
+        logger.warning(
+            "Order %s is COMPLETE but reports no filled quantity — using quantity=%d",
+            order_id, quantity,
+        )
+        filled = quantity
+    return {
+        "order_id": order_id,
+        "status": status,
+        "filled_quantity": filled,
+        "quantity": quantity,
+        "average_price": avg,
+    }
+
+
+def _position_net_qty(pos: Dict[str, Any]) -> int:
+    """Net (signed) quantity of one Groww position row.
+
+    Groww's ``/positions/user`` rows carry ``quantity`` (net) plus
+    ``credit_quantity`` / ``debit_quantity``; older / alternative shapes use
+    ``buy_quantity`` / ``sell_quantity``.  Raises ``ValueError`` when no
+    recognised quantity field exists, so callers treat the broker quantity as
+    UNKNOWN instead of silently reading 0 (flat).
+    """
+    def _num(*keys: str) -> Optional[int]:
+        for k in keys:
+            v = pos.get(k)
+            if v not in (None, ""):
+                return int(float(v))
+        return None
+
+    net = _num("quantity", "net_quantity", "netQuantity")
+    if net is not None:
+        return net
+    credit = _num("credit_quantity", "creditQuantity")
+    debit = _num("debit_quantity", "debitQuantity")
+    if credit is not None or debit is not None:
+        return (credit or 0) - (debit or 0)
+    buy = _num("buy_quantity", "buyQuantity")
+    sell = _num("sell_quantity", "sellQuantity")
+    if buy is not None or sell is not None:
+        return (buy or 0) - (sell or 0)
+    raise ValueError(f"position row has no quantity field: {sorted(pos)}")
+
+
+def _to_groww_product(product: str) -> str:
+    """Map internal product codes to the Groww SDK product constants."""
+    return "CNC" if str(product).upper() in ("CNC", "DELIVERY") else "MIS"
 
 
 def _is_permanent_groww_error(exc: Exception) -> bool:
@@ -61,6 +226,10 @@ def _is_permanent_groww_error(exc: Exception) -> bool:
     backoff only wastes ~14s per call and floods the logs.  We surface the
     failure immediately instead.
     """
+    # A wrong SDK method name / signature can never succeed on retry; failing
+    # fast avoids ~6 s of backoff on every call (e.g. before an exit SELL).
+    if isinstance(exc, (AttributeError, TypeError)):
+        return True
     code = str(getattr(exc, "code", "") or "")
     if code in ("401", "403"):
         return True
@@ -69,7 +238,13 @@ def _is_permanent_groww_error(exc: Exception) -> bool:
 
 
 def _retry_sync(func: Callable) -> Callable:
-    """Decorator: retry a synchronous Groww SDK call with exponential backoff."""
+    """Decorator: retry a synchronous Groww SDK call with exponential backoff.
+
+    READS ONLY.  Never wrap an order write (place / cancel / modify) with this:
+    a retried write after a timeout can duplicate an order (audit R5 / C3).
+    Runs inside ``asyncio.to_thread`` workers, so the sleep never blocks the
+    event loop.
+    """
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         last_exc: Exception | None = None
@@ -89,6 +264,8 @@ def _retry_sync(func: Callable) -> Callable:
                         func.__name__, exc,
                     )
                     raise
+                if attempt >= MAX_RETRIES:
+                    break  # no pointless sleep after the final attempt
                 wait = 2 ** attempt
                 logger.warning(
                     "Groww API call %s failed (attempt %d/%d): %s — retrying in %ds",
@@ -100,21 +277,21 @@ def _retry_sync(func: Callable) -> Callable:
     return wrapper
 
 
-class _GrowwFeedKiteTicker:
-    """KiteTicker-compatible adapter around the official GrowwFeed API.
+class _GrowwFeedTicker:
+    """Callback-style ticker adapter around the official GrowwFeed API.
 
-    The scanner was written against the Zerodha KiteTicker interface:
+    The scanner drives a ticker through:
       • ticker.on_ticks / on_connect / on_close / on_error  (callback attributes)
       • ticker.connect(reconnect=True)  (blocking call)
       • ws.subscribe(tokens)  +  ws.set_mode(mode, tokens)  (in on_connect)
       • ticker.MODE_FULL  (mode constant)
 
-    GrowwFeed's actual SDK API is completely different:
+    GrowwFeed's SDK API is different:
       • feed.subscribe_ltp(instruments, on_data_received=cb)
       • feed.subscribe_index_value(instruments, on_data_received=cb)
       • feed.consume()   ← blocking call
 
-    This adapter bridges the two so scanner.py requires zero changes.
+    This adapter bridges the two.
 
     Tick format emitted to on_ticks:
       [{"instrument_token": <int>, "exchange_token": <int>,
@@ -123,8 +300,6 @@ class _GrowwFeedKiteTicker:
 
     # Mode constant required by scanner._on_connect → ws.set_mode(ws.MODE_FULL, tokens)
     MODE_FULL = "ltp"
-    MODE_QUOTE = "ltp"
-    MODE_LTP = "ltp"
 
     def __init__(self, feed=None, groww=None) -> None:
         # Either an already-created feed (tests/mocks) or a GrowwAPI client that
@@ -157,7 +332,7 @@ class _GrowwFeedKiteTicker:
              ws.subscribe(tokens) which populates self._subscribed_tokens.
           2. Build the GrowwFeed instrument lists from those tokens.
           3. Register subscriptions with callbacks that convert GrowwFeed's
-             data format to KiteTicker-style tick dicts.
+             data format to the tick dicts the scanner consumes.
           4. Call feed.consume() — blocks until disconnect or exception.
         """
         # IMPORTANT: GrowwFeed uses asyncio internally for all operations
@@ -354,10 +529,7 @@ class _GrowwFeedKiteTicker:
 
 
 class GrowwClient:
-    """Wrapper around the Groww API SDK with retry and circuit-breaker logic.
-
-    Drop-in replacement for KiteClient — all method signatures are identical.
-    """
+    """Wrapper around the Groww API SDK with retry and circuit-breaker logic."""
 
     def __init__(self) -> None:
         self._settings = get_settings()
@@ -472,6 +644,94 @@ class GrowwClient:
 
     # ── Order Management ──────────────────────────────────────────────────────
 
+    async def _submit_order_write(
+        self,
+        groww: Any,
+        params: Dict[str, Any],
+        order_reference_id: str,
+    ) -> Dict[str, Any]:
+        """Send ONE order-placement request; never resubmit (audit R5 / C3).
+
+        On a definitive broker rejection the exception is re-raised.  On an
+        ambiguous failure (timeout, connection error, 5xx, unknown) the order
+        is looked up by ``order_reference_id``: if the broker has it, that
+        order is returned as the result; if the broker positively reports it
+        unknown the original exception is re-raised; if the lookup itself
+        cannot answer, ``OrderStateUnknownError`` is raised.
+        """
+        def _send():
+            return groww.place_order(timeout=ORDER_WRITE_TIMEOUT_S, **params)
+
+        try:
+            return await asyncio.to_thread(_send)
+        except Exception as exc:
+            if _is_definitive_rejection(exc):
+                raise
+            logger.warning(
+                "Order write for %s ambiguous (%s: %s) — looking up ref=%s before deciding",
+                params.get("trading_symbol"), type(exc).__name__, exc, order_reference_id,
+            )
+            found = await self._lookup_order_by_reference(groww, order_reference_id)
+            if found is None:
+                raise
+            if found is False:
+                logger.critical(
+                    "Order ref=%s for %s: state UNKNOWN after %s — manual review required",
+                    order_reference_id, params.get("trading_symbol"), exc,
+                )
+                raise OrderStateUnknownError(
+                    f"Order {order_reference_id} for {params.get('trading_symbol')} "
+                    f"failed ambiguously ({exc}) and could not be confirmed — "
+                    f"manual review required",
+                    order_reference_id,
+                ) from exc
+            logger.warning(
+                "Order ref=%s was accepted by the broker despite the error — using it",
+                order_reference_id,
+            )
+            return found
+
+    async def _lookup_order_by_reference(self, groww: Any, order_reference_id: str):
+        """Look an order up by its reference id (a READ, safe to repeat).
+
+        Returns the broker order dict when found, ``None`` when the broker
+        consistently reports it unknown, and ``False`` when undetermined.
+        """
+        not_found = 0
+        for attempt in range(ORDER_LOOKUP_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(ORDER_LOOKUP_DELAY_S)
+            try:
+                res = await asyncio.to_thread(
+                    lambda: groww.get_order_status_by_reference(
+                        segment="CASH",
+                        order_reference_id=order_reference_id,
+                        timeout=ORDER_WRITE_TIMEOUT_S,
+                    )
+                )
+                if isinstance(res, dict) and (res.get("groww_order_id") or res.get("order_id")):
+                    return res
+                not_found += 1
+            except Exception as exc:
+                if str(getattr(exc, "code", "")) == "404":
+                    not_found += 1
+                else:
+                    logger.warning(
+                        "Order lookup ref=%s failed (attempt %d/%d): %s",
+                        order_reference_id, attempt + 1, ORDER_LOOKUP_ATTEMPTS, exc,
+                    )
+        if not_found == ORDER_LOOKUP_ATTEMPTS:
+            return None
+        return False
+
+    @staticmethod
+    def _extract_order_id(result: Any) -> str:
+        if not isinstance(result, dict):
+            return ""
+        return str(
+            result.get("groww_order_id") or result.get("order_id") or result.get("orderId") or ""
+        )
+
     async def place_order(
         self,
         tradingsymbol: str,
@@ -483,10 +743,15 @@ class GrowwClient:
         price: Optional[float] = None,
         trigger_price: Optional[float] = None,
         tag: str = "autotrader",
+        order_reference_id: Optional[str] = None,
     ) -> str:
-        """Place an order and return the order ID.
+        """Place an order and return the broker order ID.
 
-        Groww MIS intraday = product type "INTRADAY".
+        The request is sent exactly once with a unique ``order_reference_id``
+        (generated when not supplied); an ambiguous failure is resolved by a
+        reference lookup, never by resubmitting.  Any price / trigger price is
+        snapped to the instrument tick (floored for a SELL, ceiled for a BUY).
+        ``tag`` is used for logging only (the SDK has no free-text tag field).
         """
         if self._settings.paper_trading:
             paper_id = f"paper_{uuid.uuid4().hex[:10]}"
@@ -497,34 +762,32 @@ class GrowwClient:
             return paper_id
 
         groww = await self.get_groww()
+        ref_id = order_reference_id or new_order_reference_id()
+        tick = get_tick_size(tradingsymbol)
+        snap = floor_to_tick if str(transaction_type).upper() == "SELL" else ceil_to_tick
 
-        # Map Kite product codes to Groww equivalents
-        groww_product = "INTRADAY" if product == "MIS" else "DELIVERY"
-        groww_order_type = order_type  # MARKET / LIMIT — same strings
-
-        @_retry_sync
-        def _place():
-            params: Dict[str, Any] = {
-                "trading_symbol": tradingsymbol,
-                "exchange": exchange,
-                "transaction_type": transaction_type,
-                "quantity": quantity,
-                "product": groww_product,
-                "order_type": groww_order_type,
-                "source": tag,
-            }
-            if price is not None:
-                params["price"] = price
-            if trigger_price is not None:
-                params["trigger_price"] = trigger_price
-            return groww.place_order(**params)
+        params: Dict[str, Any] = {
+            "validity": "DAY",
+            "exchange": exchange,
+            "segment": "CASH",
+            "trading_symbol": tradingsymbol,
+            "transaction_type": transaction_type,
+            "quantity": quantity,
+            "product": _to_groww_product(product),
+            "order_type": order_type,
+            "order_reference_id": ref_id,
+        }
+        if price is not None:
+            params["price"] = snap(price, tick)
+        if trigger_price is not None:
+            params["trigger_price"] = snap(trigger_price, tick)
 
         try:
-            result = await asyncio.to_thread(_place)
-            order_id = str(result.get("order_id") or result.get("orderId") or "")
+            result = await self._submit_order_write(groww, params, ref_id)
+            order_id = self._extract_order_id(result)
             logger.info(
-                "Order placed: %s %s %s qty=%d product=%s → order_id=%s",
-                transaction_type, exchange, tradingsymbol, quantity, product, order_id,
+                "Order placed [%s]: %s %s %s qty=%d product=%s ref=%s → order_id=%s",
+                tag, transaction_type, exchange, tradingsymbol, quantity, product, ref_id, order_id,
             )
             self._last_failure = 0.0
             return order_id
@@ -532,188 +795,254 @@ class GrowwClient:
             await self._handle_failure(exc)
             raise
 
-    async def place_gtt(
+    async def place_stop_loss_order(
         self,
         tradingsymbol: str,
-        exchange: str,
-        trigger_type: str,            # "single" in Kite; maps to OCO on Groww
-        trigger_values: List[float],
-        last_price: float,
-        orders: List[Dict[str, Any]],
-    ) -> int:
-        """Place an OCO (stop-loss + target) bracket order.
+        quantity: int,
+        trigger_price: float,
+        exchange: str = "NSE",
+        product: str = "MIS",
+        transaction_type: str = "SELL",
+    ) -> str:
+        """Place the broker-side protective SL-limit SELL and return the FULL
+        raw broker order id as a string (audit R1 / C1).
 
-        Groww does not have a GTT concept — it uses OCO orders instead.
-        For our use case (single SL trigger), we place an OCO where:
-          trigger_values[0] = stop-loss trigger price
-          orders[0] contains the SL SELL order details
+        The raw id is what must be persisted (``Trade.sl_order_id``) and used
+        for cancel / modify / status calls -- never a truncated integer.
 
-        Returns a synthetic integer ID derived from Groww's order_id for
-        compatibility with the gtt_trigger_id column (stored as integer).
+          * trigger = ``trigger_price`` floored to the instrument tick
+          * limit   = trigger minus ``SL_LIMIT_BUFFER_PCT`` (and at least one
+            tick lower), floored to the tick, so a fast move through the
+            trigger still fills instead of resting unfilled (audit R12).
+            SL-M is not used: Groww does not document SL_M for CASH/MIS.
+
+        Sent once with a unique ``order_reference_id`` (no blind retry, R5).
         """
         if self._settings.paper_trading:
-            paper_gtt_id = int(uuid.uuid4().int % 10_000_000)
+            paper_id = f"PAPER-SL-{uuid.uuid4().hex[:10]}"
             logger.info(
-                "[PAPER] OCO/GTT simulated: %s trigger=%s → gtt_id=%d",
-                tradingsymbol, trigger_values, paper_gtt_id,
+                "[PAPER] Broker stop simulated: %s qty=%d trigger=%s → %s",
+                tradingsymbol, quantity, trigger_price, paper_id,
             )
-            return paper_gtt_id
+            return paper_id
 
         groww = await self.get_groww()
 
-        # Extract SL and target from the orders list
-        # orders[0] = stop-loss order, orders[1] = target order (if two-legged)
-        sl_order = orders[0]
-        sl_price = trigger_values[0]
+        tick = get_tick_size(tradingsymbol)
+        trigger = floor_to_tick(trigger_price, tick)
+        limit = sl_limit_price(trigger, tick, SL_LIMIT_BUFFER_PCT)
+        ref_id = new_order_reference_id()
 
-        @_retry_sync
-        def _place_oco():
-            params: Dict[str, Any] = {
-                "trading_symbol": tradingsymbol,
-                "exchange": exchange,
-                "transaction_type": sl_order.get("transaction_type", "SELL"),
-                "quantity": sl_order.get("quantity", 1),
-                "product": "INTRADAY",
-                "order_type": "SL",
-                "trigger_price": sl_price,
-                "price": sl_price,   # limit price = trigger for SL-M equivalent
-                "source": "autotrader",
-            }
-            return groww.place_order(**params)
+        params: Dict[str, Any] = {
+            "validity": "DAY",
+            "exchange": exchange,
+            "segment": "CASH",
+            "trading_symbol": tradingsymbol,
+            "transaction_type": transaction_type,
+            "quantity": quantity,
+            "product": _to_groww_product(product),
+            "order_type": "SL",
+            "trigger_price": trigger,
+            "price": limit,
+            "order_reference_id": ref_id,
+        }
 
         try:
-            result = await asyncio.to_thread(_place_oco)
-            raw_id = str(result.get("order_id") or result.get("orderId") or "0")
-            # Convert to integer for DB compatibility: take last 8 digits of order_id
-            gtt_id = int("".join(c for c in raw_id if c.isdigit())[-8:] or "0")
-            # Store the full string order_id alongside the int for cancellation
-            await set_value(f"groww_oco:{gtt_id}", raw_id, ttl=24 * 3600)
+            result = await self._submit_order_write(groww, params, ref_id)
+            raw_id = self._extract_order_id(result)
             logger.info(
-                "OCO/SL order placed for %s trigger=%.2f → gtt_id=%d (raw=%s)",
-                tradingsymbol, sl_price, gtt_id, raw_id,
+                "Broker SL order placed for %s qty=%d trigger=%.2f limit=%.2f ref=%s → order_id=%s",
+                tradingsymbol, quantity, trigger, limit, ref_id, raw_id,
             )
             self._last_failure = 0.0
-            return gtt_id
+            return raw_id
         except Exception as exc:
             await self._handle_failure(exc)
             raise
 
-    async def delete_gtt(self, trigger_id: int) -> None:
-        """Cancel an OCO/SL order by its synthetic integer ID.
-
-        Looks up the real Groww order_id from Redis (set during place_gtt),
-        then cancels it via the Groww REST API.
-        """
+    async def modify_stop_loss_order(
+        self,
+        order_id: str,
+        tradingsymbol: str,
+        quantity: int,
+        trigger_price: float,
+    ) -> None:
+        """Move a resting broker SL-limit order to a new trigger (trailing /
+        breakeven, audit R1).  Sent once; a failure is raised to the caller,
+        which may leave the (lower, still protective) old stop in place."""
         if self._settings.paper_trading:
-            logger.info("[PAPER] OCO/GTT cancel simulated: trigger_id=%d", trigger_id)
-            return
-
-        raw_id = await get_value(f"groww_oco:{trigger_id}")
-        if not raw_id:
-            logger.warning(
-                "delete_gtt: no Groww order_id found for gtt_id=%d — may already be filled/expired",
-                trigger_id,
+            logger.info(
+                "[PAPER] Broker stop modify simulated: %s → trigger=%s", order_id, trigger_price,
             )
             return
 
         groww = await self.get_groww()
+        tick = get_tick_size(tradingsymbol)
+        trigger = floor_to_tick(trigger_price, tick)
+        limit = sl_limit_price(trigger, tick, SL_LIMIT_BUFFER_PCT)
 
-        @_retry_sync
+        def _modify():
+            return groww.modify_order(
+                order_type="SL",
+                segment="CASH",
+                groww_order_id=order_id,
+                quantity=quantity,
+                price=limit,
+                trigger_price=trigger,
+                timeout=ORDER_WRITE_TIMEOUT_S,
+            )
+
+        try:
+            await asyncio.to_thread(_modify)
+            logger.info(
+                "Broker SL order modified: %s %s qty=%d trigger=%.2f limit=%.2f",
+                order_id, tradingsymbol, quantity, trigger, limit,
+            )
+            self._last_failure = 0.0
+        except Exception as exc:
+            await self._handle_failure(exc)
+            raise
+
+    async def cancel_order(self, order_id: str) -> None:
+        """Send ONE cancel request for a broker order by its raw order id.
+
+        Never retried blindly -- callers confirm the outcome with
+        ``get_order_state`` (an already-executed order cannot be cancelled).
+        """
+        if self._settings.paper_trading:
+            logger.info("[PAPER] Order cancel simulated: %s", order_id)
+            return
+
+        groww = await self.get_groww()
+
         def _cancel():
-            return groww.cancel_order(order_id=raw_id)
+            return groww.cancel_order(
+                groww_order_id=order_id, segment="CASH", timeout=ORDER_WRITE_TIMEOUT_S,
+            )
 
         try:
             await asyncio.to_thread(_cancel)
-            logger.info("OCO/SL order cancelled: gtt_id=%d (raw=%s)", trigger_id, raw_id)
+            logger.info("Cancel requested for broker order %s", order_id)
+            self._last_failure = 0.0
         except Exception as exc:
             await self._handle_failure(exc)
             raise
+
+    async def get_order_state(self, order_id: str) -> Dict[str, Any]:
+        """Return the normalised state of one broker order (a READ).
+
+        Shape: ``{"order_id", "status", "filled_quantity", "quantity",
+        "average_price"}`` where status is one of COMPLETE / REJECTED /
+        CANCELLED (terminal) or the broker's raw pending status
+        (OPEN, NEW, ACKED, TRIGGER_PENDING, ...).  ``average_price`` is None
+        when the broker reports no fill price.
+        """
+        groww = await self.get_groww()
+
+        @_retry_sync
+        def _fetch():
+            return groww.get_order_detail(
+                segment="CASH", groww_order_id=order_id, timeout=READ_TIMEOUT_S,
+            )
+
+        raw = await asyncio.to_thread(_fetch)
+        self._last_failure = 0.0
+        return normalise_order_state(order_id, raw)
+
+    async def find_order_by_reference(self, order_reference_id: str) -> Optional[str]:
+        """Resolve an ``order_reference_id`` to the broker order id (a READ).
+
+        Returns the raw broker order id, or None when the broker consistently
+        reports no such order.  Raises ``OrderStateUnknownError`` when the
+        lookup cannot decide (the order may exist).
+        """
+        groww = await self.get_groww()
+        found = await self._lookup_order_by_reference(groww, order_reference_id)
+        if found is None:
+            return None
+        order_id = self._extract_order_id(found) if found else ""
+        if not order_id:
+            raise OrderStateUnknownError(
+                f"Order ref {order_reference_id} could not be resolved", order_reference_id,
+            )
+        return order_id
 
     # ── Position & Order Queries ──────────────────────────────────────────────
 
     async def get_positions(self) -> Dict[str, Any]:
         """Fetch current positions.
 
-        Groww returns buy_quantity and sell_quantity per position.
-        We normalise to Kite's schema: net[].quantity = buy_qty - sell_qty
-        so all callers (risk_manager, trading_agent) work without changes.
+        Uses ``get_positions_for_user(segment="CASH")`` (growwapi 1.5.0 has no
+        ``get_positions``), normalised to ``{"net": [{"tradingsymbol",
+        "exchange", "quantity", "average_price", "product"}]}``: ``quantity`` is
+        the signed net quantity (``_position_net_qty``) and ``product`` is
+        upper-cased.  A row with no recognised quantity field raises, so the
+        broker quantity reads as UNKNOWN, never as flat.
+
+        NOTE: the response field names follow Groww's published docs; they
+        have not been verified against a live call from this codebase.
         """
         groww = await self.get_groww()
 
         @_retry_sync
         def _fetch():
-            return groww.get_positions()
+            return groww.get_positions_for_user(segment="CASH", timeout=READ_TIMEOUT_S)
 
         raw = await asyncio.to_thread(_fetch)
-        positions = raw if isinstance(raw, list) else raw.get("data", raw.get("positions", []))
+        self._last_failure = 0.0
+        positions = raw if isinstance(raw, list) else (raw or {}).get(
+            "positions", (raw or {}).get("data", [])
+        )
 
         normalised = []
-        for pos in positions:
-            buy_qty = int(pos.get("buy_quantity") or pos.get("buyQuantity") or 0)
-            sell_qty = int(pos.get("sell_quantity") or pos.get("sellQuantity") or 0)
-            net_qty = buy_qty - sell_qty
+        for pos in positions or []:
+            net_qty = _position_net_qty(pos)
             avg_price = float(
                 pos.get("average_price") or pos.get("averagePrice") or
-                pos.get("buy_avg") or 0
+                pos.get("net_price") or pos.get("buy_avg") or 0
             )
             normalised.append({
                 "tradingsymbol": pos.get("trading_symbol") or pos.get("tradingSymbol") or "",
                 "exchange": pos.get("exchange", "NSE"),
                 "quantity": net_qty,
                 "average_price": avg_price,
-                "product": pos.get("product", "MIS"),
+                "product": str(pos.get("product") or "MIS").upper(),
             })
 
         return {"net": normalised, "day": normalised}
 
     async def get_orders(self) -> List[Dict[str, Any]]:
-        """Fetch all orders for the day."""
+        """Fetch all of today's CASH orders (``get_order_list``, every page)."""
         groww = await self.get_groww()
 
         @_retry_sync
-        def _fetch():
-            return groww.get_order_book()
+        def _fetch(page: int):
+            return groww.get_order_list(page=page, segment="CASH", timeout=READ_TIMEOUT_S)
 
-        raw = await asyncio.to_thread(_fetch)
-        return raw if isinstance(raw, list) else raw.get("data", raw.get("orders", []))
-
-    async def get_order_history(self, order_id: str) -> List[Dict[str, Any]]:
-        """Fetch the lifecycle history of a specific order.
-
-        Returns a list of status-update dicts. The last entry with
-        status == 'COMPLETE' contains average_price (actual fill).
-        Groww returns a single order object — we wrap it in a list for
-        Kite API compatibility.
-        """
-        groww = await self.get_groww()
-
-        @_retry_sync
-        def _fetch():
-            return groww.get_order_details(order_id=order_id)
-
-        raw = await asyncio.to_thread(_fetch)
-        order = raw if isinstance(raw, dict) else raw.get("data", {})
-
-        # Normalise to Kite's history list schema
-        status = (order.get("status") or order.get("order_status") or "").upper()
-        kite_status = "COMPLETE" if status in ("COMPLETE", "EXECUTED", "FILLED") else status
-        return [{
-            "order_id": order_id,
-            "status": kite_status,
-            "average_price": float(order.get("average_price") or order.get("avg_price") or 0),
-            "filled_quantity": int(order.get("filled_quantity") or order.get("filledQty") or 0),
-        }]
-
-    async def get_holdings(self) -> List[Dict[str, Any]]:
-        """Fetch CNC holdings."""
-        groww = await self.get_groww()
-
-        @_retry_sync
-        def _fetch():
-            return groww.get_holdings()
-
-        raw = await asyncio.to_thread(_fetch)
-        return raw if isinstance(raw, list) else raw.get("data", raw.get("holdings", []))
+        orders: List[Dict[str, Any]] = []
+        seen: set = set()
+        for page in range(ORDER_LIST_MAX_PAGES):
+            raw = await asyncio.to_thread(_fetch, page)
+            if isinstance(raw, list):
+                batch = raw
+            else:
+                raw = raw or {}
+                batch = raw.get("order_list", raw.get("data", raw.get("orders", [])))
+            batch = [o for o in (batch or []) if isinstance(o, dict)]
+            new = []
+            for o in batch:
+                oid = self._extract_order_id(o)
+                if oid and oid in seen:
+                    continue
+                seen.add(oid)
+                new.append(o)
+            if not new:
+                break  # empty page, or the API ignored paging and repeated itself
+            orders.extend(new)
+            if len(batch) < ORDER_LIST_PAGE_SIZE:
+                break
+        self._last_failure = 0.0
+        return orders
 
     async def get_ltp(self, instruments: List[str]) -> Dict[str, Any]:
         """Fetch last traded price for a list of instruments (e.g. ['NSE:RELIANCE']).
@@ -722,8 +1051,13 @@ class GrowwClient:
         where exchange_trading_symbols is a tuple of strings like 'NSE_RELIANCE'.
         Response: {"NSE_RELIANCE": 2500.5, "NSE_NIFTY": 22962.10}  (flat dict).
 
-        Returns a dict keyed by 'NSE:SYMBOL' → {'last_price': float} to match
-        Kite's response shape.
+        Returns a dict keyed by 'NSE:SYMBOL' → {'last_price': float} (the
+        ``BrokerPort`` quote shape).
+
+        Contract (audit R2 / C2): this NEVER returns 0.0 (or any non-positive /
+        non-numeric price) as a sentinel.  Instruments that are missing from
+        the response or have an invalid price are OMITTED from the result.  A
+        transport / API failure raises — callers must handle the exception.
         """
         groww = await self.get_groww()
 
@@ -745,33 +1079,37 @@ class GrowwClient:
             return groww.get_ltp(
                 segment="CASH",
                 exchange_trading_symbols=tuple(et_symbols),
+                timeout=READ_TIMEOUT_S,
             )
 
         try:
             raw = await asyncio.to_thread(_fetch)
-            # raw = {"NSE_RELIANCE": 2500.5, ...}  — values are plain floats
-            result: Dict[str, Any] = {}
-            for et_sym, price in raw.items():
-                orig_key = sym_map.get(et_sym, et_sym.replace("_", ":", 1))
-                result[orig_key] = {"last_price": float(price or 0)}
-            # Fill missing instruments with 0.0
-            for instrument in instruments:
-                if instrument not in result:
-                    result[instrument] = {"last_price": 0.0}
-            return result
         except Exception as exc:
             logger.warning("get_ltp failed for %s: %s", instruments, exc)
-            return {instr: {"last_price": 0.0} for instr in instruments}
+            raise
+        # raw = {"NSE_RELIANCE": 2500.5, ...}  — values are plain floats
+        result: Dict[str, Any] = {}
+        for et_sym, price in (raw or {}).items():
+            orig_key = sym_map.get(et_sym, et_sym.replace("_", ":", 1))
+            valid = _positive_price(price)
+            if valid is not None:
+                result[orig_key] = {"last_price": valid}
+        missing = [i for i in instruments if i not in result]
+        if missing:
+            logger.warning("get_ltp: no valid price for %s — omitted", missing)
+        return result
 
     async def get_quote(self, instruments: List[str]) -> Dict[str, Any]:
         """Fetch full market quote including circuit limits.
 
         Groww's quote API returns upper/lower circuit limits under different
-        field names — we normalise to Kite's schema for circuit-check (A3).
+        field names — we normalise them for the circuit check (A3).
         """
         if self._settings.paper_trading:
-            return {instr: {"last_price": 0.0, "upper_circuit_limit": 0.0,
-                            "lower_circuit_limit": 0.0} for instr in instruments}
+            # No broker quote in paper mode: every field is unknown (None),
+            # never a 0.0 sentinel (audit R2).
+            return {instr: {"last_price": None, "upper_circuit_limit": None,
+                            "lower_circuit_limit": None} for instr in instruments}
 
         groww = await self.get_groww()
         result: Dict[str, Any] = {}
@@ -785,19 +1123,22 @@ class GrowwClient:
             @_retry_sync
             def _fetch(sym=symbol, exch=exchange):
                 # segment is required; equity stocks are always CASH segment.
-                return groww.get_quote(exchange=exch, segment="CASH", trading_symbol=sym)
+                return groww.get_quote(
+                    exchange=exch, segment="CASH", trading_symbol=sym, timeout=READ_TIMEOUT_S,
+                )
 
             try:
                 raw = await asyncio.to_thread(_fetch)
+                # Missing / invalid values are None, never 0.0 (audit R2).
                 result[instrument] = {
-                    "last_price": float(raw.get("last_price") or raw.get("ltp") or 0),
-                    "upper_circuit_limit": float(
+                    "last_price": _positive_price(raw.get("last_price") or raw.get("ltp")),
+                    "upper_circuit_limit": _positive_price(
                         raw.get("upper_circuit_limit") or raw.get("upper_circuit") or
-                        raw.get("upperCircuit") or 0
+                        raw.get("upperCircuit")
                     ),
-                    "lower_circuit_limit": float(
+                    "lower_circuit_limit": _positive_price(
                         raw.get("lower_circuit_limit") or raw.get("lower_circuit") or
-                        raw.get("lowerCircuit") or 0
+                        raw.get("lowerCircuit")
                     ),
                 }
             except Exception as exc:
@@ -831,7 +1172,9 @@ class GrowwClient:
 
         @_retry_sync
         def _fetch():
-            return groww.get_quote(trading_symbol=symbol, exchange="NSE", segment="CASH")
+            return groww.get_quote(
+                trading_symbol=symbol, exchange="NSE", segment="CASH", timeout=READ_TIMEOUT_S,
+            )
 
         try:
             raw = await asyncio.to_thread(_fetch)
@@ -874,9 +1217,7 @@ class GrowwClient:
         Groww's historical API uses trading symbol + exchange, not integer tokens.
         We look up the symbol from the instrument_service reverse map.
 
-        The instrument_token parameter is retained for API compatibility —
-        it is the Groww exchange_token integer (same column, different values
-        from Zerodha tokens).
+        ``instrument_token`` is the Groww exchange_token integer.
 
         Args:
             instrument_token: Groww exchange_token integer.
@@ -896,7 +1237,7 @@ class GrowwClient:
             )
             return []
 
-        # Map Kite interval strings to Groww CANDLE_INTERVAL constants
+        # Map interval names to Groww CANDLE_INTERVAL constants
         interval_map = {
             "day":      "1day",
             "minute":   "1minute",
@@ -923,6 +1264,7 @@ class GrowwClient:
                 start_time=from_date.strftime("%Y-%m-%d 09:15:00"),
                 end_time=to_date.strftime("%Y-%m-%d 15:30:00"),
                 candle_interval=groww_interval,
+                timeout=READ_TIMEOUT_S,
             )
 
         try:
@@ -961,18 +1303,15 @@ class GrowwClient:
     # ── GrowwFeed WebSocket ───────────────────────────────────────────────────
 
     async def create_ticker(self):
-        """Create and return a KiteTicker-compatible GrowwFeed adapter.
-
-        Returns a _GrowwFeedKiteTicker that wraps the official GrowwFeed
-        API (subscribe_ltp + consume) behind the KiteTicker callback
-        interface that scanner.py expects.
+        """Create and return the callback-style GrowwFeed adapter
+        (``_GrowwFeedTicker``) that scanner.py drives.
         """
         groww = await self.get_groww()
         # IMPORTANT: do not construct GrowwFeed on the FastAPI event loop thread.
         # The adapter creates it lazily inside connect() (executor thread).
-        token_tail = (self._cached_token or "")[-6:] or "?"
-        logger.debug("GrowwFeed adapter created (token tail=...%s)", token_tail)
-        return _GrowwFeedKiteTicker(groww=groww)
+        # Never log any part of the session token (cluster D secret hygiene).
+        logger.debug("GrowwFeed adapter created (token cached=%s)", bool(self._cached_token))
+        return _GrowwFeedTicker(groww=groww)
 
     # ── Circuit Breaker ───────────────────────────────────────────────────────
 
@@ -1020,6 +1359,12 @@ class GrowwClient:
                 )
             return  # never halt on auth errors
 
+        # A definitive 4xx / business rejection (e.g. cancelling an order that
+        # already executed, a trailing modify rejected for its trigger) proves
+        # the API is reachable: it must not arm the "unreachable" breaker.
+        if _is_definitive_rejection(exc):
+            return
+
         # --- Network / API failure: apply circuit-breaker logic ---
         now = time.time()
         if self._last_failure == 0.0:
@@ -1028,7 +1373,7 @@ class GrowwClient:
             logger.critical(
                 "Groww API unreachable for >%ds — halting trading", CIRCUIT_BREAKER_SECONDS
             )
-            await set_value(HALT_KEY, "TRUE")
+            await set_halt(f"Groww API unreachable for >{CIRCUIT_BREAKER_SECONDS}s")
             try:
                 from integrations.telegram_client import send_halt_alert
                 await send_halt_alert()
@@ -1046,9 +1391,3 @@ def get_groww_client() -> GrowwClient:
     if _client is None:
         _client = GrowwClient()
     return _client
-
-
-# ── Backward-compatibility alias ─────────────────────────────────────────────
-# Allows gradual migration: `from integrations.groww_client import get_kite_client`
-# still works in any file not yet updated.
-get_kite_client = get_groww_client
